@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Verification - Weather Forecast{% endblock %}
+{% block title %}ASOS Verification - Weather Forecast{% endblock %}
 
 {% block extra_css %}
 <style>
@@ -38,8 +38,8 @@
 <div class="forecast-header">
     <div class="row align-items-center">
         <div class="col-md-8">
-            <h1 class="mb-1"><i class="bi bi-graph-up"></i> Forecast Verification</h1>
-            <p class="mb-0 opacity-75">Model accuracy by lead time (GFS vs AIFS vs IFS)</p>
+            <h1 class="mb-1"><i class="bi bi-graph-up"></i> ASOS Verification</h1>
+            <p class="mb-0 opacity-75">Model accuracy by lead time across all ASOS stations</p>
         </div>
         <div class="col-md-4">
             <select class="form-select" id="locationSelect">
@@ -90,17 +90,14 @@
                             <option value="ifs">IFS</option>
                         </select>
                         <select class="form-select form-select-sm" id="asosLeadTime" style="width: auto;">
-                            <option value="6">6h</option>
+                            <option value="6" selected>6h</option>
                             <option value="12">12h</option>
-                            <option value="24" selected>24h</option>
+                            <option value="24">24h</option>
                             <option value="48">48h</option>
                             <option value="72">72h</option>
                             <option value="120">5d</option>
                             <option value="168">7d</option>
                         </select>
-                        <button class="btn btn-sm btn-primary" id="asosSyncBtn" onclick="syncAsosData()">
-                            <i class="bi bi-cloud-download"></i> Sync
-                        </button>
                     </div>
                 </div>
                 <div class="card-body p-0">
@@ -115,6 +112,79 @@
                             <p class="mt-2 text-muted">No verification data yet.<br>Sync forecasts and wait for valid times to pass.</p>
                         </div>
                     </div>
+                    <!-- ASOS Station Detailed Charts -->
+                    <div id="asosStationCharts" class="card-body border-top d-none">
+                        <h5 class="card-title mb-3">Verification for <span id="asosStationName"></span></h5>
+                        <div class="row">
+                            <div class="col-lg-6 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><i class="bi bi-thermometer-half"></i> Temperature Accuracy</div>
+                                    <div class="card-body chart-container chart-container-small">
+                                        <canvas id="asosTempVerificationChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-6 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><i class="bi bi-speedometer"></i> Pressure Accuracy</div>
+                                    <div class="card-body chart-container chart-container-small">
+                                        <canvas id="asosMslpVerificationChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Mean Verification Table across all stations -->
+                    <div class="row mb-4">
+                        <div class="col-12">
+                            <div class="card">
+                                <div class="card-header">
+                                    <i class="bi bi-table"></i> Mean Verification by Lead Time (All Stations)
+                                </div>
+                                <div class="card-body p-0">
+                                    <div class="table-responsive">
+                                        <table class="table table-hover mb-0">
+                                            <thead>
+                                                <tr>
+                                                    <th>Lead Time</th>
+                                                    <th>Days</th>
+                                                    <th colspan="2" class="text-center bg-danger bg-opacity-10">GFS Temperature</th>
+                                                    <th colspan="2" class="text-center bg-warning bg-opacity-10">AIFS Temperature</th>
+                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Temperature</th>
+                                                    <th>Winner</th>
+                                                    <th colspan="2" class="text-center bg-danger bg-opacity-10">GFS Pressure</th>
+                                                    <th colspan="2" class="text-center bg-warning bg-opacity-10">AIFS Pressure</th>
+                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Pressure</th>
+                                                </tr>
+                                                <tr>
+                                                    <th></th>
+                                                    <th></th>
+                                                    <th class="text-center">MAE</th>
+                                                    <th class="text-center">Bias</th>
+                                                    <th class="text-center">MAE</th>
+                                                    <th class="text-center">Bias</th>
+                                                    <th class="text-center">MAE</th>
+                                                    <th class="text-center">Bias</th>
+                                                    <th></th>
+                                                    <th class="text-center">MAE</th>
+                                                    <th class="text-center">Bias</th>
+                                                    <th class="text-center">MAE</th>
+                                                    <th class="text-center">Bias</th>
+                                                    <th class="text-center">MAE</th>
+                                                    <th class="text-center">Bias</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="asosVerificationTableBody">
+                                                <tr>
+                                                    <td colspan="15" class="text-center text-muted">Loading...</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                     <!-- Color Scale Legend -->
                     <div class="d-flex align-items-center justify-content-center gap-3 py-2 border-top bg-light">
                         <span id="asosColorMin" class="text-muted small">0</span>
@@ -127,187 +197,7 @@
         </div>
     </div>
 
-    <!-- Summary Stats -->
-    <div class="row mb-4">
-        <div class="col-lg-2 col-md-4 col-6 mb-3">
-            <div class="card stat-card">
-                <div class="stat-value" id="totalRuns">--</div>
-                <div class="stat-label">Model Runs</div>
-            </div>
-        </div>
-        <div class="col-lg-2 col-md-4 col-6 mb-3">
-            <div class="card stat-card">
-                <div class="stat-value" id="maxLeadTime">--</div>
-                <div class="stat-label">Max Lead Time</div>
-            </div>
-        </div>
-        <div class="col-lg-2 col-md-4 col-6 mb-3">
-            <div class="card stat-card">
-                <div class="stat-value stat-value-gfs" id="gfsAvgMae">--</div>
-                <div class="stat-label">GFS Avg MAE</div>
-            </div>
-        </div>
-        <div class="col-lg-2 col-md-4 col-6 mb-3">
-            <div class="card stat-card">
-                <div class="stat-value stat-value-aifs" id="aifsAvgMae">--</div>
-                <div class="stat-label">AIFS Avg MAE</div>
-            </div>
-        </div>
-        <div class="col-lg-2 col-md-4 col-6 mb-3">
-            <div class="card stat-card">
-                <div class="stat-value stat-value-ifs" id="ifsAvgMae">--</div>
-                <div class="stat-label">IFS Avg MAE</div>
-            </div>
-        </div>
-    </div>
 
-    <!-- Model Legend -->
-    <div class="model-legend">
-        <div class="model-legend-item">
-            <span class="model-dot model-dot-gfs"></span>
-            <span>GFS (NOAA)</span>
-        </div>
-        <div class="model-legend-item">
-            <span class="model-dot model-dot-aifs"></span>
-            <span>AIFS (ECMWF ML)</span>
-        </div>
-        <div class="model-legend-item">
-            <span class="model-dot model-dot-ifs"></span>
-            <span>IFS (ECMWF NWP)</span>
-        </div>
-    </div>
-
-    <!-- Temperature MAE Chart -->
-    <div class="row mb-4">
-        <div class="col-12">
-            <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-thermometer-half"></i> Temperature MAE by Lead Time
-                    <small class="text-muted ms-2">(lower is better)</small>
-                </div>
-                <div class="card-body">
-                    <div class="chart-container chart-container-large">
-                        <canvas id="tempMaeChart"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Temperature Bias Chart -->
-    <div class="row mb-4">
-        <div class="col-12">
-            <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-thermometer-half"></i> Temperature Bias by Lead Time
-                    <small class="text-muted ms-2">(positive = warm bias, negative = cold bias)</small>
-                </div>
-                <div class="card-body">
-                    <div class="chart-container chart-container-large">
-                        <canvas id="tempBiasChart"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- MSLP MAE Chart -->
-    <div class="row mb-4">
-        <div class="col-12">
-            <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-speedometer"></i> Pressure MAE by Lead Time
-                    <small class="text-muted ms-2">(lower is better)</small>
-                </div>
-                <div class="card-body">
-                    <div class="chart-container chart-container-large">
-                        <canvas id="mslpMaeChart"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- MSLP Bias Chart -->
-    <div class="row mb-4">
-        <div class="col-12">
-            <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-speedometer"></i> Pressure Bias by Lead Time
-                    <small class="text-muted ms-2">(positive = high bias, negative = low bias)</small>
-                </div>
-                <div class="card-body">
-                    <div class="chart-container chart-container-large">
-                        <canvas id="mslpBiasChart"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Data Table -->
-    <div class="row mb-4">
-        <div class="col-12">
-            <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-table"></i> Verification Statistics by Lead Time
-                </div>
-                <div class="card-body p-0">
-                    <div class="table-responsive">
-                        <table class="table table-hover mb-0">
-                            <thead>
-                                <tr>
-                                    <th>Lead Time</th>
-                                    <th>Days Out</th>
-                                    <th>GFS Temp MAE</th>
-                                    <th>AIFS Temp MAE</th>
-                                    <th>IFS Temp MAE</th>
-                                    <th>Winner</th>
-                                    <th>GFS MSLP MAE</th>
-                                    <th>AIFS MSLP MAE</th>
-                                    <th>IFS MSLP MAE</th>
-                                    <th>Samples</th>
-                                </tr>
-                            </thead>
-                            <tbody id="verificationTable">
-                                <!-- Populated by JavaScript -->
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Historical Runs List -->
-    <div class="row">
-        <div class="col-12">
-            <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-clock-history"></i> Historical Model Runs
-                </div>
-                <div class="card-body p-0">
-                    <div class="table-responsive">
-                        <table class="table table-hover mb-0">
-                            <thead>
-                                <tr>
-                                    <th>Init Time</th>
-                                    <th>Fetched At</th>
-                                    <th>Has Observations</th>
-                                    <th>Temp MAE</th>
-                                    <th>MSLP MAE</th>
-                                </tr>
-                            </thead>
-                            <tbody id="runsTable">
-                                <!-- Populated by JavaScript -->
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
 {% endblock %}
 
 {% block extra_js %}
@@ -320,6 +210,75 @@ let tempMaeChart, tempBiasChart, mslpMaeChart, mslpBiasChart;
 
 let asosMap = null;
 let asosMarkers = [];
+
+let asosTempMaeChart, asosTempBiasChart, asosMslpMaeChart, asosMslpBiasChart;
+
+// Format lead time for display
+function formatLeadTime(hours) {
+    if (hours < 24) {
+        return hours + 'h';
+    }
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+    if (remainingHours === 0) {
+        return days + 'd';
+    }
+    return days + 'd ' + remainingHours + 'h';
+}
+
+function getVerificationChartOptions(yLabel, minY = null, showZeroLine = false) {
+    const options = {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: {
+            mode: 'index',
+            intersect: false
+        },
+        plugins: {
+            legend: {
+                position: 'top',
+                labels: {
+                    usePointStyle: true,
+                    padding: 20
+                }
+            },
+            annotation: {
+                annotations: {}
+            }
+        },
+        scales: {
+            y: {
+                grid: { color: '#e0e0e0' },
+                title: { display: true, text: yLabel }
+            },
+            x: {
+                grid: { display: false },
+                title: { display: true, text: 'Lead Time' }
+            }
+        }
+    };
+
+    if (minY !== null) {
+        options.scales.y.min = minY;
+    }
+
+    if (showZeroLine) {
+        options.plugins.annotation = {
+            annotations: {
+                zeroLine: {
+                    type: 'line',
+                    yMin: 0,
+                    yMax: 0,
+                    borderColor: '#999',
+                    borderWidth: 1,
+                    borderDash: [5, 5]
+                }
+            }
+        };
+    }
+
+    return options;
+}
 
 // Initialize ASOS map
 function initAsosMap() {
@@ -340,7 +299,7 @@ function initAsosMap() {
     }).addTo(asosMap);
 
     // Initialize color scale
-    updateColorScale('mae', 0, 10);
+    // updateColorScale('mae', 0, 10);
 }
 
 // Color interpolation for MAE (green -> yellow -> red)
@@ -435,16 +394,320 @@ function clearAsosMarkers() {
     asosMarkers = [];
 }
 
+let currentAsosTempChart = null;
+let currentAsosMslpChart = null;
+
+// Load detailed verification data for a single ASOS station
+async function loadAsosStationCharts(stationId, stationName) {
+    const location = document.getElementById('locationSelect').value;
+    const model = document.getElementById('asosModel').value; // Get the selected model
+
+    // Show the chart container and update the station name
+    document.getElementById('asosStationCharts').classList.remove('d-none');
+    document.getElementById('asosStationName').textContent = stationName;
+
+    try {
+        const response = await fetch(
+            `/api/asos/station-verification?location=${encodeURIComponent(location)}&station_id=${encodeURIComponent(stationId)}&model=${encodeURIComponent(model)}`
+        );
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'No detailed verification data available for this station.');
+        }
+
+        renderAsosVerificationCharts(data.verification);
+
+    } catch (error) {
+        console.error(`Error loading detailed verification for ${stationName}:`, error);
+        // Optionally hide the chart section or display an error message there
+        document.getElementById('asosStationCharts').classList.add('d-none');
+    }
+}
+
+// Render detailed verification charts for a single ASOS station
+function renderAsosVerificationCharts(v) {
+    const labels = v.lead_times.map(h => formatLeadTime(h));
+
+    // Temperature MAE and Bias Chart
+    const tempDatasets = [
+        {
+            label: 'MAE (°F)',
+            data: v.temp_mae,
+            borderColor: '#dc3545',
+            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            yAxisID: 'y'
+        },
+        {
+            label: 'Bias (°F)',
+            data: v.temp_bias,
+            borderColor: '#0d6efd',
+            backgroundColor: 'rgba(13, 110, 253, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5],
+            yAxisID: 'y1'
+        }
+    ];
+
+    if (currentAsosTempChart) currentAsosTempChart.destroy();
+    currentAsosTempChart = new Chart(document.getElementById('asosTempVerificationChart'), {
+        type: 'line',
+        data: { labels: labels, datasets: tempDatasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                },
+                annotation: {
+                    annotations: {
+                        zeroLine: {
+                            type: 'line',
+                            yMin: 0,
+                            yMax: 0,
+                            borderColor: '#999',
+                            borderWidth: 1,
+                            borderDash: [5, 5],
+                            yAxisID: 'y1' // Ensure zero line applies to bias axis
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: { display: false },
+                    title: { display: true, text: 'Lead Time' }
+                },
+                y: {
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'MAE (°F)' },
+                    min: 0 // MAE should start from 0
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    grid: { drawOnChartArea: false }, // Only draw grid lines for the first y-axis
+                    title: { display: true, text: 'Bias (°F)' }
+                }
+            }
+        }
+    });
+
+    // Pressure MAE and Bias Chart
+    const mslpDatasets = [
+        {
+            label: 'MAE (mb)',
+            data: v.mslp_mae,
+            borderColor: '#6f42c1',
+            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            yAxisID: 'y'
+        },
+        {
+            label: 'Bias (mb)',
+            data: v.mslp_bias,
+            borderColor: '#fd7e14',
+            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5],
+            yAxisID: 'y1'
+        }
+    ];
+
+    if (currentAsosMslpChart) currentAsosMslpChart.destroy();
+    currentAsosMslpChart = new Chart(document.getElementById('asosMslpVerificationChart'), {
+        type: 'line',
+        data: { labels: labels, datasets: mslpDatasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                },
+                annotation: {
+                    annotations: {
+                        zeroLine: {
+                            type: 'line',
+                            yMin: 0,
+                            yMax: 0,
+                            borderColor: '#999',
+                            borderWidth: 1,
+                            borderDash: [5, 5],
+                            yAxisID: 'y1' // Ensure zero line applies to bias axis
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: { display: false },
+                    title: { display: true, text: 'Lead Time' }
+                },
+                y: {
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'MAE (mb)' },
+                    min: 0 // MAE should start from 0
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    grid: { drawOnChartArea: false },
+                    title: { display: true, text: 'Bias (mb)' }
+                }
+            }
+        }
+    });
+}
+
+// Load and display Mean ASOS Verification
+async function loadMeanAsosVerification() {
+    const location = document.getElementById('locationSelect').value;
+
+    try {
+        const response = await fetch(
+            `/api/asos/mean-verification?location=${encodeURIComponent(location)}`
+        );
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'No mean verification data available.');
+        }
+
+        renderAsosVerificationTable(data.verification);
+
+    } catch (error) {
+        console.error('Error loading mean ASOS verification:', error);
+        const tbody = document.getElementById('asosVerificationTableBody');
+        tbody.innerHTML = '<tr><td colspan="15" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
+    }
+}
+
+// Render ASOS verification table
+function renderAsosVerificationTable(v) {
+    const tbody = document.getElementById('asosVerificationTableBody');
+    tbody.innerHTML = '';
+
+    if (!v.lead_times || v.lead_times.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="15" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
+        return;
+    }
+
+    for (let i = 0; i < v.lead_times.length; i++) {
+        const lt = v.lead_times[i];
+        const days = (lt / 24).toFixed(1);
+
+        // Temperature data
+        const gfsTempMae = v.gfs_temp_mae[i];
+        const gfsTempBias = v.gfs_temp_bias[i];
+        const aifsTempMae = v.aifs_temp_mae[i];
+        const aifsTempBias = v.aifs_temp_bias[i];
+        const ifsTempMae = v.ifs_temp_mae ? v.ifs_temp_mae[i] : null;
+        const ifsTempBias = v.ifs_temp_bias ? v.ifs_temp_bias[i] : null;
+
+        // Pressure data
+        const gfsMslpMae = v.gfs_mslp_mae[i];
+        const gfsMslpBias = v.gfs_mslp_bias[i];
+        const aifsMslpMae = v.aifs_mslp_mae[i];
+        const aifsMslpBias = v.aifs_mslp_bias[i];
+        const ifsMslpMae = v.ifs_mslp_mae ? v.ifs_mslp_mae[i] : null;
+        const ifsMslpBias = v.ifs_mslp_bias ? v.ifs_mslp_bias[i] : null;
+
+        // Determine temperature winner
+        let winner = '--';
+        let winnerClass = 'badge bg-secondary';
+        const tempMaes = [
+            { name: 'GFS', mae: gfsTempMae, class: 'badge bg-danger' },
+            { name: 'AIFS', mae: aifsTempMae, class: 'badge bg-warning text-dark' },
+            { name: 'IFS', mae: ifsTempMae, class: 'badge bg-success' }
+        ].filter(m => m.mae !== null && m.mae !== undefined);
+
+        if (tempMaes.length > 0) {
+            const minMae = Math.min(...tempMaes.map(m => m.mae));
+            const winners = tempMaes.filter(m => m.mae === minMae);
+            if (winners.length === 1) {
+                winner = winners[0].name;
+                winnerClass = winners[0].class;
+            } else {
+                winner = 'Tie';
+            }
+        }
+
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td><strong>${formatLeadTime(lt)}</strong></td>
+            <td>${days}</td>
+            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${ifsTempMae !== null && ifsTempMae !== undefined ? ifsTempMae.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${ifsTempBias !== null && ifsTempBias !== undefined ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + '°F' : '--'}</td>
+            <td><span class="${winnerClass}">${winner}</span></td>
+            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' : '--'}</td>
+            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + ' mb' : '--'}</td>
+            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + ' mb' : '--'}</td>
+            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
+            <td class="text-center">${ifsMslpMae !== null && ifsMslpMae !== undefined ? ifsMslpMae.toFixed(1) + ' mb' : '--'}</td>
+            <td class="text-center">${ifsMslpBias !== null && ifsMslpBias !== undefined ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
+        `;
+        tbody.appendChild(row);
+    }
+}
+
+
 // Load and display ASOS verification data
 async function loadAsosVerification() {
     if (!asosMap) {
         initAsosMap();
     }
+    // Hide station charts when map is reloaded
+    document.getElementById('asosStationCharts').classList.add('d-none');
 
     const variable = document.getElementById('asosVariable').value;
     const metric = document.getElementById('asosMetric').value;
     const model = document.getElementById('asosModel').value;
     const leadTime = document.getElementById('asosLeadTime').value;
+
+    console.log(`[loadAsosVerification] Fetching map data for variable=${variable}, metric=${metric}, model=${model}, leadTime=${leadTime}`);
 
     // Show loading
     document.getElementById('asosMapLoading').classList.remove('d-none');
@@ -454,25 +717,42 @@ async function loadAsosVerification() {
         const response = await fetch(
             `/api/asos/verification-map?variable=${variable}&metric=${metric}&model=${model}&lead_time=${leadTime}`
         );
-        const data = await response.json();
+        console.log('[loadAsosVerification] Received response:', response);
 
-        // Hide loading
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        console.log('[loadAsosVerification] Received data:', data);
+
+        // Hide loading and show content
         document.getElementById('asosMapLoading').classList.add('d-none');
+        document.getElementById('loadingState').classList.add('d-none'); // Hide main loading spinner
+        document.getElementById('verificationContent').classList.remove('d-none');
+        asosMap.invalidateSize(); // Invalidate map size after container is visible
+
 
         if (!data.success) {
-            console.error('ASOS verification error:', data.error);
+            console.error('[loadAsosVerification] ASOS verification error from API:', data.error);
             document.getElementById('asosMapEmpty').classList.remove('d-none');
+            // Ensure map loading spinner is hidden on API error
+            document.getElementById('asosMapLoading').classList.add('d-none');
             return;
         }
 
         const stations = data.stations || [];
+        console.log(`[loadAsosVerification] Found ${stations.length} stations.`);
 
         // Update station count
         document.getElementById('asosStationCount').textContent = `${stations.length} stations`;
 
         if (stations.length === 0) {
+            console.log('[loadAsosVerification] No stations to display, showing empty message.');
             document.getElementById('asosMapEmpty').classList.remove('d-none');
             clearAsosMarkers();
+            // Ensure map loading spinner is hidden when no stations
+            document.getElementById('asosMapLoading').classList.add('d-none');
             return;
         }
 
@@ -517,60 +797,18 @@ async function loadAsosVerification() {
                 offset: [0, -5]
             });
 
+            marker.on('click', function() {
+                loadAsosStationCharts(station.station_id, station.name);
+            });
+
             marker.addTo(asosMap);
             asosMarkers.push(marker);
         }
 
     } catch (error) {
-        console.error('Error loading ASOS verification:', error);
+        console.error('[loadAsosVerification] Error during fetch or processing:', error);
         document.getElementById('asosMapLoading').classList.add('d-none');
         document.getElementById('asosMapEmpty').classList.remove('d-none');
-    }
-}
-
-// Sync ASOS forecast data
-async function syncAsosData() {
-    const btn = document.getElementById('asosSyncBtn');
-    const originalContent = btn.innerHTML;
-
-    // Disable button and show spinner
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> Syncing...';
-
-    try {
-        const response = await fetch('/api/asos/sync');
-        const data = await response.json();
-
-        if (data.success) {
-            // Show success message
-            btn.innerHTML = '<i class="bi bi-check-lg"></i> Done!';
-            btn.classList.remove('btn-primary');
-            btn.classList.add('btn-success');
-
-            // Reload verification data after a short delay
-            setTimeout(() => {
-                loadAsosVerification();
-                btn.innerHTML = originalContent;
-                btn.classList.remove('btn-success');
-                btn.classList.add('btn-primary');
-                btn.disabled = false;
-            }, 2000);
-        } else {
-            throw new Error(data.error || 'Sync failed');
-        }
-
-    } catch (error) {
-        console.error('ASOS sync error:', error);
-        btn.innerHTML = '<i class="bi bi-exclamation-triangle"></i> Error';
-        btn.classList.remove('btn-primary');
-        btn.classList.add('btn-danger');
-
-        setTimeout(() => {
-            btn.innerHTML = originalContent;
-            btn.classList.remove('btn-danger');
-            btn.classList.add('btn-primary');
-            btn.disabled = false;
-        }, 3000);
     }
 }
 
@@ -580,454 +818,13 @@ document.getElementById('asosMetric').addEventListener('change', loadAsosVerific
 document.getElementById('asosModel').addEventListener('change', loadAsosVerification);
 document.getElementById('asosLeadTime').addEventListener('change', loadAsosVerification);
 
-// Initialize ASOS map after DOM is ready
+// Initial load
 document.addEventListener('DOMContentLoaded', function() {
-    // Small delay to ensure container is visible
-    setTimeout(initAsosMap, 100);
-    setTimeout(loadAsosVerification, 200);
+    initAsosMap();
+    setTimeout(loadAsosVerification, 50); // Small delay
+    setTimeout(loadMeanAsosVerification, 250); // Small delay for mean verification after map
 });
 
-// ============================================================================
-// Existing Verification Functionality
-// ============================================================================
 
-// Format lead time for display
-function formatLeadTime(hours) {
-    if (hours < 24) {
-        return hours + 'h';
-    }
-    const days = Math.floor(hours / 24);
-    const remainingHours = hours % 24;
-    if (remainingHours === 0) {
-        return days + 'd';
-    }
-    return days + 'd ' + remainingHours + 'h';
-}
-
-// Load verification data
-async function loadVerification() {
-    const location = document.getElementById('locationSelect').value;
-
-    document.getElementById('loadingState').classList.remove('d-none');
-    document.getElementById('verificationContent').classList.add('d-none');
-    document.getElementById('errorState').classList.add('d-none');
-
-    try {
-        const [verificationResponse, runsResponse] = await Promise.all([
-            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`),
-            fetch(`/api/runs?location=${encodeURIComponent(location)}`)
-        ]);
-
-        const verificationData = await verificationResponse.json();
-        const runsData = await runsResponse.json();
-
-        if (!verificationData.success) {
-            throw new Error(verificationData.error || 'No verification data available');
-        }
-
-        const v = verificationData.verification;
-
-        if (!v.lead_times || v.lead_times.length === 0) {
-            throw new Error('No verified forecast data yet. Sync forecasts and wait for observations.');
-        }
-
-        document.getElementById('loadingState').classList.add('d-none');
-        document.getElementById('verificationContent').classList.remove('d-none');
-
-        updateSummaryStats(v);
-        renderCharts(v);
-        renderTable(v);
-
-        if (runsData.success) {
-            renderRunsTable(runsData.runs);
-        }
-
-    } catch (error) {
-        console.error('Error loading verification:', error);
-        document.getElementById('loadingState').classList.add('d-none');
-        document.getElementById('errorState').classList.remove('d-none');
-        document.getElementById('errorMessage').textContent = error.message;
-    }
-}
-
-// Update summary statistics
-function updateSummaryStats(v) {
-    document.getElementById('totalRuns').textContent = v.run_count || '--';
-
-    const maxLeadHours = v.lead_times.length > 0 ? Math.max(...v.lead_times) : 0;
-    document.getElementById('maxLeadTime').textContent = formatLeadTime(maxLeadHours);
-
-    // Calculate average MAE across all lead times
-    const gfsTempMaes = v.gfs_temp_mae.filter(x => x !== null);
-    const aifsTempMaes = v.aifs_temp_mae.filter(x => x !== null);
-    const ifsTempMaes = (v.ifs_temp_mae || []).filter(x => x !== null);
-
-    if (gfsTempMaes.length > 0) {
-        const avgGfs = (gfsTempMaes.reduce((a, b) => a + b, 0) / gfsTempMaes.length).toFixed(1);
-        document.getElementById('gfsAvgMae').textContent = avgGfs + '°F';
-    }
-
-    if (aifsTempMaes.length > 0) {
-        const avgAifs = (aifsTempMaes.reduce((a, b) => a + b, 0) / aifsTempMaes.length).toFixed(1);
-        document.getElementById('aifsAvgMae').textContent = avgAifs + '°F';
-    }
-
-    if (ifsTempMaes.length > 0) {
-        const avgIfs = (ifsTempMaes.reduce((a, b) => a + b, 0) / ifsTempMaes.length).toFixed(1);
-        document.getElementById('ifsAvgMae').textContent = avgIfs + '°F';
-    }
-}
-
-// Render charts
-function renderCharts(v) {
-    const labels = v.lead_times.map(h => formatLeadTime(h));
-
-    // Temperature MAE chart datasets
-    const tempMaeDatasets = [
-        {
-            label: 'GFS',
-            data: v.gfs_temp_mae,
-            borderColor: '#dc3545',
-            backgroundColor: 'rgba(220, 53, 69, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2
-        },
-        {
-            label: 'AIFS',
-            data: v.aifs_temp_mae,
-            borderColor: '#e85d2d',
-            backgroundColor: 'rgba(232, 93, 45, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [5, 5]
-        }
-    ];
-
-    if (v.ifs_temp_mae) {
-        tempMaeDatasets.push({
-            label: 'IFS',
-            data: v.ifs_temp_mae,
-            borderColor: '#198754',
-            backgroundColor: 'rgba(25, 135, 84, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [2, 2]
-        });
-    }
-
-    // Temperature MAE chart
-    if (tempMaeChart) tempMaeChart.destroy();
-    tempMaeChart = new Chart(document.getElementById('tempMaeChart'), {
-        type: 'line',
-        data: { labels: labels, datasets: tempMaeDatasets },
-        options: getChartOptions('Temperature MAE (°F)', 0)
-    });
-
-    // Temperature Bias chart datasets
-    const tempBiasDatasets = [
-        {
-            label: 'GFS',
-            data: v.gfs_temp_bias,
-            borderColor: '#dc3545',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2
-        },
-        {
-            label: 'AIFS',
-            data: v.aifs_temp_bias,
-            borderColor: '#e85d2d',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [5, 5]
-        }
-    ];
-
-    if (v.ifs_temp_bias) {
-        tempBiasDatasets.push({
-            label: 'IFS',
-            data: v.ifs_temp_bias,
-            borderColor: '#198754',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [2, 2]
-        });
-    }
-
-    // Temperature Bias chart
-    if (tempBiasChart) tempBiasChart.destroy();
-    tempBiasChart = new Chart(document.getElementById('tempBiasChart'), {
-        type: 'line',
-        data: { labels: labels, datasets: tempBiasDatasets },
-        options: getChartOptions('Temperature Bias (°F)', null, true)
-    });
-
-    // MSLP MAE chart datasets
-    const mslpMaeDatasets = [
-        {
-            label: 'GFS',
-            data: v.gfs_mslp_mae,
-            borderColor: '#6f42c1',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2
-        },
-        {
-            label: 'AIFS',
-            data: v.aifs_mslp_mae,
-            borderColor: '#d63384',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [5, 5]
-        }
-    ];
-
-    if (v.ifs_mslp_mae) {
-        mslpMaeDatasets.push({
-            label: 'IFS',
-            data: v.ifs_mslp_mae,
-            borderColor: '#fd7e14',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [2, 2]
-        });
-    }
-
-    // MSLP MAE chart
-    if (mslpMaeChart) mslpMaeChart.destroy();
-    mslpMaeChart = new Chart(document.getElementById('mslpMaeChart'), {
-        type: 'line',
-        data: { labels: labels, datasets: mslpMaeDatasets },
-        options: getChartOptions('Pressure MAE (mb)', 0)
-    });
-
-    // MSLP Bias chart datasets
-    const mslpBiasDatasets = [
-        {
-            label: 'GFS',
-            data: v.gfs_mslp_bias,
-            borderColor: '#6f42c1',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2
-        },
-        {
-            label: 'AIFS',
-            data: v.aifs_mslp_bias,
-            borderColor: '#d63384',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [5, 5]
-        }
-    ];
-
-    if (v.ifs_mslp_bias) {
-        mslpBiasDatasets.push({
-            label: 'IFS',
-            data: v.ifs_mslp_bias,
-            borderColor: '#fd7e14',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [2, 2]
-        });
-    }
-
-    // MSLP Bias chart
-    if (mslpBiasChart) mslpBiasChart.destroy();
-    mslpBiasChart = new Chart(document.getElementById('mslpBiasChart'), {
-        type: 'line',
-        data: { labels: labels, datasets: mslpBiasDatasets },
-        options: getChartOptions('Pressure Bias (mb)', null, true)
-    });
-}
-
-function getChartOptions(yLabel, minY = null, showZeroLine = false) {
-    const options = {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: {
-            mode: 'index',
-            intersect: false
-        },
-        plugins: {
-            legend: {
-                position: 'top',
-                labels: {
-                    usePointStyle: true,
-                    padding: 20
-                }
-            }
-        },
-        scales: {
-            y: {
-                grid: { color: '#e0e0e0' },
-                title: { display: true, text: yLabel }
-            },
-            x: {
-                grid: { display: false },
-                title: { display: true, text: 'Lead Time' }
-            }
-        }
-    };
-
-    if (minY !== null) {
-        options.scales.y.min = minY;
-    }
-
-    if (showZeroLine) {
-        options.plugins.annotation = {
-            annotations: {
-                zeroLine: {
-                    type: 'line',
-                    yMin: 0,
-                    yMax: 0,
-                    borderColor: '#999',
-                    borderWidth: 1,
-                    borderDash: [5, 5]
-                }
-            }
-        };
-    }
-
-    return options;
-}
-
-// Render data table
-function renderTable(v) {
-    const tbody = document.getElementById('verificationTable');
-    tbody.innerHTML = '';
-
-    const ifsTempMae = v.ifs_temp_mae || [];
-    const ifsMslpMae = v.ifs_mslp_mae || [];
-
-    for (let i = 0; i < v.lead_times.length; i++) {
-        const lt = v.lead_times[i];
-        const days = v.lead_times_days[i];
-        const gfsTempMae = v.gfs_temp_mae[i];
-        const aifsTempMae = v.aifs_temp_mae[i];
-        const ifsTempMaeVal = ifsTempMae[i];
-        const gfsMslpMae = v.gfs_mslp_mae[i];
-        const aifsMslpMae = v.aifs_mslp_mae[i];
-        const ifsMslpMaeVal = ifsMslpMae[i];
-        const samples = v.temp_sample_counts[i];
-
-        // Determine winner - find lowest MAE among all models
-        let winner = '--';
-        let winnerClass = 'badge bg-secondary';
-        const tempMaes = [
-            { name: 'GFS', mae: gfsTempMae, class: 'badge bg-danger' },
-            { name: 'AIFS', mae: aifsTempMae, class: 'badge bg-warning text-dark' },
-            { name: 'IFS', mae: ifsTempMaeVal, class: 'badge bg-success' }
-        ].filter(m => m.mae !== null && m.mae !== undefined);
-
-        if (tempMaes.length > 0) {
-            const minMae = Math.min(...tempMaes.map(m => m.mae));
-            const winners = tempMaes.filter(m => m.mae === minMae);
-            if (winners.length === 1) {
-                winner = winners[0].name;
-                winnerClass = winners[0].class;
-            } else {
-                winner = 'Tie';
-                winnerClass = 'badge bg-secondary';
-            }
-        }
-
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td><strong>${formatLeadTime(lt)}</strong></td>
-            <td>${days.toFixed(1)}</td>
-            <td>${gfsTempMae !== null ? gfsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td>${aifsTempMae !== null ? aifsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td>${ifsTempMaeVal !== null && ifsTempMaeVal !== undefined ? ifsTempMaeVal.toFixed(1) + '°F' : '--'}</td>
-            <td><span class="${winnerClass}">${winner}</span></td>
-            <td>${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' : '--'}</td>
-            <td>${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + ' mb' : '--'}</td>
-            <td>${ifsMslpMaeVal !== null && ifsMslpMaeVal !== undefined ? ifsMslpMaeVal.toFixed(1) + ' mb' : '--'}</td>
-            <td>${samples}</td>
-        `;
-        tbody.appendChild(row);
-    }
-}
-
-// Render runs table
-function renderRunsTable(runs) {
-    const tbody = document.getElementById('runsTable');
-    tbody.innerHTML = '';
-
-    for (const run of runs) {
-        const initTime = new Date(run.run_id);
-        const fetchedAt = run.fetched_at ? new Date(run.fetched_at) : null;
-        const v = run.verification || {};
-
-        // Build temp MAE string
-        let tempMaeStr = '--';
-        if (v.gfs_temp_mae !== undefined && v.gfs_temp_mae !== null) {
-            tempMaeStr = `GFS: ${v.gfs_temp_mae}°`;
-            if (v.aifs_temp_mae !== undefined && v.aifs_temp_mae !== null) {
-                tempMaeStr += ` / AIFS: ${v.aifs_temp_mae}°`;
-            }
-            if (v.ifs_temp_mae !== undefined && v.ifs_temp_mae !== null) {
-                tempMaeStr += ` / IFS: ${v.ifs_temp_mae}°`;
-            }
-        }
-
-        // Build MSLP MAE string
-        let mslpMaeStr = '--';
-        if (v.gfs_mslp_mae !== undefined && v.gfs_mslp_mae !== null) {
-            mslpMaeStr = `GFS: ${v.gfs_mslp_mae}`;
-            if (v.aifs_mslp_mae !== undefined && v.aifs_mslp_mae !== null) {
-                mslpMaeStr += ` / AIFS: ${v.aifs_mslp_mae}`;
-            }
-            if (v.ifs_mslp_mae !== undefined && v.ifs_mslp_mae !== null) {
-                mslpMaeStr += ` / IFS: ${v.ifs_mslp_mae}`;
-            }
-            mslpMaeStr += ' mb';
-        }
-
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td>
-                <strong>${initTime.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', timeZoneName: 'short' })}</strong>
-                ${run.is_latest ? '<span class="badge bg-primary ms-2">Latest</span>' : ''}
-            </td>
-            <td>${fetchedAt ? fetchedAt.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '--'}</td>
-            <td>
-                ${run.has_observations ?
-                    '<span class="badge bg-success">Yes</span>' :
-                    '<span class="badge bg-secondary">No</span>'}
-            </td>
-            <td>${tempMaeStr}</td>
-            <td>${mslpMaeStr}</td>
-        `;
-        tbody.appendChild(row);
-    }
-}
-
-// Event listeners
-document.getElementById('locationSelect').addEventListener('change', loadVerification);
-
-// Initial load
-document.addEventListener('DOMContentLoaded', loadVerification);
 </script>
 {% endblock %}

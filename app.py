@@ -162,15 +162,6 @@ MSLP_GFS = Variable(
 # Preset locations (bounds aligned to 0.25 degree grid)
 LOCATIONS = {
     "Fairfax, VA": (-77.5, -77.0, 38.5, 39.0),
-    "New York, NY": (-74.25, -73.75, 40.5, 41.0),
-    "Los Angeles, CA": (-118.5, -118.0, 33.75, 34.25),
-    "Chicago, IL": (-88.0, -87.5, 41.75, 42.25),
-    "Houston, TX": (-95.5, -95.0, 29.5, 30.0),
-    "Phoenix, AZ": (-112.25, -111.75, 33.25, 33.75),
-    "Miami, FL": (-80.5, -80.0, 25.5, 26.0),
-    "Seattle, WA": (-122.5, -122.0, 47.25, 47.75),
-    "Denver, CO": (-105.0, -104.5, 39.5, 40.0),
-    "Boston, MA": (-71.25, -70.75, 42.25, 42.75),
 }
 
 # CONUS region for ASOS station extraction (covers continental US)
@@ -1369,26 +1360,109 @@ def api_asos_verification_map():
         return jsonify({"success": False, "error": str(e)})
 
 
-@app.route('/api/asos/station-detail/<station_id>')
-def api_asos_station_detail(station_id):
-    """Get detailed verification for a single station."""
-    model = request.args.get('model')  # Optional filter
+@app.route('/api/asos/station-verification')
+def api_asos_station_verification():
+    """Get detailed verification for a single station across all lead times."""
+    station_id = request.args.get('station_id')
+    model = request.args.get('model') # Required model filter
+
+    if not station_id:
+        return jsonify({"success": False, "error": "Missing station_id parameter"}), 400
+    if not model:
+        return jsonify({"success": False, "error": "Missing model parameter"}), 400
 
     try:
-        result = asos.get_station_detail(station_id, model)
+        raw_result = asos.get_station_detail(station_id, model)
 
-        if "error" in result:
-            return jsonify({"success": False, "error": result["error"]})
+        if "error" in raw_result:
+            return jsonify({"success": False, "error": raw_result["error"]}), 404
+
+        lead_times = raw_result.get("lead_times", [])
+        data_by_lead_time = raw_result.get("data", {})
+
+        temp_mae = []
+        temp_bias = []
+        mslp_mae = []
+        mslp_bias = []
+
+        for lt in lead_times:
+            model_data = data_by_lead_time.get(lt, {}).get(model, {})
+            
+            temp_metrics = model_data.get("temp")
+            temp_mae.append(temp_metrics["mae"] if temp_metrics else None)
+            temp_bias.append(temp_metrics["bias"] if temp_metrics else None)
+
+            mslp_metrics = model_data.get("mslp")
+            mslp_mae.append(mslp_metrics["mae"] if mslp_metrics else None)
+            mslp_bias.append(mslp_metrics["bias"] if mslp_metrics else None)
+        
+        verification_data = {
+            "lead_times": lead_times,
+            "temp_mae": temp_mae,
+            "temp_bias": temp_bias,
+            "mslp_mae": mslp_mae,
+            "mslp_bias": mslp_bias,
+        }
 
         return jsonify({
             "success": True,
             "station_id": station_id,
-            **result
+            "station_name": raw_result["station"]["name"],
+            "verification": verification_data
         })
 
     except Exception as e:
-        logger.error(f"Error getting station detail for {station_id}: {e}")
-        return jsonify({"success": False, "error": str(e)})
+        logger.error(f"Error getting station verification for {station_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/asos/mean-verification')
+def api_asos_mean_verification():
+    """Get mean verification (MAE and Bias) across all stations by lead time for all models."""
+    # The 'model' parameter is no longer taken here, as we fetch for all models.
+    # Location is not directly used for mean across all stations.
+
+    try:
+        gfs_results = asos.get_mean_verification_by_lead_time('gfs')
+        aifs_results = asos.get_mean_verification_by_lead_time('aifs')
+        ifs_results = asos.get_mean_verification_by_lead_time('ifs')
+
+        # Check for errors from asos functions
+        if "error" in gfs_results:
+            return jsonify({"success": False, "error": gfs_results["error"]}), 404
+        if "error" in aifs_results:
+            return jsonify({"success": False, "error": aifs_results["error"]}), 404
+        if "error" in ifs_results:
+            return jsonify({"success": False, "error": ifs_results["error"]}), 404
+
+        # Combine results
+        # Assuming lead_times are the same for all models
+        lead_times = gfs_results["lead_times"]
+
+        combined_verification = {
+            "lead_times": lead_times,
+            "gfs_temp_mae": gfs_results["temp_mae"],
+            "gfs_temp_bias": gfs_results["temp_bias"],
+            "aifs_temp_mae": aifs_results["temp_mae"],
+            "aifs_temp_bias": aifs_results["temp_bias"],
+            "ifs_temp_mae": ifs_results["temp_mae"],
+            "ifs_temp_bias": ifs_results["temp_bias"],
+            "gfs_mslp_mae": gfs_results["mslp_mae"],
+            "gfs_mslp_bias": gfs_results["mslp_bias"],
+            "aifs_mslp_mae": aifs_results["mslp_mae"],
+            "aifs_mslp_bias": aifs_results["mslp_bias"],
+            "ifs_mslp_mae": ifs_results["mslp_mae"],
+            "ifs_mslp_bias": ifs_results["mslp_bias"],
+        }
+
+        return jsonify({
+            "success": True,
+            "verification": combined_verification
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting mean ASOS verification: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 def check_asos_model_exists(init_time, model_name):
@@ -1431,8 +1505,8 @@ def api_asos_sync():
 
         logger.info(f"Syncing ASOS forecasts for {len(stations)} stations...")
 
-        # Define forecast hours (6-hourly out to 7 days)
-        forecast_hours = list(range(0, 169, 6))
+        # Define forecast hours (6-hourly out to 15 days)
+        forecast_hours = list(range(0, 361, 6))
 
         results = {}
 
@@ -1513,6 +1587,148 @@ def api_asos_sync():
         return jsonify({"success": False, "error": str(e)})
 
 
+@app.route('/api/sync-all')
+def api_sync_all():
+    """
+    Master sync endpoint that syncs everything:
+    - Fairfax WeatherLink forecast data (GFS, AIFS, IFS)
+    - ASOS station forecasts
+    - ASOS observations
+    """
+    force = request.args.get('force', 'false').lower() == 'true'
+
+    results = {
+        'fairfax': {},
+        'asos': {},
+        'success': True,
+        'errors': []
+    }
+
+    try:
+        # 1. Sync Fairfax forecast data
+        logger.info("Master sync: Fetching Fairfax forecast data...")
+        location = "Fairfax, VA"
+        days = 7
+
+        try:
+            bounds = LOCATIONS[location]
+            region = Region(location, bounds)
+
+            # Check if we already have the latest data
+            gfs_init, aifs_init = get_latest_init_times()
+            already_fetched, message = check_if_already_fetched(location, gfs_init, aifs_init)
+
+            if already_fetched and not force:
+                logger.info(f"Fairfax data already cached: {message}")
+                db = load_forecasts_db()
+                loc_data = db[location]
+                run_data = loc_data.get("runs", {}).get(gfs_init, {})
+                results['fairfax'] = {
+                    'status': 'cached',
+                    'message': message,
+                    'init_time': gfs_init
+                }
+            else:
+                # Fetch new data
+                forecast_hours = list(range(0, min(days * 24, 360) + 1, 6))
+                gfs_data = fetch_gfs_data(region, forecast_hours)
+                aifs_data = fetch_aifs_data(region, forecast_hours)
+                ifs_data = fetch_ifs_data(region, forecast_hours)
+                observed = fetch_observations(gfs_data.get("times", []), location)
+                verification = calculate_all_verification(gfs_data, aifs_data, observed, ifs_data)
+                save_forecast_data(location, gfs_data, aifs_data, observed, verification, ifs_data)
+
+                results['fairfax'] = {
+                    'status': 'synced',
+                    'message': 'Fetched new forecast data',
+                    'init_time': gfs_init
+                }
+                logger.info(f"Fairfax data synced: {gfs_init}")
+        except Exception as e:
+            logger.error(f"Fairfax sync failed: {e}")
+            results['fairfax'] = {'status': 'error', 'error': str(e)}
+            results['errors'].append(f"Fairfax: {str(e)}")
+
+        # 2. Sync ASOS forecasts
+        logger.info("Master sync: Fetching ASOS station forecasts...")
+        try:
+            stations_list = asos.fetch_all_stations()
+            stations = [
+                {'station_id': s.station_id, 'lat': s.lat, 'lon': s.lon, 'name': s.name}
+                for s in stations_list
+            ]
+
+            forecast_hours = list(range(0, 361, 6))
+            asos_results = {}
+
+            # Fetch GFS
+            gfs_model = GFSModel()
+            gfs_init = gfs_model.get_latest_init_time()
+
+            if not force and check_asos_model_exists(gfs_init, 'gfs'):
+                logger.info(f"ASOS GFS already synced for {gfs_init}")
+                asos_results['gfs'] = {'status': 'skipped', 'reason': 'already synced'}
+            else:
+                gfs_forecasts = fetch_asos_forecasts_for_model('gfs', gfs_init, forecast_hours, stations)
+                asos.store_asos_forecasts(gfs_init, forecast_hours, 'gfs', gfs_forecasts)
+                asos_results['gfs'] = {'status': 'synced', 'stations': len(gfs_forecasts)}
+
+            # Fetch AIFS
+            aifs_model = AIFSModel()
+            aifs_init = aifs_model.get_latest_init_time()
+
+            if not force and check_asos_model_exists(aifs_init, 'aifs'):
+                logger.info(f"ASOS AIFS already synced for {aifs_init}")
+                asos_results['aifs'] = {'status': 'skipped', 'reason': 'already synced'}
+            else:
+                aifs_forecasts = fetch_asos_forecasts_for_model('aifs', aifs_init, forecast_hours, stations)
+                asos.store_asos_forecasts(aifs_init, forecast_hours, 'aifs', aifs_forecasts)
+                asos_results['aifs'] = {'status': 'synced', 'stations': len(aifs_forecasts)}
+
+            # Fetch IFS
+            ifs_model = IFSModel()
+            ifs_init = ifs_model.get_latest_init_time()
+
+            if not force and check_asos_model_exists(ifs_init, 'ifs'):
+                logger.info(f"ASOS IFS already synced for {ifs_init}")
+                asos_results['ifs'] = {'status': 'skipped', 'reason': 'already synced'}
+            else:
+                ifs_forecasts = fetch_asos_forecasts_for_model('ifs', ifs_init, forecast_hours, stations)
+                asos.store_asos_forecasts(ifs_init, forecast_hours, 'ifs', ifs_forecasts)
+                asos_results['ifs'] = {'status': 'synced', 'stations': len(ifs_forecasts)}
+
+            # Fetch observations
+            obs_count = asos.fetch_and_store_observations()
+            asos_results['observations'] = {'status': 'synced', 'count': obs_count}
+
+            results['asos'] = {
+                'status': 'success',
+                'models': asos_results,
+                'station_count': len(stations)
+            }
+            logger.info(f"ASOS sync complete: {len(stations)} stations")
+
+        except Exception as e:
+            logger.error(f"ASOS sync failed: {e}")
+            results['asos'] = {'status': 'error', 'error': str(e)}
+            results['errors'].append(f"ASOS: {str(e)}")
+
+        # Check if any critical errors occurred
+        if results['errors']:
+            results['success'] = False
+
+        return jsonify(results)
+
+    except Exception as e:
+        logger.error(f"Master sync error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'fairfax': results.get('fairfax', {}),
+            'asos': results.get('asos', {})
+        })
+
+
 @app.route('/api/asos/status')
 def api_asos_status():
     """Get status of ASOS forecasts database."""
@@ -1537,11 +1753,15 @@ def api_asos_status():
         # Sort by init time descending
         run_list.sort(key=lambda x: x["init_time"], reverse=True)
 
+        # Get cumulative stats summary
+        cumulative_summary = asos.get_cumulative_stats_summary()
+
         return jsonify({
             "success": True,
             "station_count": len(stations),
             "run_count": len(runs),
-            "runs": run_list[:10]  # Last 10 runs
+            "runs": run_list[:10],  # Last 10 runs
+            "cumulative_stats": cumulative_summary
         })
 
     except Exception as e:
