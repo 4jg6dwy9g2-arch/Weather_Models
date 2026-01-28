@@ -1,0 +1,662 @@
+{% extends "base.html" %}
+
+{% block title %}Verification - Weather Forecast{% endblock %}
+
+{% block content %}
+<div class="forecast-header">
+    <div class="row align-items-center">
+        <div class="col-md-8">
+            <h1 class="mb-1"><i class="bi bi-graph-up"></i> Forecast Verification</h1>
+            <p class="mb-0 opacity-75">Model accuracy by lead time (GFS vs AIFS vs IFS)</p>
+        </div>
+        <div class="col-md-4">
+            <select class="form-select" id="locationSelect">
+                {% for loc in locations %}
+                <option value="{{ loc }}" {% if loc == selected_location %}selected{% endif %}>{{ loc }}</option>
+                {% endfor %}
+            </select>
+        </div>
+    </div>
+</div>
+
+<div id="loadingState" class="loading-spinner">
+    <div class="text-center">
+        <div class="spinner-border text-primary" role="status"></div>
+        <p class="mt-2 text-muted">Loading verification data...</p>
+    </div>
+</div>
+
+<div id="errorState" class="alert alert-warning d-none">
+    <i class="bi bi-exclamation-triangle"></i>
+    <span id="errorMessage">No verification data available.</span>
+    <a href="/sync" class="alert-link ms-2">Sync more forecast data to build verification history</a>
+</div>
+
+<div id="verificationContent" class="d-none">
+    <!-- Summary Stats -->
+    <div class="row mb-4">
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value" id="totalRuns">--</div>
+                <div class="stat-label">Model Runs</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value" id="maxLeadTime">--</div>
+                <div class="stat-label">Max Lead Time</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-gfs" id="gfsAvgMae">--</div>
+                <div class="stat-label">GFS Avg MAE</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-aifs" id="aifsAvgMae">--</div>
+                <div class="stat-label">AIFS Avg MAE</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-ifs" id="ifsAvgMae">--</div>
+                <div class="stat-label">IFS Avg MAE</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Model Legend -->
+    <div class="model-legend">
+        <div class="model-legend-item">
+            <span class="model-dot model-dot-gfs"></span>
+            <span>GFS (NOAA)</span>
+        </div>
+        <div class="model-legend-item">
+            <span class="model-dot model-dot-aifs"></span>
+            <span>AIFS (ECMWF ML)</span>
+        </div>
+        <div class="model-legend-item">
+            <span class="model-dot model-dot-ifs"></span>
+            <span>IFS (ECMWF NWP)</span>
+        </div>
+    </div>
+
+    <!-- Temperature MAE Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-thermometer-half"></i> Temperature MAE by Lead Time
+                    <small class="text-muted ms-2">(lower is better)</small>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="tempMaeChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Temperature Bias Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-thermometer-half"></i> Temperature Bias by Lead Time
+                    <small class="text-muted ms-2">(positive = warm bias, negative = cold bias)</small>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="tempBiasChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MSLP MAE Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-speedometer"></i> Pressure MAE by Lead Time
+                    <small class="text-muted ms-2">(lower is better)</small>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="mslpMaeChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MSLP Bias Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-speedometer"></i> Pressure Bias by Lead Time
+                    <small class="text-muted ms-2">(positive = high bias, negative = low bias)</small>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="mslpBiasChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Data Table -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-table"></i> Verification Statistics by Lead Time
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Lead Time</th>
+                                    <th>Days Out</th>
+                                    <th>GFS Temp MAE</th>
+                                    <th>AIFS Temp MAE</th>
+                                    <th>IFS Temp MAE</th>
+                                    <th>Winner</th>
+                                    <th>GFS MSLP MAE</th>
+                                    <th>AIFS MSLP MAE</th>
+                                    <th>IFS MSLP MAE</th>
+                                    <th>Samples</th>
+                                </tr>
+                            </thead>
+                            <tbody id="verificationTable">
+                                <!-- Populated by JavaScript -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Historical Runs List -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-clock-history"></i> Historical Model Runs
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Init Time</th>
+                                    <th>Fetched At</th>
+                                    <th>Has Observations</th>
+                                    <th>Temp MAE</th>
+                                    <th>MSLP MAE</th>
+                                </tr>
+                            </thead>
+                            <tbody id="runsTable">
+                                <!-- Populated by JavaScript -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let tempMaeChart, tempBiasChart, mslpMaeChart, mslpBiasChart;
+
+// Format lead time for display
+function formatLeadTime(hours) {
+    if (hours < 24) {
+        return hours + 'h';
+    }
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+    if (remainingHours === 0) {
+        return days + 'd';
+    }
+    return days + 'd ' + remainingHours + 'h';
+}
+
+// Load verification data
+async function loadVerification() {
+    const location = document.getElementById('locationSelect').value;
+
+    document.getElementById('loadingState').classList.remove('d-none');
+    document.getElementById('verificationContent').classList.add('d-none');
+    document.getElementById('errorState').classList.add('d-none');
+
+    try {
+        const [verificationResponse, runsResponse] = await Promise.all([
+            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`),
+            fetch(`/api/runs?location=${encodeURIComponent(location)}`)
+        ]);
+
+        const verificationData = await verificationResponse.json();
+        const runsData = await runsResponse.json();
+
+        if (!verificationData.success) {
+            throw new Error(verificationData.error || 'No verification data available');
+        }
+
+        const v = verificationData.verification;
+
+        if (!v.lead_times || v.lead_times.length === 0) {
+            throw new Error('No verified forecast data yet. Sync forecasts and wait for observations.');
+        }
+
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('verificationContent').classList.remove('d-none');
+
+        updateSummaryStats(v);
+        renderCharts(v);
+        renderTable(v);
+
+        if (runsData.success) {
+            renderRunsTable(runsData.runs);
+        }
+
+    } catch (error) {
+        console.error('Error loading verification:', error);
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('errorState').classList.remove('d-none');
+        document.getElementById('errorMessage').textContent = error.message;
+    }
+}
+
+// Update summary statistics
+function updateSummaryStats(v) {
+    document.getElementById('totalRuns').textContent = v.run_count || '--';
+
+    const maxLeadHours = v.lead_times.length > 0 ? Math.max(...v.lead_times) : 0;
+    document.getElementById('maxLeadTime').textContent = formatLeadTime(maxLeadHours);
+
+    // Calculate average MAE across all lead times
+    const gfsTempMaes = v.gfs_temp_mae.filter(x => x !== null);
+    const aifsTempMaes = v.aifs_temp_mae.filter(x => x !== null);
+    const ifsTempMaes = (v.ifs_temp_mae || []).filter(x => x !== null);
+
+    if (gfsTempMaes.length > 0) {
+        const avgGfs = (gfsTempMaes.reduce((a, b) => a + b, 0) / gfsTempMaes.length).toFixed(1);
+        document.getElementById('gfsAvgMae').textContent = avgGfs + '°F';
+    }
+
+    if (aifsTempMaes.length > 0) {
+        const avgAifs = (aifsTempMaes.reduce((a, b) => a + b, 0) / aifsTempMaes.length).toFixed(1);
+        document.getElementById('aifsAvgMae').textContent = avgAifs + '°F';
+    }
+
+    if (ifsTempMaes.length > 0) {
+        const avgIfs = (ifsTempMaes.reduce((a, b) => a + b, 0) / ifsTempMaes.length).toFixed(1);
+        document.getElementById('ifsAvgMae').textContent = avgIfs + '°F';
+    }
+}
+
+// Render charts
+function renderCharts(v) {
+    const labels = v.lead_times.map(h => formatLeadTime(h));
+
+    // Temperature MAE chart datasets
+    const tempMaeDatasets = [
+        {
+            label: 'GFS',
+            data: v.gfs_temp_mae,
+            borderColor: '#dc3545',
+            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2
+        },
+        {
+            label: 'AIFS',
+            data: v.aifs_temp_mae,
+            borderColor: '#e85d2d',
+            backgroundColor: 'rgba(232, 93, 45, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5]
+        }
+    ];
+
+    if (v.ifs_temp_mae) {
+        tempMaeDatasets.push({
+            label: 'IFS',
+            data: v.ifs_temp_mae,
+            borderColor: '#198754',
+            backgroundColor: 'rgba(25, 135, 84, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [2, 2]
+        });
+    }
+
+    // Temperature MAE chart
+    if (tempMaeChart) tempMaeChart.destroy();
+    tempMaeChart = new Chart(document.getElementById('tempMaeChart'), {
+        type: 'line',
+        data: { labels: labels, datasets: tempMaeDatasets },
+        options: getChartOptions('Temperature MAE (°F)', 0)
+    });
+
+    // Temperature Bias chart datasets
+    const tempBiasDatasets = [
+        {
+            label: 'GFS',
+            data: v.gfs_temp_bias,
+            borderColor: '#dc3545',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2
+        },
+        {
+            label: 'AIFS',
+            data: v.aifs_temp_bias,
+            borderColor: '#e85d2d',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5]
+        }
+    ];
+
+    if (v.ifs_temp_bias) {
+        tempBiasDatasets.push({
+            label: 'IFS',
+            data: v.ifs_temp_bias,
+            borderColor: '#198754',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [2, 2]
+        });
+    }
+
+    // Temperature Bias chart
+    if (tempBiasChart) tempBiasChart.destroy();
+    tempBiasChart = new Chart(document.getElementById('tempBiasChart'), {
+        type: 'line',
+        data: { labels: labels, datasets: tempBiasDatasets },
+        options: getChartOptions('Temperature Bias (°F)', null, true)
+    });
+
+    // MSLP MAE chart datasets
+    const mslpMaeDatasets = [
+        {
+            label: 'GFS',
+            data: v.gfs_mslp_mae,
+            borderColor: '#6f42c1',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2
+        },
+        {
+            label: 'AIFS',
+            data: v.aifs_mslp_mae,
+            borderColor: '#d63384',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5]
+        }
+    ];
+
+    if (v.ifs_mslp_mae) {
+        mslpMaeDatasets.push({
+            label: 'IFS',
+            data: v.ifs_mslp_mae,
+            borderColor: '#fd7e14',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [2, 2]
+        });
+    }
+
+    // MSLP MAE chart
+    if (mslpMaeChart) mslpMaeChart.destroy();
+    mslpMaeChart = new Chart(document.getElementById('mslpMaeChart'), {
+        type: 'line',
+        data: { labels: labels, datasets: mslpMaeDatasets },
+        options: getChartOptions('Pressure MAE (mb)', 0)
+    });
+
+    // MSLP Bias chart datasets
+    const mslpBiasDatasets = [
+        {
+            label: 'GFS',
+            data: v.gfs_mslp_bias,
+            borderColor: '#6f42c1',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2
+        },
+        {
+            label: 'AIFS',
+            data: v.aifs_mslp_bias,
+            borderColor: '#d63384',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5]
+        }
+    ];
+
+    if (v.ifs_mslp_bias) {
+        mslpBiasDatasets.push({
+            label: 'IFS',
+            data: v.ifs_mslp_bias,
+            borderColor: '#fd7e14',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [2, 2]
+        });
+    }
+
+    // MSLP Bias chart
+    if (mslpBiasChart) mslpBiasChart.destroy();
+    mslpBiasChart = new Chart(document.getElementById('mslpBiasChart'), {
+        type: 'line',
+        data: { labels: labels, datasets: mslpBiasDatasets },
+        options: getChartOptions('Pressure Bias (mb)', null, true)
+    });
+}
+
+function getChartOptions(yLabel, minY = null, showZeroLine = false) {
+    const options = {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: {
+            mode: 'index',
+            intersect: false
+        },
+        plugins: {
+            legend: {
+                position: 'top',
+                labels: {
+                    usePointStyle: true,
+                    padding: 20
+                }
+            }
+        },
+        scales: {
+            y: {
+                grid: { color: '#e0e0e0' },
+                title: { display: true, text: yLabel }
+            },
+            x: {
+                grid: { display: false },
+                title: { display: true, text: 'Lead Time' }
+            }
+        }
+    };
+
+    if (minY !== null) {
+        options.scales.y.min = minY;
+    }
+
+    if (showZeroLine) {
+        options.plugins.annotation = {
+            annotations: {
+                zeroLine: {
+                    type: 'line',
+                    yMin: 0,
+                    yMax: 0,
+                    borderColor: '#999',
+                    borderWidth: 1,
+                    borderDash: [5, 5]
+                }
+            }
+        };
+    }
+
+    return options;
+}
+
+// Render data table
+function renderTable(v) {
+    const tbody = document.getElementById('verificationTable');
+    tbody.innerHTML = '';
+
+    const ifsTempMae = v.ifs_temp_mae || [];
+    const ifsMslpMae = v.ifs_mslp_mae || [];
+
+    for (let i = 0; i < v.lead_times.length; i++) {
+        const lt = v.lead_times[i];
+        const days = v.lead_times_days[i];
+        const gfsTempMae = v.gfs_temp_mae[i];
+        const aifsTempMae = v.aifs_temp_mae[i];
+        const ifsTempMaeVal = ifsTempMae[i];
+        const gfsMslpMae = v.gfs_mslp_mae[i];
+        const aifsMslpMae = v.aifs_mslp_mae[i];
+        const ifsMslpMaeVal = ifsMslpMae[i];
+        const samples = v.temp_sample_counts[i];
+
+        // Determine winner - find lowest MAE among all models
+        let winner = '--';
+        let winnerClass = 'badge bg-secondary';
+        const tempMaes = [
+            { name: 'GFS', mae: gfsTempMae, class: 'badge bg-danger' },
+            { name: 'AIFS', mae: aifsTempMae, class: 'badge bg-warning text-dark' },
+            { name: 'IFS', mae: ifsTempMaeVal, class: 'badge bg-success' }
+        ].filter(m => m.mae !== null && m.mae !== undefined);
+
+        if (tempMaes.length > 0) {
+            const minMae = Math.min(...tempMaes.map(m => m.mae));
+            const winners = tempMaes.filter(m => m.mae === minMae);
+            if (winners.length === 1) {
+                winner = winners[0].name;
+                winnerClass = winners[0].class;
+            } else {
+                winner = 'Tie';
+                winnerClass = 'badge bg-secondary';
+            }
+        }
+
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td><strong>${formatLeadTime(lt)}</strong></td>
+            <td>${days.toFixed(1)}</td>
+            <td>${gfsTempMae !== null ? gfsTempMae.toFixed(1) + '°F' : '--'}</td>
+            <td>${aifsTempMae !== null ? aifsTempMae.toFixed(1) + '°F' : '--'}</td>
+            <td>${ifsTempMaeVal !== null && ifsTempMaeVal !== undefined ? ifsTempMaeVal.toFixed(1) + '°F' : '--'}</td>
+            <td><span class="${winnerClass}">${winner}</span></td>
+            <td>${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' : '--'}</td>
+            <td>${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + ' mb' : '--'}</td>
+            <td>${ifsMslpMaeVal !== null && ifsMslpMaeVal !== undefined ? ifsMslpMaeVal.toFixed(1) + ' mb' : '--'}</td>
+            <td>${samples}</td>
+        `;
+        tbody.appendChild(row);
+    }
+}
+
+// Render runs table
+function renderRunsTable(runs) {
+    const tbody = document.getElementById('runsTable');
+    tbody.innerHTML = '';
+
+    for (const run of runs) {
+        const initTime = new Date(run.run_id);
+        const fetchedAt = run.fetched_at ? new Date(run.fetched_at) : null;
+        const v = run.verification || {};
+
+        // Build temp MAE string
+        let tempMaeStr = '--';
+        if (v.gfs_temp_mae !== undefined && v.gfs_temp_mae !== null) {
+            tempMaeStr = `GFS: ${v.gfs_temp_mae}°`;
+            if (v.aifs_temp_mae !== undefined && v.aifs_temp_mae !== null) {
+                tempMaeStr += ` / AIFS: ${v.aifs_temp_mae}°`;
+            }
+            if (v.ifs_temp_mae !== undefined && v.ifs_temp_mae !== null) {
+                tempMaeStr += ` / IFS: ${v.ifs_temp_mae}°`;
+            }
+        }
+
+        // Build MSLP MAE string
+        let mslpMaeStr = '--';
+        if (v.gfs_mslp_mae !== undefined && v.gfs_mslp_mae !== null) {
+            mslpMaeStr = `GFS: ${v.gfs_mslp_mae}`;
+            if (v.aifs_mslp_mae !== undefined && v.aifs_mslp_mae !== null) {
+                mslpMaeStr += ` / AIFS: ${v.aifs_mslp_mae}`;
+            }
+            if (v.ifs_mslp_mae !== undefined && v.ifs_mslp_mae !== null) {
+                mslpMaeStr += ` / IFS: ${v.ifs_mslp_mae}`;
+            }
+            mslpMaeStr += ' mb';
+        }
+
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>
+                <strong>${initTime.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', timeZoneName: 'short' })}</strong>
+                ${run.is_latest ? '<span class="badge bg-primary ms-2">Latest</span>' : ''}
+            </td>
+            <td>${fetchedAt ? fetchedAt.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '--'}</td>
+            <td>
+                ${run.has_observations ?
+                    '<span class="badge bg-success">Yes</span>' :
+                    '<span class="badge bg-secondary">No</span>'}
+            </td>
+            <td>${tempMaeStr}</td>
+            <td>${mslpMaeStr}</td>
+        `;
+        tbody.appendChild(row);
+    }
+}
+
+// Event listeners
+document.getElementById('locationSelect').addEventListener('change', loadVerification);
+
+// Initial load
+document.addEventListener('DOMContentLoaded', loadVerification);
+</script>
+{% endblock %}

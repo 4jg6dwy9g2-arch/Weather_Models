@@ -1,0 +1,436 @@
+{% extends "base.html" %}
+
+{% block title %}Sync - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .sync-header {
+        background: linear-gradient(135deg, #6f42c1 0%, #0088cc 100%);
+        color: white;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+    }
+
+    .sync-card {
+        transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .sync-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+
+    .sync-btn {
+        min-width: 150px;
+    }
+
+    .progress-container {
+        display: none;
+    }
+
+    .progress-container.active {
+        display: block;
+    }
+
+    .log-output {
+        background-color: #1d1d1f;
+        color: #00ff00;
+        font-family: 'Monaco', 'Menlo', monospace;
+        font-size: 0.85rem;
+        padding: 1rem;
+        border-radius: 8px;
+        max-height: 300px;
+        overflow-y: auto;
+    }
+
+    .log-entry {
+        margin-bottom: 0.25rem;
+    }
+
+    .log-entry.error {
+        color: #ff6b6b;
+    }
+
+    .log-entry.success {
+        color: #51cf66;
+    }
+
+    .log-entry.info {
+        color: #74c0fc;
+    }
+
+    .saved-file-badge {
+        background-color: rgba(0, 168, 107, 0.15);
+        color: #00a86b;
+        padding: 0.5rem 1rem;
+        border-radius: 8px;
+        font-family: monospace;
+        font-size: 0.85rem;
+    }
+
+    .status-indicator {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-right: 8px;
+    }
+
+    .status-idle { background-color: #adb5bd; }
+    .status-running { background-color: #ffc107; animation: pulse 1s infinite; }
+    .status-success { background-color: #28a745; }
+    .status-error { background-color: #dc3545; }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="sync-header">
+    <div class="row align-items-center">
+        <div class="col-md-8">
+            <h1 class="mb-1"><i class="bi bi-cloud-download"></i> Sync Model Data</h1>
+            <p class="mb-0 opacity-75">Fetch the latest forecast data from GFS, ECMWF AIFS, and ECMWF IFS</p>
+        </div>
+        <div class="col-md-4 text-md-end">
+            <span class="status-indicator status-idle" id="statusIndicator"></span>
+            <span id="statusText">Ready</span>
+        </div>
+    </div>
+</div>
+
+<!-- Sync Controls -->
+<div class="row mb-4">
+    <div class="col-lg-6 mb-3">
+        <div class="card sync-card h-100">
+            <div class="card-header">
+                <i class="bi bi-geo-alt"></i> Location
+            </div>
+            <div class="card-body">
+                <select class="form-select form-select-lg" id="locationSelect">
+                    {% for loc in locations %}
+                    <option value="{{ loc }}" {% if loc == selected_location %}selected{% endif %}>{{ loc }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-6 mb-3">
+        <div class="card sync-card h-100">
+            <div class="card-header">
+                <i class="bi bi-calendar-range"></i> Forecast Range
+            </div>
+            <div class="card-body">
+                <select class="form-select form-select-lg" id="daysSelect">
+                    <option value="3">3 days</option>
+                    <option value="5">5 days</option>
+                    <option value="7" selected>7 days</option>
+                    <option value="10">10 days</option>
+                    <option value="15">15 days (max)</option>
+                </select>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Sync Buttons -->
+<div class="row mb-4">
+    <div class="col-12 text-center">
+        <button class="btn btn-primary btn-lg sync-btn me-2" id="syncBtn" onclick="startSync(false)">
+            <i class="bi bi-cloud-download"></i> Sync Data
+        </button>
+        <button class="btn btn-outline-secondary btn-lg sync-btn" id="forceSyncBtn" onclick="startSync(true)">
+            <i class="bi bi-arrow-repeat"></i> Force Refresh
+        </button>
+        <p class="text-muted mt-2 mb-0">
+            <small>Sync checks for new model runs. Force Refresh always re-downloads data.</small>
+        </p>
+    </div>
+</div>
+
+<!-- Progress Section -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card" id="progressCard" style="display: none;">
+            <div class="card-header">
+                <i class="bi bi-terminal"></i> Sync Progress
+            </div>
+            <div class="card-body">
+                <div class="progress mb-3" style="height: 24px;">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated" id="progressBar"
+                         role="progressbar" style="width: 0%">0%</div>
+                </div>
+                <div class="log-output" id="logOutput">
+                    <div class="log-entry info">Waiting to start...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Results Section -->
+<div class="row mb-4" id="resultsSection" style="display: none;">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-check-circle"></i> Sync Complete
+            </div>
+            <div class="card-body">
+                <div class="row mb-3">
+                    <div class="col-md-6">
+                        <h6>Saved to:</h6>
+                        <div class="saved-file-badge" id="savedFilePath">--</div>
+                    </div>
+                    <div class="col-md-6 text-md-end">
+                        <a href="/" class="btn btn-primary">
+                            <i class="bi bi-speedometer2"></i> View Dashboard
+                        </a>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-lg-2 col-md-4 col-6">
+                        <div class="stat-card text-center p-3">
+                            <div class="stat-value stat-value-gfs" id="resultGfsHigh">--</div>
+                            <div class="stat-label">GFS High</div>
+                        </div>
+                    </div>
+                    <div class="col-lg-2 col-md-4 col-6">
+                        <div class="stat-card text-center p-3">
+                            <div class="stat-value stat-value-aifs" id="resultAifsHigh">--</div>
+                            <div class="stat-label">AIFS High</div>
+                        </div>
+                    </div>
+                    <div class="col-lg-2 col-md-4 col-6">
+                        <div class="stat-card text-center p-3">
+                            <div class="stat-value stat-value-ifs" id="resultIfsHigh">--</div>
+                            <div class="stat-label">IFS High</div>
+                        </div>
+                    </div>
+                    <div class="col-lg-2 col-md-4 col-6">
+                        <div class="stat-card text-center p-3">
+                            <div class="stat-value stat-value-gfs" id="resultGfsInit">--</div>
+                            <div class="stat-label">GFS Init</div>
+                        </div>
+                    </div>
+                    <div class="col-lg-2 col-md-4 col-6">
+                        <div class="stat-card text-center p-3">
+                            <div class="stat-value stat-value-aifs" id="resultAifsInit">--</div>
+                            <div class="stat-label">AIFS Init</div>
+                        </div>
+                    </div>
+                    <div class="col-lg-2 col-md-4 col-6">
+                        <div class="stat-card text-center p-3">
+                            <div class="stat-value stat-value-ifs" id="resultIfsInit">--</div>
+                            <div class="stat-label">IFS Init</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Saved Forecasts -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-archive"></i> Saved Forecasts</span>
+                <button class="btn btn-sm btn-outline-light" onclick="loadSavedForecasts()">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Location</th>
+                                <th>Fetched At</th>
+                                <th>GFS Init</th>
+                                <th>AIFS Init</th>
+                                <th>IFS Init</th>
+                            </tr>
+                        </thead>
+                        <tbody id="savedForecastsTable">
+                            <tr>
+                                <td colspan="5" class="text-center text-muted">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let isSyncing = false;
+
+function formatDateTime(isoStr) {
+    if (!isoStr) return '--';
+    const date = new Date(isoStr);
+    return date.toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+    });
+}
+
+function formatInitTime(isoStr) {
+    if (!isoStr) return '--';
+    const date = new Date(isoStr);
+    return date.toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        hour12: false
+    }) + 'Z';
+}
+
+function addLog(message, type = 'info') {
+    const logOutput = document.getElementById('logOutput');
+    const entry = document.createElement('div');
+    entry.className = `log-entry ${type}`;
+    entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+    logOutput.appendChild(entry);
+    logOutput.scrollTop = logOutput.scrollHeight;
+}
+
+function updateProgress(percent, message) {
+    const progressBar = document.getElementById('progressBar');
+    progressBar.style.width = `${percent}%`;
+    progressBar.textContent = `${percent}%`;
+    if (message) addLog(message);
+}
+
+function setStatus(status, text) {
+    const indicator = document.getElementById('statusIndicator');
+    const statusText = document.getElementById('statusText');
+
+    indicator.className = `status-indicator status-${status}`;
+    statusText.textContent = text;
+}
+
+async function startSync(force = false) {
+    if (isSyncing) return;
+
+    isSyncing = true;
+    const location = document.getElementById('locationSelect').value;
+    const days = document.getElementById('daysSelect').value;
+
+    // Show progress card, hide results
+    document.getElementById('progressCard').style.display = 'block';
+    document.getElementById('resultsSection').style.display = 'none';
+    document.getElementById('logOutput').innerHTML = '';
+
+    // Update UI
+    document.getElementById('syncBtn').disabled = true;
+    document.getElementById('forceSyncBtn').disabled = true;
+    document.getElementById('syncBtn').innerHTML = '<span class="spinner-border spinner-border-sm"></span> Checking...';
+    setStatus('running', 'Checking for updates...');
+
+    addLog(`Checking for new model data for ${location}...`, 'info');
+    updateProgress(5, 'Checking latest model runs...');
+
+    try {
+        const forceParam = force ? '&force=true' : '';
+        const response = await fetch(`/api/forecast?location=${encodeURIComponent(location)}&days=${days}${forceParam}`);
+
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'Sync failed');
+        }
+
+        if (data.cached && !force) {
+            // Data was already cached
+            updateProgress(100, 'Using cached data - already up to date!');
+            addLog(data.message, 'success');
+            addLog('No new model runs available. Use "Force Refresh" to re-fetch.', 'info');
+            setStatus('success', 'Already up to date');
+        } else {
+            // New data was fetched
+            updateProgress(50, 'Downloading and processing data...');
+            updateProgress(90, 'Saving data...');
+            updateProgress(100, 'Sync complete!');
+            addLog(data.message || 'Fetched new data', 'success');
+            addLog(`Saved to: ${data.saved_to}`, 'success');
+            setStatus('success', 'Sync complete');
+        }
+
+        // Update results section
+        document.getElementById('resultsSection').style.display = 'block';
+        document.getElementById('savedFilePath').textContent = data.cached ? 'forecasts.json (cached)' : 'forecasts.json';
+
+        const gfsTemps = data.gfs.temps.filter(t => t !== null);
+        const aifsTemps = data.aifs.temps.filter(t => t !== null);
+        const ifsTemps = data.ifs ? data.ifs.temps.filter(t => t !== null) : [];
+
+        document.getElementById('resultGfsHigh').textContent = gfsTemps.length > 0
+            ? Math.round(Math.max(...gfsTemps)) + '°F' : '--';
+        document.getElementById('resultAifsHigh').textContent = aifsTemps.length > 0
+            ? Math.round(Math.max(...aifsTemps)) + '°F' : '--';
+        document.getElementById('resultIfsHigh').textContent = ifsTemps.length > 0
+            ? Math.round(Math.max(...ifsTemps)) + '°F' : '--';
+        document.getElementById('resultGfsInit').textContent = formatInitTime(data.gfs.init_time);
+        document.getElementById('resultAifsInit').textContent = formatInitTime(data.aifs.init_time);
+        document.getElementById('resultIfsInit').textContent = data.ifs ? formatInitTime(data.ifs.init_time) : '--';
+
+        // Refresh saved forecasts list
+        loadSavedForecasts();
+
+    } catch (error) {
+        addLog(`Error: ${error.message}`, 'error');
+        setStatus('error', 'Sync failed');
+        updateProgress(0, '');
+    } finally {
+        isSyncing = false;
+        document.getElementById('syncBtn').disabled = false;
+        document.getElementById('forceSyncBtn').disabled = false;
+        document.getElementById('syncBtn').innerHTML = '<i class="bi bi-cloud-download"></i> Sync Data';
+    }
+}
+
+async function loadSavedForecasts() {
+    const tbody = document.getElementById('savedForecastsTable');
+
+    try {
+        const response = await fetch('/api/saved-forecasts');
+        const data = await response.json();
+
+        if (!data.success || data.forecasts.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No saved forecasts</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = '';
+        data.forecasts.forEach(f => {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td><strong>${f.location}</strong></td>
+                <td>${formatDateTime(f.fetched_at)}</td>
+                <td>${formatInitTime(f.gfs_init)}</td>
+                <td>${formatInitTime(f.aifs_init)}</td>
+                <td>${formatInitTime(f.ifs_init)}</td>
+            `;
+            tbody.appendChild(row);
+        });
+
+    } catch (error) {
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center text-danger">Failed to load</td></tr>';
+    }
+}
+
+// Load saved forecasts on page load
+document.addEventListener('DOMContentLoaded', loadSavedForecasts);
+</script>
+{% endblock %}
