@@ -1,0 +1,60 @@
+FLASK APP AUTO-START SETUP (macOS LaunchAgent)
+==============================================
+
+This will make your Flask weather app start automatically when you log in
+and keep it running in the background.
+
+STEP 1: Copy the launch agent to LaunchAgents directory
+--------------------------------------------------------
+Run this command:
+    cp /Users/kennypratt/Documents/Weather_Models/com.weather.app.plist ~/Library/LaunchAgents/
+
+STEP 2: Load the launch agent
+------------------------------
+Run this command:
+    launchctl load ~/Library/LaunchAgents/com.weather.app.plist
+
+STEP 3: Start the service
+--------------------------
+Run this command:
+    launchctl start com.weather.app
+
+VERIFY IT'S RUNNING:
+--------------------
+Check if the Flask app is running:
+    curl http://localhost:5000/
+
+You should see the dashboard page HTML.
+
+Or check the logs:
+    tail -f /Users/kennypratt/Documents/Weather_Models/logs/flask_app.log
+
+MANAGING THE SERVICE:
+---------------------
+Stop the service:
+    launchctl stop com.weather.app
+
+Restart the service:
+    launchctl stop com.weather.app && launchctl start com.weather.app
+
+Unload the service (disable auto-start):
+    launchctl unload ~/Library/LaunchAgents/com.weather.app.plist
+
+Reload after editing the plist file:
+    launchctl unload ~/Library/LaunchAgents/com.weather.app.plist
+    launchctl load ~/Library/LaunchAgents/com.weather.app.plist
+
+TROUBLESHOOTING:
+----------------
+If the service won't start:
+1. Check the error log:
+   cat /Users/kennypratt/Documents/Weather_Models/logs/flask_app_error.log
+
+2. Verify Python path is correct:
+   which python3
+
+3. Make sure app.py has the correct if __name__ == '__main__' block
+
+4. Test running manually first:
+   cd /Users/kennypratt/Documents/Weather_Models
+   python3 app.py

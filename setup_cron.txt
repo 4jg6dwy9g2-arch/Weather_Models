@@ -1,0 +1,47 @@
+CRON JOB SETUP INSTRUCTIONS
+===========================
+
+This will run the weather sync every 6 hours at: 1 AM, 7 AM, 1 PM, and 7 PM
+
+STEP 1: Open your crontab
+--------------------------
+Run this command in your terminal:
+    crontab -e
+
+STEP 2: Add the following line
+-------------------------------
+Copy and paste this line into the crontab editor:
+
+0 1,7,13,19 * * * /Users/kennypratt/Documents/Weather_Models/sync_weather.sh >> /Users/kennypratt/Documents/Weather_Models/logs/cron.log 2>&1
+
+STEP 3: Save and exit
+---------------------
+- If using vim: Press ESC, then type :wq and press ENTER
+- If using nano: Press CTRL+X, then Y, then ENTER
+
+STEP 4: Verify the cron job
+----------------------------
+Run this command to verify it was added:
+    crontab -l
+
+You should see your sync job listed.
+
+IMPORTANT NOTES:
+----------------
+1. Make sure your Flask app is running on localhost:5000 when the cron job executes
+2. You may want to set up the Flask app to run as a service so it's always available
+3. Logs will be stored in: /Users/kennypratt/Documents/Weather_Models/logs/
+4. Cron jobs on macOS may require Full Disk Access permission for cron in System Preferences > Security & Privacy
+
+TESTING THE SCRIPT:
+-------------------
+You can manually test the script anytime by running:
+    /Users/kennypratt/Documents/Weather_Models/sync_weather.sh
+
+VIEWING LOGS:
+-------------
+To view the latest sync log:
+    ls -lt /Users/kennypratt/Documents/Weather_Models/logs/sync_*.log | head -1 | awk '{print $9}' | xargs cat
+
+To view the cron execution log:
+    tail -f /Users/kennypratt/Documents/Weather_Models/logs/cron.log

@@ -258,17 +258,17 @@
                 <ul class="navbar-nav ms-auto">
                     <li class="nav-item">
                         <a class="nav-link {% if request.path == '/' %}active{% endif %}" href="/">
-                            <i class="bi bi-speedometer2"></i> Dashboard
+                            <i class="bi bi-speedometer2"></i> Fairfax Verification
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/verification' %}active{% endif %}" href="/verification">
+                            <i class="bi bi-graph-up"></i> ASOS Verification
                         </a>
                     </li>
                     <li class="nav-item">
                         <a class="nav-link {% if request.path == '/sync' %}active{% endif %}" href="/sync">
                             <i class="bi bi-cloud-download"></i> Sync
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link {% if request.path == '/verification' %}active{% endif %}" href="/verification">
-                            <i class="bi bi-graph-up"></i> Verification
                         </a>
                     </li>
                 </ul>
