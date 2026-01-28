@@ -2,6 +2,38 @@
 
 {% block title %}Verification - Weather Forecast{% endblock %}
 
+{% block extra_css %}
+<style>
+    /* ASOS Map Styles */
+    #asosMap {
+        background-color: #e8e8e8;
+    }
+
+    #asosMapContainer {
+        background-color: #f5f5f5;
+    }
+
+    .leaflet-tooltip {
+        background-color: white;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        padding: 6px 10px;
+        font-size: 13px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+    }
+
+    .leaflet-tooltip strong {
+        color: #333;
+    }
+
+    /* Make dropdowns look better on the card header */
+    .card-header .form-select-sm {
+        padding: 0.25rem 1.75rem 0.25rem 0.5rem;
+        font-size: 0.8rem;
+    }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="forecast-header">
     <div class="row align-items-center">
@@ -33,6 +65,68 @@
 </div>
 
 <div id="verificationContent" class="d-none">
+    <!-- ASOS Station Verification Map -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div>
+                        <i class="bi bi-geo-alt"></i> ASOS Station Verification
+                        <span class="badge bg-secondary ms-2" id="asosStationCount">-- stations</span>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap">
+                        <select class="form-select form-select-sm" id="asosVariable" style="width: auto;">
+                            <option value="temp">Temperature</option>
+                            <option value="mslp">Pressure</option>
+                            <option value="precip">Precipitation</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="asosMetric" style="width: auto;">
+                            <option value="mae">MAE</option>
+                            <option value="bias">Bias</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="asosModel" style="width: auto;">
+                            <option value="gfs">GFS</option>
+                            <option value="aifs">AIFS</option>
+                            <option value="ifs">IFS</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="asosLeadTime" style="width: auto;">
+                            <option value="6">6h</option>
+                            <option value="12">12h</option>
+                            <option value="24" selected>24h</option>
+                            <option value="48">48h</option>
+                            <option value="72">72h</option>
+                            <option value="120">5d</option>
+                            <option value="168">7d</option>
+                        </select>
+                        <button class="btn btn-sm btn-primary" id="asosSyncBtn" onclick="syncAsosData()">
+                            <i class="bi bi-cloud-download"></i> Sync
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body p-0">
+                    <div id="asosMapContainer" style="height: 450px; position: relative;">
+                        <div id="asosMap" style="height: 100%; width: 100%;"></div>
+                        <div id="asosMapLoading" class="position-absolute top-50 start-50 translate-middle text-center" style="z-index: 1000;">
+                            <div class="spinner-border text-primary" role="status"></div>
+                            <p class="mt-2 text-muted">Loading station data...</p>
+                        </div>
+                        <div id="asosMapEmpty" class="position-absolute top-50 start-50 translate-middle text-center d-none" style="z-index: 1000;">
+                            <i class="bi bi-info-circle fs-1 text-muted"></i>
+                            <p class="mt-2 text-muted">No verification data yet.<br>Sync forecasts and wait for valid times to pass.</p>
+                        </div>
+                    </div>
+                    <!-- Color Scale Legend -->
+                    <div class="d-flex align-items-center justify-content-center gap-3 py-2 border-top bg-light">
+                        <span id="asosColorMin" class="text-muted small">0</span>
+                        <div id="asosColorScale" style="width: 200px; height: 12px; border-radius: 4px;"></div>
+                        <span id="asosColorMax" class="text-muted small">10</span>
+                        <span id="asosUnits" class="text-muted small ms-2"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Summary Stats -->
     <div class="row mb-4">
         <div class="col-lg-2 col-md-4 col-6 mb-3">
@@ -219,6 +313,283 @@
 {% block extra_js %}
 <script>
 let tempMaeChart, tempBiasChart, mslpMaeChart, mslpBiasChart;
+
+// ============================================================================
+// ASOS Map Functionality
+// ============================================================================
+
+let asosMap = null;
+let asosMarkers = [];
+
+// Initialize ASOS map
+function initAsosMap() {
+    if (asosMap) return;
+
+    // Create map centered on CONUS
+    asosMap = L.map('asosMap', {
+        center: [39.5, -98.5],
+        zoom: 4,
+        minZoom: 3,
+        maxZoom: 10
+    });
+
+    // Add tile layer (OpenStreetMap)
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 19
+    }).addTo(asosMap);
+
+    // Initialize color scale
+    updateColorScale('mae', 0, 10);
+}
+
+// Color interpolation for MAE (green -> yellow -> red)
+function getMaeColor(value, minVal, maxVal) {
+    const ratio = Math.max(0, Math.min(1, (value - minVal) / (maxVal - minVal || 1)));
+
+    // Green (#22c55e) -> Yellow (#eab308) -> Red (#ef4444)
+    if (ratio < 0.5) {
+        // Green to Yellow
+        const t = ratio * 2;
+        const r = Math.round(34 + t * (234 - 34));
+        const g = Math.round(197 + t * (179 - 197));
+        const b = Math.round(94 + t * (8 - 94));
+        return `rgb(${r}, ${g}, ${b})`;
+    } else {
+        // Yellow to Red
+        const t = (ratio - 0.5) * 2;
+        const r = Math.round(234 + t * (239 - 234));
+        const g = Math.round(179 + t * (68 - 179));
+        const b = Math.round(8 + t * (68 - 8));
+        return `rgb(${r}, ${g}, ${b})`;
+    }
+}
+
+// Color interpolation for Bias (blue -> white -> red)
+function getBiasColor(value, minVal, maxVal) {
+    // Normalize to -1 to 1
+    const maxAbs = Math.max(Math.abs(minVal), Math.abs(maxVal), 0.1);
+    const ratio = value / maxAbs;  // -1 to 1
+
+    // Blue (#3b82f6) -> White (#ffffff) -> Red (#ef4444)
+    if (ratio < 0) {
+        // Blue to White
+        const t = 1 + ratio;  // 0 to 1
+        const r = Math.round(59 + t * (255 - 59));
+        const g = Math.round(130 + t * (255 - 130));
+        const b = Math.round(246 + t * (255 - 246));
+        return `rgb(${r}, ${g}, ${b})`;
+    } else {
+        // White to Red
+        const t = ratio;  // 0 to 1
+        const r = Math.round(255 + t * (239 - 255));
+        const g = Math.round(255 + t * (68 - 255));
+        const b = Math.round(255 + t * (68 - 255));
+        return `rgb(${r}, ${g}, ${b})`;
+    }
+}
+
+// Get color based on metric type
+function getMarkerColor(value, metric, minVal, maxVal) {
+    if (metric === 'bias') {
+        return getBiasColor(value, minVal, maxVal);
+    } else {
+        return getMaeColor(value, minVal, maxVal);
+    }
+}
+
+// Update color scale display
+function updateColorScale(metric, minVal, maxVal) {
+    const scale = document.getElementById('asosColorScale');
+    const minSpan = document.getElementById('asosColorMin');
+    const maxSpan = document.getElementById('asosColorMax');
+    const unitsSpan = document.getElementById('asosUnits');
+
+    const variable = document.getElementById('asosVariable').value;
+
+    // Set units
+    const units = {
+        'temp': '°F',
+        'mslp': 'mb',
+        'precip': 'in'
+    };
+    unitsSpan.textContent = units[variable] || '';
+
+    // Format values
+    minSpan.textContent = minVal.toFixed(1);
+    maxSpan.textContent = maxVal.toFixed(1);
+
+    // Create gradient
+    if (metric === 'bias') {
+        scale.style.background = 'linear-gradient(to right, #3b82f6, #ffffff 50%, #ef4444)';
+    } else {
+        scale.style.background = 'linear-gradient(to right, #22c55e, #eab308 50%, #ef4444)';
+    }
+}
+
+// Clear all markers
+function clearAsosMarkers() {
+    for (const marker of asosMarkers) {
+        asosMap.removeLayer(marker);
+    }
+    asosMarkers = [];
+}
+
+// Load and display ASOS verification data
+async function loadAsosVerification() {
+    if (!asosMap) {
+        initAsosMap();
+    }
+
+    const variable = document.getElementById('asosVariable').value;
+    const metric = document.getElementById('asosMetric').value;
+    const model = document.getElementById('asosModel').value;
+    const leadTime = document.getElementById('asosLeadTime').value;
+
+    // Show loading
+    document.getElementById('asosMapLoading').classList.remove('d-none');
+    document.getElementById('asosMapEmpty').classList.add('d-none');
+
+    try {
+        const response = await fetch(
+            `/api/asos/verification-map?variable=${variable}&metric=${metric}&model=${model}&lead_time=${leadTime}`
+        );
+        const data = await response.json();
+
+        // Hide loading
+        document.getElementById('asosMapLoading').classList.add('d-none');
+
+        if (!data.success) {
+            console.error('ASOS verification error:', data.error);
+            document.getElementById('asosMapEmpty').classList.remove('d-none');
+            return;
+        }
+
+        const stations = data.stations || [];
+
+        // Update station count
+        document.getElementById('asosStationCount').textContent = `${stations.length} stations`;
+
+        if (stations.length === 0) {
+            document.getElementById('asosMapEmpty').classList.remove('d-none');
+            clearAsosMarkers();
+            return;
+        }
+
+        // Update color scale
+        updateColorScale(metric, data.min_value, data.max_value);
+
+        // Clear existing markers
+        clearAsosMarkers();
+
+        // Add new markers
+        for (const station of stations) {
+            if (!station.lat || !station.lon) continue;
+
+            const color = getMarkerColor(station.value, metric, data.min_value, data.max_value);
+
+            const marker = L.circleMarker([station.lat, station.lon], {
+                radius: 6,
+                fillColor: color,
+                color: '#333',
+                weight: 1,
+                opacity: 0.8,
+                fillOpacity: 0.9
+            });
+
+            // Create tooltip content
+            const metricLabel = metric.toUpperCase();
+            const units = {
+                'temp': '°F',
+                'mslp': 'mb',
+                'precip': 'in'
+            };
+            const unit = units[variable] || '';
+
+            const tooltipContent = `
+                <strong>${station.name}</strong> (${station.station_id})<br>
+                ${metricLabel}: ${station.value.toFixed(1)}${unit}<br>
+                Samples: ${station.count}
+            `;
+
+            marker.bindTooltip(tooltipContent, {
+                direction: 'top',
+                offset: [0, -5]
+            });
+
+            marker.addTo(asosMap);
+            asosMarkers.push(marker);
+        }
+
+    } catch (error) {
+        console.error('Error loading ASOS verification:', error);
+        document.getElementById('asosMapLoading').classList.add('d-none');
+        document.getElementById('asosMapEmpty').classList.remove('d-none');
+    }
+}
+
+// Sync ASOS forecast data
+async function syncAsosData() {
+    const btn = document.getElementById('asosSyncBtn');
+    const originalContent = btn.innerHTML;
+
+    // Disable button and show spinner
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> Syncing...';
+
+    try {
+        const response = await fetch('/api/asos/sync');
+        const data = await response.json();
+
+        if (data.success) {
+            // Show success message
+            btn.innerHTML = '<i class="bi bi-check-lg"></i> Done!';
+            btn.classList.remove('btn-primary');
+            btn.classList.add('btn-success');
+
+            // Reload verification data after a short delay
+            setTimeout(() => {
+                loadAsosVerification();
+                btn.innerHTML = originalContent;
+                btn.classList.remove('btn-success');
+                btn.classList.add('btn-primary');
+                btn.disabled = false;
+            }, 2000);
+        } else {
+            throw new Error(data.error || 'Sync failed');
+        }
+
+    } catch (error) {
+        console.error('ASOS sync error:', error);
+        btn.innerHTML = '<i class="bi bi-exclamation-triangle"></i> Error';
+        btn.classList.remove('btn-primary');
+        btn.classList.add('btn-danger');
+
+        setTimeout(() => {
+            btn.innerHTML = originalContent;
+            btn.classList.remove('btn-danger');
+            btn.classList.add('btn-primary');
+            btn.disabled = false;
+        }, 3000);
+    }
+}
+
+// Event listeners for ASOS controls
+document.getElementById('asosVariable').addEventListener('change', loadAsosVerification);
+document.getElementById('asosMetric').addEventListener('change', loadAsosVerification);
+document.getElementById('asosModel').addEventListener('change', loadAsosVerification);
+document.getElementById('asosLeadTime').addEventListener('change', loadAsosVerification);
+
+// Initialize ASOS map after DOM is ready
+document.addEventListener('DOMContentLoaded', function() {
+    // Small delay to ensure container is visible
+    setTimeout(initAsosMap, 100);
+    setTimeout(loadAsosVerification, 200);
+});
+
+// ============================================================================
+// Existing Verification Functionality
+// ============================================================================
 
 // Format lead time for display
 function formatLeadTime(hours) {
