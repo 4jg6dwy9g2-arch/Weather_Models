@@ -1,0 +1,1037 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .time-selector {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+    .time-selector .btn {
+        min-width: 50px;
+    }
+
+    .freezing-line {
+        border-top: 2px dashed rgba(100, 149, 237, 0.5);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="forecast-header">
+    <div class="row align-items-center">
+        <div class="col-md-6">
+            <h1 class="mb-1"><i class="bi bi-cloud-sun"></i> Weather Forecast Comparison</h1>
+            <p class="mb-0 opacity-75">GFS vs ECMWF AIFS vs ECMWF IFS model forecasts</p>
+        </div>
+        <div class="col-md-6">
+            <div class="row g-2">
+                <div class="col-md-8">
+                    <select class="form-select" id="locationSelect">
+                        {% for loc in locations %}
+                        <option value="{{ loc }}" {% if loc == selected_location %}selected{% endif %}>{{ loc }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <a href="/sync" class="btn btn-light w-100">
+                        <i class="bi bi-cloud-download"></i> Sync Data
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="loadingState" class="loading-spinner d-none">
+    <div class="text-center">
+        <div class="spinner-border text-primary" role="status"></div>
+        <p class="mt-2 text-muted">Loading forecast data...</p>
+    </div>
+</div>
+
+<div id="errorState" class="alert alert-warning d-none">
+    <i class="bi bi-exclamation-triangle"></i>
+    <span id="errorMessage">No data available.</span>
+    <a href="/sync" class="alert-link ms-2">Go to Sync to fetch data</a>
+</div>
+
+<div id="forecastContent">
+    <!-- Summary Stats -->
+    <div class="row mb-4">
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-gfs" id="gfsHigh">--</div>
+                <div class="stat-label">GFS High</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-aifs" id="aifsHigh">--</div>
+                <div class="stat-label">AIFS High</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-ifs" id="ifsHigh">--</div>
+                <div class="stat-label">IFS High</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-gfs" id="gfsPrecip">--</div>
+                <div class="stat-label">GFS Precip</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-aifs" id="aifsPrecip">--</div>
+                <div class="stat-label">AIFS Precip</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-ifs" id="ifsPrecip">--</div>
+                <div class="stat-label">IFS Precip</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-gfs" id="gfsMslpLow">--</div>
+                <div class="stat-label">GFS Low Press</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-aifs" id="aifsMslpLow">--</div>
+                <div class="stat-label">AIFS Low Press</div>
+            </div>
+        </div>
+        <div class="col-lg-2 col-md-4 col-6 mb-3">
+            <div class="card stat-card">
+                <div class="stat-value stat-value-ifs" id="ifsMslpLow">--</div>
+                <div class="stat-label">IFS Low Press</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Model Legend -->
+    <div class="model-legend">
+        <div class="model-legend-item">
+            <span class="model-dot model-dot-gfs"></span>
+            <span>GFS (NOAA)</span>
+        </div>
+        <div class="model-legend-item">
+            <span class="model-dot model-dot-aifs"></span>
+            <span>AIFS (ECMWF ML)</span>
+        </div>
+        <div class="model-legend-item">
+            <span class="model-dot model-dot-ifs"></span>
+            <span>IFS (ECMWF NWP)</span>
+        </div>
+        <div class="model-legend-item" id="observedLegend" style="display: none;">
+            <span class="model-dot" style="background-color: #28a745;"></span>
+            <span>Observed (WeatherLink)</span>
+        </div>
+    </div>
+
+    <!-- Verification Stats (only shown when available) -->
+    <div id="verificationSection" class="row mb-4" style="display: none;">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-check-circle"></i> Model Verification (vs Observed)
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h6>Temperature</h6>
+                            <div class="row">
+                                <div class="col-4">
+                                    <div class="small text-muted">GFS MAE</div>
+                                    <div class="fw-bold" id="gfsTempMae">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">AIFS MAE</div>
+                                    <div class="fw-bold" id="aifsTempMae">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">IFS MAE</div>
+                                    <div class="fw-bold" id="ifsTempMae">--</div>
+                                </div>
+                            </div>
+                            <div class="row mt-2">
+                                <div class="col-4">
+                                    <div class="small text-muted">GFS Bias</div>
+                                    <div class="fw-bold" id="gfsTempBias">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">AIFS Bias</div>
+                                    <div class="fw-bold" id="aifsTempBias">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">IFS Bias</div>
+                                    <div class="fw-bold" id="ifsTempBias">--</div>
+                                </div>
+                            </div>
+                            <div class="mt-2">
+                                <span class="badge" id="tempWinner">--</span>
+                                <small class="text-muted ms-2" id="tempCount"></small>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <h6>Pressure</h6>
+                            <div class="row">
+                                <div class="col-4">
+                                    <div class="small text-muted">GFS MAE</div>
+                                    <div class="fw-bold" id="gfsMslpMae">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">AIFS MAE</div>
+                                    <div class="fw-bold" id="aifsMslpMae">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">IFS MAE</div>
+                                    <div class="fw-bold" id="ifsMslpMae">--</div>
+                                </div>
+                            </div>
+                            <div class="row mt-2">
+                                <div class="col-4">
+                                    <div class="small text-muted">GFS Bias</div>
+                                    <div class="fw-bold" id="gfsMslpBias">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">AIFS Bias</div>
+                                    <div class="fw-bold" id="aifsMslpBias">--</div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="small text-muted">IFS Bias</div>
+                                    <div class="fw-bold" id="ifsMslpBias">--</div>
+                                </div>
+                            </div>
+                            <div class="mt-2">
+                                <span class="badge" id="mslpWinner">--</span>
+                                <small class="text-muted ms-2" id="mslpCount"></small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Temperature Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-thermometer-half"></i> Temperature Forecast</span>
+                    <small class="text-muted" id="gfsInitTime"></small>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="tempChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Precipitation Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-cloud-rain"></i> 6-Hour Precipitation</span>
+                    <small class="text-muted" id="aifsInitTime"></small>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="precipChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MSLP Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-speedometer"></i> Mean Sea Level Pressure
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="mslpChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Data Table -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-table"></i> Detailed Forecast Data
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>GFS Temp</th>
+                                    <th>AIFS Temp</th>
+                                    <th>IFS Temp</th>
+                                    <th class="observed-col" style="display: none;">Obs Temp</th>
+                                    <th class="observed-col" style="display: none;">GFS Err</th>
+                                    <th class="observed-col" style="display: none;">AIFS Err</th>
+                                    <th class="observed-col" style="display: none;">IFS Err</th>
+                                    <th>GFS Precip</th>
+                                    <th>AIFS Precip</th>
+                                    <th>IFS Precip</th>
+                                    <th>GFS MSLP</th>
+                                    <th>AIFS MSLP</th>
+                                    <th>IFS MSLP</th>
+                                    <th class="observed-col" style="display: none;">Obs MSLP</th>
+                                </tr>
+                            </thead>
+                            <tbody id="forecastTable">
+                                <!-- Populated by JavaScript -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Model Info -->
+    <div class="row mt-4">
+        <div class="col-md-4 mb-3">
+            <div class="card h-100">
+                <div class="card-header">
+                    <i class="bi bi-info-circle"></i> GFS (Global Forecast System)
+                </div>
+                <div class="card-body">
+                    <ul class="mb-0">
+                        <li>Operated by NOAA/NCEP</li>
+                        <li>Resolution: 0.25° (~28 km)</li>
+                        <li>Updates: Every 6 hours</li>
+                        <li>Range: 16 days (384 hours)</li>
+                        <li>Physics-based NWP model</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4 mb-3">
+            <div class="card h-100">
+                <div class="card-header">
+                    <i class="bi bi-info-circle"></i> ECMWF AIFS (AI Forecast)
+                </div>
+                <div class="card-body">
+                    <ul class="mb-0">
+                        <li>Operated by ECMWF</li>
+                        <li>Resolution: 0.25° (~28 km)</li>
+                        <li>Updates: Every 6 hours</li>
+                        <li>Range: 15 days (360 hours)</li>
+                        <li>Machine learning model</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4 mb-3">
+            <div class="card h-100">
+                <div class="card-header">
+                    <i class="bi bi-info-circle"></i> ECMWF IFS (Integrated Forecast)
+                </div>
+                <div class="card-body">
+                    <ul class="mb-0">
+                        <li>Operated by ECMWF</li>
+                        <li>Resolution: 0.25° (~28 km)</li>
+                        <li>Updates: Every 6 hours</li>
+                        <li>Range: 10 days (240 hours)</li>
+                        <li>Physics-based NWP model</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let tempChart, precipChart, mslpChart;
+let currentData = null;
+
+// Format time for display
+function formatTime(dateStr) {
+    const date = new Date(dateStr);
+    return date.toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        hour12: true
+    });
+}
+
+function formatShortTime(dateStr) {
+    const date = new Date(dateStr);
+    return date.toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric'
+    });
+}
+
+// Get temperature badge class
+function getTempClass(temp) {
+    if (temp < 32) return 'temp-cold';
+    if (temp < 50) return 'temp-cool';
+    if (temp < 75) return 'temp-warm';
+    return 'temp-hot';
+}
+
+// Load forecast data from saved files
+async function loadForecast() {
+    const location = document.getElementById('locationSelect').value;
+
+    document.getElementById('loadingState').classList.remove('d-none');
+    document.getElementById('forecastContent').classList.add('d-none');
+    document.getElementById('errorState').classList.add('d-none');
+
+    try {
+        // Load from saved data (not fetching new data)
+        const response = await fetch(`/api/latest-forecast?location=${encodeURIComponent(location)}`);
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'No saved data available');
+        }
+
+        currentData = data;
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('forecastContent').classList.remove('d-none');
+
+        updateStats(data);
+        renderCharts(data);
+        renderTable(data);
+        updateInitTimes(data);
+        updateFetchedTime(data);
+        updateVerification(data);
+        updateObservedLegend(data);
+
+    } catch (error) {
+        console.error('Error loading forecast:', error);
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('errorState').classList.remove('d-none');
+        document.getElementById('errorMessage').textContent = error.message;
+    }
+}
+
+// Update the "fetched at" time display
+function updateFetchedTime(data) {
+    if (data.fetched_at) {
+        const fetchedAt = new Date(data.fetched_at);
+        const timeStr = fetchedAt.toLocaleString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true
+        });
+        // Add fetched time to the header if element exists
+        const header = document.querySelector('.forecast-header p');
+        if (header) {
+            header.innerHTML = `GFS vs ECMWF AIFS vs ECMWF IFS model forecasts <span class="opacity-75">| Data from ${timeStr}</span>`;
+        }
+    }
+}
+
+// Update summary stats
+function updateStats(data) {
+    const gfsTemps = data.gfs.temps.filter(t => t !== null && !isNaN(t));
+    const aifsTemps = data.aifs.temps.filter(t => t !== null && !isNaN(t));
+    const ifsTemps = data.ifs ? data.ifs.temps.filter(t => t !== null && !isNaN(t)) : [];
+    const gfsPrecips = data.gfs.precips.filter(p => p !== null && !isNaN(p));
+    const aifsPrecips = data.aifs.precips.filter(p => p !== null && !isNaN(p));
+    const ifsPrecips = data.ifs ? data.ifs.precips.filter(p => p !== null && !isNaN(p)) : [];
+    const gfsMslps = (data.gfs.mslps || []).filter(m => m !== null && !isNaN(m));
+    const aifsMslps = (data.aifs.mslps || []).filter(m => m !== null && !isNaN(m));
+    const ifsMslps = data.ifs ? (data.ifs.mslps || []).filter(m => m !== null && !isNaN(m)) : [];
+
+    document.getElementById('gfsHigh').textContent = gfsTemps.length > 0
+        ? Math.round(Math.max(...gfsTemps)) + '°F' : '--';
+    document.getElementById('aifsHigh').textContent = aifsTemps.length > 0
+        ? Math.round(Math.max(...aifsTemps)) + '°F' : '--';
+    document.getElementById('ifsHigh').textContent = ifsTemps.length > 0
+        ? Math.round(Math.max(...ifsTemps)) + '°F' : '--';
+    document.getElementById('gfsPrecip').textContent = gfsPrecips.length > 0
+        ? Math.max(...gfsPrecips).toFixed(2) + '"' : '--';
+    document.getElementById('aifsPrecip').textContent = aifsPrecips.length > 0
+        ? Math.max(...aifsPrecips).toFixed(2) + '"' : '--';
+    document.getElementById('ifsPrecip').textContent = ifsPrecips.length > 0
+        ? Math.max(...ifsPrecips).toFixed(2) + '"' : '--';
+    document.getElementById('gfsMslpLow').textContent = gfsMslps.length > 0
+        ? Math.round(Math.min(...gfsMslps)) + ' mb' : '--';
+    document.getElementById('aifsMslpLow').textContent = aifsMslps.length > 0
+        ? Math.round(Math.min(...aifsMslps)) + ' mb' : '--';
+    document.getElementById('ifsMslpLow').textContent = ifsMslps.length > 0
+        ? Math.round(Math.min(...ifsMslps)) + ' mb' : '--';
+}
+
+// Update init times
+function updateInitTimes(data) {
+    if (data.gfs.init_time) {
+        const gfsInit = new Date(data.gfs.init_time);
+        document.getElementById('gfsInitTime').textContent =
+            'GFS: ' + gfsInit.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', timeZoneName: 'short' });
+    }
+    if (data.aifs.init_time) {
+        const aifsInit = new Date(data.aifs.init_time);
+        document.getElementById('aifsInitTime').textContent =
+            'AIFS/IFS: ' + aifsInit.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', timeZoneName: 'short' });
+    }
+}
+
+// Update observed legend visibility
+function updateObservedLegend(data) {
+    const hasObserved = data.observed && data.observed.temps && data.observed.temps.some(t => t !== null);
+    document.getElementById('observedLegend').style.display = hasObserved ? '' : 'none';
+}
+
+// Update verification stats
+function updateVerification(data) {
+    const verificationSection = document.getElementById('verificationSection');
+
+    if (!data.verification || data.verification.temp_count === 0) {
+        verificationSection.style.display = 'none';
+        return;
+    }
+
+    verificationSection.style.display = '';
+    const v = data.verification;
+
+    // Temperature metrics
+    document.getElementById('gfsTempMae').textContent = v.gfs_temp_mae !== null ? v.gfs_temp_mae.toFixed(1) + '°F' : '--';
+    document.getElementById('aifsTempMae').textContent = v.aifs_temp_mae !== null ? v.aifs_temp_mae.toFixed(1) + '°F' : '--';
+    document.getElementById('ifsTempMae').textContent = v.ifs_temp_mae !== null && v.ifs_temp_mae !== undefined ? v.ifs_temp_mae.toFixed(1) + '°F' : '--';
+    document.getElementById('gfsTempBias').textContent = v.gfs_temp_bias !== null ? (v.gfs_temp_bias > 0 ? '+' : '') + v.gfs_temp_bias.toFixed(1) + '°F' : '--';
+    document.getElementById('aifsTempBias').textContent = v.aifs_temp_bias !== null ? (v.aifs_temp_bias > 0 ? '+' : '') + v.aifs_temp_bias.toFixed(1) + '°F' : '--';
+    document.getElementById('ifsTempBias').textContent = v.ifs_temp_bias !== null && v.ifs_temp_bias !== undefined ? (v.ifs_temp_bias > 0 ? '+' : '') + v.ifs_temp_bias.toFixed(1) + '°F' : '--';
+
+    // Temperature winner - find lowest MAE among all models
+    const tempWinner = document.getElementById('tempWinner');
+    const tempMaes = [
+        { name: 'GFS', mae: v.gfs_temp_mae, class: 'bg-danger' },
+        { name: 'AIFS', mae: v.aifs_temp_mae, class: 'bg-warning text-dark' },
+        { name: 'IFS', mae: v.ifs_temp_mae, class: 'bg-success' }
+    ].filter(m => m.mae !== null && m.mae !== undefined);
+
+    if (tempMaes.length > 0) {
+        const minMae = Math.min(...tempMaes.map(m => m.mae));
+        const winners = tempMaes.filter(m => m.mae === minMae);
+        if (winners.length === 1) {
+            tempWinner.textContent = winners[0].name + ' wins';
+            tempWinner.className = 'badge ' + winners[0].class;
+        } else {
+            tempWinner.textContent = 'Tie';
+            tempWinner.className = 'badge bg-secondary';
+        }
+    } else {
+        tempWinner.textContent = '--';
+        tempWinner.className = 'badge bg-secondary';
+    }
+    document.getElementById('tempCount').textContent = v.temp_count ? `(${v.temp_count} obs)` : '';
+
+    // Pressure metrics
+    document.getElementById('gfsMslpMae').textContent = v.gfs_mslp_mae !== null ? v.gfs_mslp_mae.toFixed(1) + ' mb' : '--';
+    document.getElementById('aifsMslpMae').textContent = v.aifs_mslp_mae !== null ? v.aifs_mslp_mae.toFixed(1) + ' mb' : '--';
+    document.getElementById('ifsMslpMae').textContent = v.ifs_mslp_mae !== null && v.ifs_mslp_mae !== undefined ? v.ifs_mslp_mae.toFixed(1) + ' mb' : '--';
+    document.getElementById('gfsMslpBias').textContent = v.gfs_mslp_bias !== null ? (v.gfs_mslp_bias > 0 ? '+' : '') + v.gfs_mslp_bias.toFixed(1) + ' mb' : '--';
+    document.getElementById('aifsMslpBias').textContent = v.aifs_mslp_bias !== null ? (v.aifs_mslp_bias > 0 ? '+' : '') + v.aifs_mslp_bias.toFixed(1) + ' mb' : '--';
+    document.getElementById('ifsMslpBias').textContent = v.ifs_mslp_bias !== null && v.ifs_mslp_bias !== undefined ? (v.ifs_mslp_bias > 0 ? '+' : '') + v.ifs_mslp_bias.toFixed(1) + ' mb' : '--';
+
+    // Pressure winner - find lowest MAE among all models
+    const mslpWinner = document.getElementById('mslpWinner');
+    const mslpMaes = [
+        { name: 'GFS', mae: v.gfs_mslp_mae, class: 'bg-danger' },
+        { name: 'AIFS', mae: v.aifs_mslp_mae, class: 'bg-warning text-dark' },
+        { name: 'IFS', mae: v.ifs_mslp_mae, class: 'bg-success' }
+    ].filter(m => m.mae !== null && m.mae !== undefined);
+
+    if (mslpMaes.length > 0) {
+        const minMae = Math.min(...mslpMaes.map(m => m.mae));
+        const winners = mslpMaes.filter(m => m.mae === minMae);
+        if (winners.length === 1) {
+            mslpWinner.textContent = winners[0].name + ' wins';
+            mslpWinner.className = 'badge ' + winners[0].class;
+        } else {
+            mslpWinner.textContent = 'Tie';
+            mslpWinner.className = 'badge bg-secondary';
+        }
+    } else {
+        mslpWinner.textContent = '--';
+        mslpWinner.className = 'badge bg-secondary';
+    }
+    document.getElementById('mslpCount').textContent = v.mslp_count ? `(${v.mslp_count} obs)` : '';
+}
+
+// Render charts
+function renderCharts(data) {
+    const gfsLabels = data.gfs.times.map(t => formatShortTime(t));
+    const aifsLabels = data.aifs.times.map(t => formatShortTime(t));
+    const ifsLabels = data.ifs ? data.ifs.times.map(t => formatShortTime(t)) : [];
+
+    // Use the longer label set
+    let labels = gfsLabels;
+    if (aifsLabels.length > labels.length) labels = aifsLabels;
+    if (ifsLabels.length > labels.length) labels = ifsLabels;
+
+    // Check if we have observed data
+    const hasObserved = data.observed && data.observed.temps && data.observed.temps.some(t => t !== null);
+
+    // Temperature chart datasets
+    const tempDatasets = [
+        {
+            label: 'GFS',
+            data: data.gfs.temps,
+            borderColor: '#dc3545',
+            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2
+        },
+        {
+            label: 'AIFS',
+            data: data.aifs.temps,
+            borderColor: '#e85d2d',
+            backgroundColor: 'rgba(232, 93, 45, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [5, 5]
+        }
+    ];
+
+    // Add IFS dataset if available
+    if (data.ifs && data.ifs.temps) {
+        tempDatasets.push({
+            label: 'IFS',
+            data: data.ifs.temps,
+            borderColor: '#198754',
+            backgroundColor: 'rgba(25, 135, 84, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [2, 2]
+        });
+    }
+
+    // Add observed dataset if available
+    if (hasObserved) {
+        tempDatasets.push({
+            label: 'Observed',
+            data: data.observed.temps,
+            borderColor: '#28a745',
+            backgroundColor: 'rgba(40, 167, 69, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            pointHoverRadius: 6,
+            borderWidth: 2.5
+        });
+    }
+
+    // Temperature chart
+    if (tempChart) tempChart.destroy();
+    tempChart = new Chart(document.getElementById('tempChart'), {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: tempDatasets
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return context.dataset.label + ': ' +
+                                (context.raw !== null ? context.raw.toFixed(1) + '°F' : 'N/A');
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Temperature (°F)' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            // Show every 4th label for readability
+                            return index % 4 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Precipitation chart datasets
+    const precipDatasets = [
+        {
+            label: 'GFS',
+            data: data.gfs.precips,
+            borderColor: '#0d6efd',
+            backgroundColor: 'rgba(13, 110, 253, 0.2)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2
+        },
+        {
+            label: 'AIFS',
+            data: data.aifs.precips,
+            borderColor: '#0dcaf0',
+            backgroundColor: 'rgba(13, 202, 240, 0.2)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [5, 5]
+        }
+    ];
+
+    // Add IFS precipitation if available
+    if (data.ifs && data.ifs.precips) {
+        precipDatasets.push({
+            label: 'IFS',
+            data: data.ifs.precips,
+            borderColor: '#20c997',
+            backgroundColor: 'rgba(32, 201, 151, 0.2)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [2, 2]
+        });
+    }
+
+    // Precipitation chart
+    if (precipChart) precipChart.destroy();
+    precipChart = new Chart(document.getElementById('precipChart'), {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: precipDatasets
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return context.dataset.label + ': ' +
+                                (context.raw !== null ? context.raw.toFixed(3) + ' in' : 'N/A');
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Precipitation (inches)' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            return index % 4 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // MSLP chart datasets
+    const mslpDatasets = [
+        {
+            label: 'GFS',
+            data: data.gfs.mslps || [],
+            borderColor: '#6f42c1',
+            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2
+        },
+        {
+            label: 'AIFS',
+            data: data.aifs.mslps || [],
+            borderColor: '#d63384',
+            backgroundColor: 'rgba(214, 51, 132, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [5, 5]
+        }
+    ];
+
+    // Add IFS MSLP if available
+    if (data.ifs && data.ifs.mslps) {
+        mslpDatasets.push({
+            label: 'IFS',
+            data: data.ifs.mslps || [],
+            borderColor: '#fd7e14',
+            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [2, 2]
+        });
+    }
+
+    // Add observed MSLP if available
+    const hasObservedMslp = data.observed && data.observed.mslps && data.observed.mslps.some(m => m !== null);
+    if (hasObservedMslp) {
+        mslpDatasets.push({
+            label: 'Observed',
+            data: data.observed.mslps,
+            borderColor: '#28a745',
+            backgroundColor: 'rgba(40, 167, 69, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            pointHoverRadius: 6,
+            borderWidth: 2.5
+        });
+    }
+
+    // MSLP chart
+    if (mslpChart) mslpChart.destroy();
+    mslpChart = new Chart(document.getElementById('mslpChart'), {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: mslpDatasets
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return context.dataset.label + ': ' +
+                                (context.raw !== null ? context.raw.toFixed(1) + ' mb' : 'N/A');
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Pressure (mb)' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            return index % 4 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Render data table
+function renderTable(data) {
+    const tbody = document.getElementById('forecastTable');
+    tbody.innerHTML = '';
+
+    const gfsMslps = data.gfs.mslps || [];
+    const aifsMslps = data.aifs.mslps || [];
+    const ifsMslps = data.ifs ? (data.ifs.mslps || []) : [];
+    const ifsTemps = data.ifs ? data.ifs.temps : [];
+    const ifsPrecips = data.ifs ? data.ifs.precips : [];
+    const ifsTimes = data.ifs ? data.ifs.times : [];
+
+    // Check for observed data
+    const hasObserved = data.observed && data.observed.temps;
+    const obsTemps = hasObserved ? data.observed.temps : [];
+    const obsMslps = hasObserved ? (data.observed.mslps || []) : [];
+
+    // Show/hide observed columns
+    document.querySelectorAll('.observed-col').forEach(el => {
+        el.style.display = hasObserved ? '' : 'none';
+    });
+
+    // Show every 4th data point for readability
+    const maxLen = Math.max(data.gfs.times.length, data.aifs.times.length, ifsTimes.length);
+    for (let i = 0; i < maxLen; i += 4) {
+        const gfsTime = data.gfs.times[i];
+        const aifsTime = data.aifs.times[i];
+        const ifsTime = ifsTimes[i];
+        const gfsTemp = data.gfs.temps[i];
+        const aifsTemp = data.aifs.temps[i];
+        const ifsTemp = ifsTemps[i];
+        const gfsPrecip = data.gfs.precips[i];
+        const aifsPrecip = data.aifs.precips[i];
+        const ifsPrecip = ifsPrecips[i];
+        const gfsMslp = gfsMslps[i];
+        const aifsMslp = aifsMslps[i];
+        const ifsMslp = ifsMslps[i];
+        const obsTemp = obsTemps[i];
+        const obsMslp = obsMslps[i];
+
+        const time = gfsTime || aifsTime || ifsTime;
+
+        // Calculate errors vs observed
+        const gfsTempErr = (gfsTemp !== null && obsTemp !== null)
+            ? (gfsTemp - obsTemp).toFixed(1)
+            : '--';
+        const aifsTempErr = (aifsTemp !== null && obsTemp !== null)
+            ? (aifsTemp - obsTemp).toFixed(1)
+            : '--';
+        const ifsTempErr = (ifsTemp !== null && ifsTemp !== undefined && obsTemp !== null)
+            ? (ifsTemp - obsTemp).toFixed(1)
+            : '--';
+
+        const row = document.createElement('tr');
+        let html = `
+            <td><strong>${formatTime(time)}</strong></td>
+            <td>
+                ${gfsTemp !== null ?
+                    `<span class="weather-badge ${getTempClass(gfsTemp)}">${gfsTemp.toFixed(1)}°F</span>` :
+                    '<span class="text-muted">--</span>'}
+            </td>
+            <td>
+                ${aifsTemp !== null ?
+                    `<span class="weather-badge ${getTempClass(aifsTemp)}">${aifsTemp.toFixed(1)}°F</span>` :
+                    '<span class="text-muted">--</span>'}
+            </td>
+            <td>
+                ${ifsTemp !== null && ifsTemp !== undefined ?
+                    `<span class="weather-badge ${getTempClass(ifsTemp)}">${ifsTemp.toFixed(1)}°F</span>` :
+                    '<span class="text-muted">--</span>'}
+            </td>`;
+
+        if (hasObserved) {
+            html += `
+            <td class="observed-col">
+                ${obsTemp !== null ?
+                    `<span class="weather-badge bg-success text-white">${obsTemp.toFixed(1)}°F</span>` :
+                    '<span class="text-muted">--</span>'}
+            </td>
+            <td class="observed-col">
+                ${gfsTempErr !== '--' ?
+                    `<span class="${parseFloat(gfsTempErr) > 0 ? 'text-danger' : 'text-primary'}">${gfsTempErr > 0 ? '+' : ''}${gfsTempErr}°</span>` :
+                    '<span class="text-muted">--</span>'}
+            </td>
+            <td class="observed-col">
+                ${aifsTempErr !== '--' ?
+                    `<span class="${parseFloat(aifsTempErr) > 0 ? 'text-danger' : 'text-primary'}">${aifsTempErr > 0 ? '+' : ''}${aifsTempErr}°</span>` :
+                    '<span class="text-muted">--</span>'}
+            </td>
+            <td class="observed-col">
+                ${ifsTempErr !== '--' ?
+                    `<span class="${parseFloat(ifsTempErr) > 0 ? 'text-danger' : 'text-primary'}">${ifsTempErr > 0 ? '+' : ''}${ifsTempErr}°</span>` :
+                    '<span class="text-muted">--</span>'}
+            </td>`;
+        }
+
+        html += `
+            <td>${gfsPrecip !== null ? gfsPrecip.toFixed(3) + '"' : '--'}</td>
+            <td>${aifsPrecip !== null ? aifsPrecip.toFixed(3) + '"' : '--'}</td>
+            <td>${ifsPrecip !== null && ifsPrecip !== undefined ? ifsPrecip.toFixed(3) + '"' : '--'}</td>
+            <td>${gfsMslp !== null ? gfsMslp.toFixed(1) + ' mb' : '--'}</td>
+            <td>${aifsMslp !== null ? aifsMslp.toFixed(1) + ' mb' : '--'}</td>
+            <td>${ifsMslp !== null && ifsMslp !== undefined ? ifsMslp.toFixed(1) + ' mb' : '--'}</td>`;
+
+        if (hasObserved) {
+            html += `
+            <td class="observed-col">
+                ${obsMslp !== null ? obsMslp.toFixed(1) + ' mb' : '<span class="text-muted">--</span>'}
+            </td>`;
+        }
+
+        row.innerHTML = html;
+        tbody.appendChild(row);
+    }
+}
+
+// Event listeners
+document.getElementById('locationSelect').addEventListener('change', loadForecast);
+
+// Initial load
+document.addEventListener('DOMContentLoaded', loadForecast);
+</script>
+{% endblock %}
