@@ -7,131 +7,284 @@ Data is freely available via ECMWF Open Data (no authentication required).
 Install: pip install ecmwf-opendata
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
 from pathlib import Path
+
 from typing import Dict, List, Optional, Tuple
+
 import logging
 
+
+
 import numpy as np
+
 import xarray as xr
+
+
 
 from base import WeatherModel
 
+
+
 CACHE_DIR = Path.home() / ".cache" / "weather_models"
+
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 
 logger = logging.getLogger(__name__)
 
 
+
+
+
 class Variable:
+
     def __init__(self, name, display_name, units, ecmwf_param, category, colormap, contour_levels, fill=True, level=None):
+
         self.name = name
+
         self.display_name = display_name
+
         self.units = units
+
         self.ecmwf_param = ecmwf_param  # ECMWF parameter name
+
         self.category = category
+
         self.colormap = colormap
+
         self.contour_levels = contour_levels
+
         self.fill = fill
+
         self.level = level
 
 
+
+
+
 class Region:
+
     def __init__(self, name, bounds):
+
         self.name = name
+
         self.bounds = bounds
 
 
+
+
+
 # IFS variables available from ECMWF Open Data
+
 IFS_VARIABLES: Dict[str, Variable] = {
+
     "t2m": Variable(
+
         name="t2m",
+
         display_name="2m Temperature",
+
         units="F",
+
         ecmwf_param="2t",
+
         category="surface",
+
         colormap="RdYlBu_r",
+
         contour_levels=list(range(-40, 120, 5))
+
     ),
+
     "mslp": Variable(
+
         name="mslp",
+
         display_name="Mean Sea Level Pressure",
+
         units="mb",
+
         ecmwf_param="msl",
+
         category="surface",
+
         colormap="coolwarm",
+
         contour_levels=list(range(960, 1060, 4)),
+
         fill=False
+
     ),
+
     "tp": Variable(
+
         name="tp",
+
         display_name="Total Precipitation",
+
         units="in",
+
         ecmwf_param="tp",
+
         category="surface",
+
         colormap="precip",
+
         contour_levels=[0.01, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
+
     ),
+
 }
 
+
+
 # IFS forecast hours (6-hourly out to 10 days via open data)
+
 IFS_FORECAST_HOURS = list(range(0, 241, 6))
 
+
+
 # IFS runs at 00Z, 06Z, 12Z, 18Z
+
 IFS_INIT_HOURS = [0, 6, 12, 18]
 
 
+
+
+
 class IFSModel(WeatherModel):
+
     """ECMWF IFS model data access via ecmwf-opendata."""
 
+
+
     def __init__(self):
+
         super().__init__("IFS")
+
         self._client = None
+
         self._download_dir = CACHE_DIR / "ifs_downloads"
+
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
+
+
     def _get_client(self):
+
         """Get or create ECMWF Open Data client for IFS."""
+
         if self._client is None:
+
             try:
+
                 from ecmwf.opendata import Client
+
                 self._client = Client(source="ecmwf", model="ifs")
+
             except ImportError:
+
                 raise ImportError(
+
                     "ecmwf-opendata package required. Install with: pip install ecmwf-opendata"
+
                 )
+
         return self._client
 
+
+
     @property
+
     def available_variables(self) -> Dict[str, Variable]:
+
         """Return available IFS variables."""
+
         return IFS_VARIABLES
 
+
+
     @property
+
     def forecast_hours(self) -> List[int]:
+
         """Return IFS forecast hours."""
+
         return IFS_FORECAST_HOURS
 
+
+
     @property
+
     def init_hours(self) -> List[int]:
+
         """Return IFS initialization hours."""
+
         return IFS_INIT_HOURS
 
+
+
     def get_latest_init_time(self) -> datetime:
-        """Get the most recent available IFS initialization time."""
-        now = datetime.utcnow()
+
+        """
+
+        Get the most recent available IFS initialization time.
+
+        """
+
+        now = datetime.now(timezone.utc)
+
+
 
         # IFS data typically available ~6 hours after init time
+
         for hours_back in range(6, 48, 1):
+
             candidate = now - timedelta(hours=hours_back)
+
             candidate = candidate.replace(minute=0, second=0, microsecond=0)
 
+
+
             if candidate.hour in self.init_hours:
+
                 return candidate
 
+
+
         # Fallback
+
         yesterday = now - timedelta(days=1)
+
         return yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_init_time_for_hour(self, init_hour: int) -> datetime:
+        """
+        Get the initialization time for a specific hour today (or yesterday if not ready yet).
+
+        Args:
+            init_hour: The init hour (0, 6, 12, or 18)
+
+        Returns:
+            datetime: The init time for the specified hour
+        """
+        if init_hour not in self.init_hours:
+            raise ValueError(f"Invalid init hour {init_hour}. Must be one of {self.init_hours}")
+
+        now = datetime.now(timezone.utc)
+        today = now.replace(hour=init_hour, minute=0, second=0, microsecond=0)
+
+        # IFS data typically available ~6 hours after init time
+        hours_since_init = (now - today).total_seconds() / 3600
+
+        if hours_since_init >= 6:
+            return today
+        else:
+            # Use yesterday's run at this hour
+            return today - timedelta(days=1)
 
     def get_available_init_times(self, days_back: int = 3) -> List[datetime]:
         """Get list of available initialization times."""
@@ -169,12 +322,21 @@ class IFSModel(WeatherModel):
             logger.info(f"Using cached GRIB: {filename}")
             return filepath
 
-        logger.info(f"Downloading IFS {param} for F{forecast_hour:03d}")
+        # Convert to naive UTC datetime if timezone-aware
+        if init_time.tzinfo is not None:
+            init_time_naive = init_time.replace(tzinfo=None)
+        else:
+            init_time_naive = init_time
+
+        logger.info(f"Downloading IFS {param} for F{forecast_hour:03d} from {init_time_naive.strftime('%Y%m%d %HZ')}")
 
         try:
             kwargs = {
+                "date": init_time_naive.strftime('%Y%m%d'),
+                "time": init_time_naive.hour,
                 "step": forecast_hour,
                 "param": param,
+                "type": "fc",
                 "target": str(filepath.absolute()),
             }
 
