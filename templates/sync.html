@@ -40,8 +40,9 @@
         font-size: 0.85rem;
         padding: 1rem;
         border-radius: 8px;
-        max-height: 300px;
+        max-height: 500px;
         overflow-y: auto;
+        overflow-x: hidden;
     }
 
     .log-entry {
@@ -50,10 +51,15 @@
 
     .log-entry.error {
         color: #ff6b6b;
+        font-weight: bold;
     }
 
     .log-entry.success {
         color: #51cf66;
+    }
+
+    .log-entry.warning {
+        color: #ffc107;
     }
 
     .log-entry.info {
@@ -113,7 +119,7 @@
             <i class="bi bi-arrow-repeat"></i> Force Refresh All
         </button>
         <p class="text-muted mt-2 mb-0">
-            <small>Syncs Fairfax forecasts, ASOS stations, and all model data. Force Refresh always re-downloads everything.</small>
+            <small>Syncs latest available model runs for Fairfax forecasts and ASOS stations. Force Refresh always re-downloads everything.</small>
         </p>
     </div>
 </div>
@@ -238,6 +244,7 @@
 {% block extra_js %}
 <script>
 let isSyncing = false;
+let eventSource = null;
 
 function formatDateTime(isoStr) {
     if (!isoStr) return '--';
@@ -258,17 +265,26 @@ function formatInitTime(isoStr) {
         month: 'short',
         day: 'numeric',
         hour: '2-digit',
-        hour12: false
+        hour12: false,
+        timeZone: 'UTC'
     }) + 'Z';
 }
 
 function addLog(message, type = 'info') {
     const logOutput = document.getElementById('logOutput');
+
+    // Check if user is near bottom (within 50px)
+    const isNearBottom = logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight < 50;
+
     const entry = document.createElement('div');
     entry.className = `log-entry ${type}`;
     entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
     logOutput.appendChild(entry);
-    logOutput.scrollTop = logOutput.scrollHeight;
+
+    // Only auto-scroll if user was already near the bottom
+    if (isNearBottom) {
+        logOutput.scrollTop = logOutput.scrollHeight;
+    }
 }
 
 function updateProgress(percent, message) {
@@ -302,59 +318,74 @@ async function startSync(force = false) {
     document.getElementById('syncBtn').innerHTML = '<span class="spinner-border spinner-border-sm"></span> Syncing...';
     setStatus('running', 'Syncing all data...');
 
-    addLog('Starting master sync...', 'info');
-    updateProgress(5, 'Checking latest model runs...');
+    addLog('Connecting to sync stream...', 'info');
+    updateProgress(5, null);
+
+    // Always use latest available initialization time
+    const initHourValue = 'auto';
+
+    // Connect to SSE stream for real-time logs
+    if (eventSource) {
+        eventSource.close();
+    }
+
+    eventSource = new EventSource('/api/sync-logs');
+
+    eventSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        addLog(data.message, data.type);
+
+        // Update progress bar based on log content
+        if (data.message.includes('Step 1/2')) {
+            updateProgress(10, null);
+        } else if (data.message.includes('GFS data fetched')) {
+            updateProgress(20, null);
+        } else if (data.message.includes('AIFS data fetched')) {
+            updateProgress(30, null);
+        } else if (data.message.includes('IFS data fetched')) {
+            updateProgress(35, null);
+        } else if (data.message.includes('Step 2/2')) {
+            updateProgress(40, null);
+        } else if (data.message.includes('GFS ASOS data synced')) {
+            updateProgress(60, null);
+        } else if (data.message.includes('AIFS ASOS data synced')) {
+            updateProgress(75, null);
+        } else if (data.message.includes('IFS ASOS data synced')) {
+            updateProgress(85, null);
+        } else if (data.message.includes('Fetched') && data.message.includes('observations')) {
+            updateProgress(95, null);
+        } else if (data.message.includes('SYNC COMPLETED')) {
+            updateProgress(100, null);
+        }
+    };
+
+    eventSource.onerror = function(error) {
+        console.error('SSE Error:', error);
+        eventSource.close();
+    };
 
     try {
-        const forceParam = force ? '?force=true' : '';
-        const response = await fetch(`/api/sync-all${forceParam}`);
+        // Build query parameters
+        const params = new URLSearchParams();
+        if (force) params.append('force', 'true');
+        if (initHourValue !== 'auto') params.append('init_hour', initHourValue);
+
+        const queryString = params.toString();
+        const url = `/api/sync-all${queryString ? '?' + queryString : ''}`;
+
+        const response = await fetch(url);
         const data = await response.json();
 
         if (!data.success) {
             throw new Error(data.errors?.join(', ') || 'Sync failed');
         }
 
-        // Log Fairfax sync results
-        updateProgress(30, 'Syncing Fairfax forecast data...');
-        if (data.fairfax.status === 'cached') {
-            addLog('Fairfax: Using cached data - already up to date', 'info');
-        } else if (data.fairfax.status === 'synced') {
-            addLog('Fairfax: Fetched new forecast data', 'success');
-        } else if (data.fairfax.status === 'error') {
-            addLog(`Fairfax: Error - ${data.fairfax.error}`, 'error');
+        // Close SSE connection
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
         }
 
-        // Log ASOS sync results
-        updateProgress(60, 'Syncing ASOS station data...');
-        if (data.asos.status === 'success') {
-            const models = data.asos.models;
-            const syncedModels = [];
-            const skippedModels = [];
-
-            if (models.gfs?.status === 'synced') syncedModels.push('GFS');
-            else if (models.gfs?.status === 'skipped') skippedModels.push('GFS');
-
-            if (models.aifs?.status === 'synced') syncedModels.push('AIFS');
-            else if (models.aifs?.status === 'skipped') skippedModels.push('AIFS');
-
-            if (models.ifs?.status === 'synced') syncedModels.push('IFS');
-            else if (models.ifs?.status === 'skipped') skippedModels.push('IFS');
-
-            if (syncedModels.length > 0) {
-                addLog(`ASOS: Synced ${syncedModels.join(', ')} for ${data.asos.station_count} stations`, 'success');
-            }
-            if (skippedModels.length > 0) {
-                addLog(`ASOS: Skipped ${skippedModels.join(', ')} (already up to date)`, 'info');
-            }
-
-            if (models.observations?.status === 'synced') {
-                addLog(`ASOS: Fetched ${models.observations.count} observations`, 'success');
-            }
-        } else if (data.asos.status === 'error') {
-            addLog(`ASOS: Error - ${data.asos.error}`, 'error');
-        }
-
-        updateProgress(100, 'Sync complete!');
         setStatus('success', 'All data synced');
 
         // Update results section - show summary
@@ -381,6 +412,12 @@ async function startSync(force = false) {
         addLog(`Error: ${error.message}`, 'error');
         setStatus('error', 'Sync failed');
         updateProgress(0, '');
+
+        // Close SSE connection on error
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+        }
     } finally {
         isSyncing = false;
         document.getElementById('syncBtn').disabled = false;

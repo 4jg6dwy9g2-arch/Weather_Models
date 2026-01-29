@@ -7,11 +7,17 @@ Manages storage of model forecasts at ASOS station locations for verification.
 IEM Data Sources (free, no authentication required):
 - Station metadata: https://mesonet.agron.iastate.edu/geojson/network/{STATE}_ASOS.geojson
 - Observations: http://mesonet.agron.iastate.edu/cgi-bin/request/asos.py
+
+Precipitation Handling:
+- IEM provides p01i (1-hour precipitation increments)
+- Model forecasts (GFS/AIFS/IFS) provide 6-hour accumulated precipitation
+- For verification, 1-hour observations are accumulated into 6-hour totals at synoptic times
+  (00Z, 06Z, 12Z, 18Z) to match model forecast periods
 """
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -117,8 +123,12 @@ def fetch_all_stations(force_refresh: bool = False) -> List[ASOSStation]:
             with open(STATIONS_CACHE_FILE) as f:
                 cache_data = json.load(f)
 
-            cache_time = datetime.fromisoformat(cache_data.get('fetched_at', '2000-01-01'))
-            if datetime.utcnow() - cache_time < timedelta(days=STATIONS_CACHE_TTL_DAYS):
+            fetched_at_str = cache_data.get('fetched_at', '2000-01-01T00:00:00+00:00')
+            cache_time = datetime.fromisoformat(fetched_at_str)
+            if cache_time.tzinfo is None:
+                cache_time = cache_time.replace(tzinfo=timezone.utc)
+
+            if datetime.now(timezone.utc) - cache_time < timedelta(days=STATIONS_CACHE_TTL_DAYS):
                 stations = [ASOSStation(**s) for s in cache_data.get('stations', [])]
                 logger.info(f"Loaded {len(stations)} stations from cache")
                 return stations
@@ -140,7 +150,7 @@ def fetch_all_stations(force_refresh: bool = False) -> List[ASOSStation]:
     # Save to cache
     try:
         cache_data = {
-            'fetched_at': datetime.utcnow().isoformat(),
+            'fetched_at': datetime.now(timezone.utc).isoformat(),
             'stations': [asdict(s) for s in all_stations]
         }
         with open(STATIONS_CACHE_FILE, 'w') as f:
@@ -277,7 +287,7 @@ def fetch_observations(
             try:
                 # Parse timestamp
                 valid_str = fields[col_valid].strip()
-                valid_time = datetime.strptime(valid_str, '%Y-%m-%d %H:%M')
+                valid_time = datetime.strptime(valid_str, '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
 
                 obs = {
                     'valid_time': valid_time.isoformat(),
@@ -352,6 +362,31 @@ def get_observation_at_time(
     return None
 
 
+def _get_6hr_window_end(dt: datetime) -> datetime:
+    """
+    Calculates the end time of the 6-hour precipitation window for a given datetime.
+    Windows end at 00Z, 06Z, 12Z, 18Z.
+    An observation with valid_time = T (meaning precip from T-1h to T) contributes to the
+    6-hour total ending at the nearest 6-hour mark (00, 06, 12, 18) that is >= T.
+    """
+    hour = dt.hour
+    
+    if hour < 6:
+        target_hour = 6
+        target_date = dt
+    elif hour < 12:
+        target_hour = 12
+        target_date = dt
+    elif hour < 18:
+        target_hour = 18
+        target_date = dt
+    else: # hour >= 18
+        target_hour = 0
+        target_date = dt + timedelta(days=1)
+
+    return datetime(target_date.year, target_date.month, target_date.day, target_hour, 0, 0, tzinfo=timezone.utc)
+
+
 def load_asos_forecasts_db() -> dict:
     """Load the ASOS forecasts database from JSON file."""
     if ASOS_FORECASTS_FILE.exists():
@@ -399,14 +434,14 @@ def accumulate_stats_from_run(
         run_key: Run ID (init_time ISO string)
         run_data: Run data dict with model forecasts
     """
-    from datetime import timezone
-
     try:
         init_time = datetime.fromisoformat(run_key)
+        if init_time.tzinfo is None:
+            init_time = init_time.replace(tzinfo=timezone.utc)
     except ValueError:
         return
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
     stations = data.get("stations", {})
     forecast_hours = run_data.get("forecast_hours", [])
 
@@ -457,7 +492,7 @@ def accumulate_stats_from_run(
                 for var, (fcst_key, obs_key) in [
                     ('temp', ('temps', 'temp')),
                     ('mslp', ('mslps', 'mslp')),
-                    ('precip', ('precips', 'precip'))
+                    ('precip', ('precips', 'precip_6hr'))  # Use 6-hour accumulated precip
                 ]:
                     fcst_values = fcst_data.get(fcst_key, [])
                     if i >= len(fcst_values) or fcst_values[i] is None:
@@ -506,12 +541,18 @@ def cleanup_old_runs(data: dict) -> dict:
     Before deleting runs, accumulates their statistics into cumulative_stats
     to preserve historical verification data.
     """
-    from datetime import timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FORECASTS_RETENTION_DAYS)
 
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=FORECASTS_RETENTION_DAYS)
-    cutoff_str = cutoff.isoformat()
-
-    old_runs = [run_id for run_id in data.get("runs", {}) if run_id < cutoff_str]
+    old_runs = []
+    for run_id in data.get("runs", {}):
+        try:
+            run_time = datetime.fromisoformat(run_id)
+            if run_time.tzinfo is None:
+                run_time = run_time.replace(tzinfo=timezone.utc)  # Assume UTC for old naive datetimes
+            if run_time < cutoff:
+                old_runs.append(run_id)
+        except ValueError:
+            continue # Ignore invalid run_ids
 
     # Accumulate statistics from old runs before deleting them
     for run_id in old_runs:
@@ -529,8 +570,18 @@ def cleanup_old_runs(data: dict) -> dict:
     obs_data = data.get("observations", {})
     for station_id in list(obs_data.keys()):
         station_obs = obs_data[station_id]
-        old_times = [t for t in station_obs if t < cutoff_str]
-        for t in old_times:
+        old_times_to_delete = []
+        for obs_time_str in station_obs:
+            try:
+                obs_time = datetime.fromisoformat(obs_time_str)
+                if obs_time.tzinfo is None:
+                    obs_time = obs_time.replace(tzinfo=timezone.utc)
+                if obs_time < cutoff:
+                    old_times_to_delete.append(obs_time_str)
+            except ValueError:
+                continue
+
+        for t in old_times_to_delete:
             del station_obs[t]
         # Remove station if no observations left
         if not station_obs:
@@ -546,8 +597,6 @@ def fetch_and_store_observations():
     This should be called during sync to collect observations for verification.
     Only fetches observations for valid times that have already passed.
     """
-    from datetime import timezone
-
     db = load_asos_forecasts_db()
     stations = db.get("stations", {})
     runs = db.get("runs", {})
@@ -556,7 +605,7 @@ def fetch_and_store_observations():
         logger.info("No forecast runs to fetch observations for")
         return 0
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
 
     # Initialize observations dict if needed
     if "observations" not in db:
@@ -568,6 +617,8 @@ def fetch_and_store_observations():
     for run_key, run_data in runs.items():
         try:
             init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
 
@@ -650,9 +701,69 @@ def fetch_and_store_observations():
     return obs_count
 
 
+def calculate_6hr_precip_total(db: dict, station_id: str, end_time: datetime) -> Optional[float]:
+    """
+    Calculate 6-hour accumulated precipitation ending at the specified time.
+
+    Accumulates 1-hour precipitation observations over the 6-hour period ending
+    at end_time. This is used to match model 6-hour precipitation forecasts.
+
+    Args:
+        db: The loaded database
+        station_id: Station ID
+        end_time: End of the 6-hour accumulation period
+
+    Returns:
+        6-hour precipitation total in inches, or None if insufficient data
+    """
+    station_obs = db.get("observations", {}).get(station_id, {})
+
+    if not station_obs:
+        return None
+
+    # Collect all 1-hour precipitation values in the 6-hour window
+    start_time = end_time - timedelta(hours=6)
+    precip_values = []
+
+    # Look for observations within each hour of the 6-hour period
+    for hour_offset in range(6):
+        # Target time for this hour (e.g., if end_time is 06Z, we want 01Z, 02Z, 03Z, 04Z, 05Z, 06Z)
+        target = start_time + timedelta(hours=hour_offset + 1)
+
+        # Find observation closest to this hour (within 30 minutes)
+        best_obs = None
+        best_delta = timedelta(minutes=31)
+
+        for obs_time_str, obs_data in station_obs.items():
+            try:
+                obs_time = datetime.fromisoformat(obs_time_str)
+                delta = abs(obs_time - target)
+
+                if delta < best_delta:
+                    best_delta = delta
+                    best_obs = obs_data
+            except ValueError:
+                continue
+
+        # If we found an observation within 30 minutes and it has precip data
+        if best_obs and best_obs.get('precip') is not None:
+            precip_values.append(best_obs['precip'])
+        # else: missing data for this hour
+
+    # Require at least 4 out of 6 hours to have data (allows some missing obs)
+    if len(precip_values) < 4:
+        return None
+
+    # Sum up the 1-hour values to get 6-hour total
+    return sum(precip_values)
+
+
 def get_stored_observation(db: dict, station_id: str, target_time: datetime, max_delta_minutes: int = 30) -> Optional[dict]:
     """
     Get a stored observation for a station near the target time.
+
+    For precipitation, this function calculates 6-hour accumulated totals to match
+    model forecast accumulation periods. For temp and mslp, it returns point observations.
 
     Args:
         db: The loaded database
@@ -661,7 +772,8 @@ def get_stored_observation(db: dict, station_id: str, target_time: datetime, max
         max_delta_minutes: Maximum time difference allowed
 
     Returns:
-        Observation dict or None
+        Observation dict with keys: temp, mslp, precip (1-hr), precip_6hr (6-hr total)
+        Returns None if no observation found
     """
     station_obs = db.get("observations", {}).get(station_id, {})
 
@@ -678,11 +790,20 @@ def get_stored_observation(db: dict, station_id: str, target_time: datetime, max
 
             if delta < best_delta:
                 best_delta = delta
-                best_match = obs_data
+                best_match = obs_data.copy()  # Copy so we can add precip_6hr
         except ValueError:
             continue
 
     if best_delta <= timedelta(minutes=max_delta_minutes):
+        # Add 6-hour accumulated precipitation
+        # Check if target_time aligns with a 6-hour synoptic time (00Z, 06Z, 12Z, 18Z)
+        if target_time.hour % 6 == 0:
+            precip_6hr = calculate_6hr_precip_total(db, station_id, target_time)
+            best_match['precip_6hr'] = precip_6hr
+        else:
+            # For non-synoptic times, don't calculate 6-hour total
+            best_match['precip_6hr'] = None
+
         return best_match
     return None
 
@@ -703,8 +824,6 @@ def store_asos_forecasts(
         station_forecasts: Dict mapping station_id to forecast data
             Each station dict has: temps, mslps, precips (lists aligned with forecast_hours)
     """
-    from datetime import timezone
-
     db = load_asos_forecasts_db()
 
     # Ensure stations are up to date
@@ -715,7 +834,7 @@ def store_asos_forecasts(
     run_key = init_time.isoformat()
     if run_key not in db.get("runs", {}):
         db.setdefault("runs", {})[run_key] = {
-            "fetched_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
             "forecast_hours": forecast_hours,
         }
 
@@ -759,8 +878,6 @@ def get_verification_data(
             }
         }
     """
-    from datetime import timezone
-
     db = load_asos_forecasts_db()
     stations = db.get("stations", {})
     runs = db.get("runs", {})
@@ -769,13 +886,13 @@ def get_verification_data(
     if not stations:
         return {}
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
 
     # Map variable name to forecast/obs keys
     var_map = {
         'temp': ('temps', 'temp'),
         'mslp': ('mslps', 'mslp'),
-        'precip': ('precips', 'precip')
+        'precip': ('precips', 'precip_6hr')  # Use 6-hour accumulated precip
     }
 
     if variable not in var_map:
@@ -804,6 +921,8 @@ def get_verification_data(
     for run_key, run_data in runs.items():
         try:
             init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
 
@@ -894,8 +1013,6 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
     Returns:
         Dict with lead time breakdown for each variable and model
     """
-    from datetime import timezone
-
     db = load_asos_forecasts_db()
     stations = db.get("stations", {})
     runs = db.get("runs", {})
@@ -905,7 +1022,7 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
     if not station:
         return {"error": "Station not found"}
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
     models = [model.lower()] if model else ['gfs', 'aifs', 'ifs']
 
     # Collect all forecast hours (from current runs and cumulative stats)
@@ -960,6 +1077,8 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
     for run_key, run_data in runs.items():
         try:
             init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
 
@@ -998,10 +1117,10 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
                     stats_by_lt[lt][m]['mslp']['sum_errors'] += error
                     stats_by_lt[lt][m]['mslp']['count'] += 1
 
-                # Precip
+                # Precip (6-hour accumulated)
                 fcst_precips = fcst_data.get('precips', [])
-                if i < len(fcst_precips) and fcst_precips[i] is not None and obs.get('precip') is not None:
-                    error = fcst_precips[i] - obs['precip']
+                if i < len(fcst_precips) and fcst_precips[i] is not None and obs.get('precip_6hr') is not None:
+                    error = fcst_precips[i] - obs['precip_6hr']
                     stats_by_lt[lt][m]['precip']['sum_abs_errors'] += abs(error)
                     stats_by_lt[lt][m]['precip']['sum_errors'] += error
                     stats_by_lt[lt][m]['precip']['count'] += 1
@@ -1074,6 +1193,138 @@ def get_cumulative_stats_summary() -> dict:
     }
 
 
+def get_verification_time_series(
+    model: str,
+    variable: str,
+    lead_time_hours: int,
+    days_back: int = 30
+) -> dict:
+    """
+    Get time series of verification metrics (MAE and Bias) over time for a specific
+    model, variable, and lead time.
+
+    Args:
+        model: Model name ('gfs', 'aifs', 'ifs')
+        variable: Variable name ('temp', 'mslp', 'precip')
+        lead_time_hours: Lead time in hours
+        days_back: Number of days to look back
+
+    Returns:
+        Dict with structure:
+        {
+            "dates": ["2026-01-20", "2026-01-21", ...],
+            "mae": [2.1, 2.3, ...],
+            "bias": [0.5, 0.3, ...],
+            "counts": [150, 145, ...]
+        }
+    """
+    db = load_asos_forecasts_db()
+    stations = db.get("stations", {})
+    runs = db.get("runs", {})
+
+    if not stations or not runs:
+        return {"error": "No data available"}
+
+    now = datetime.now(timezone.utc)
+    cutoff_date = now - timedelta(days=days_back)
+
+    # Map variable name to forecast/obs keys
+    var_map = {
+        'temp': ('temps', 'temp'),
+        'mslp': ('mslps', 'mslp'),
+        'precip': ('precips', 'precip_6hr')
+    }
+
+    if variable not in var_map:
+        return {"error": "Invalid variable"}
+
+    fcst_key, obs_key = var_map[variable]
+
+    # Collect errors grouped by date
+    # Key: date string (YYYY-MM-DD), Value: list of errors
+    errors_by_date = {}
+
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        # Skip runs outside the time window
+        if init_time < cutoff_date:
+            continue
+
+        forecast_hours = run_data.get("forecast_hours", [])
+        if lead_time_hours not in forecast_hours:
+            continue
+
+        fcst_idx = forecast_hours.index(lead_time_hours)
+        valid_time = init_time + timedelta(hours=lead_time_hours)
+
+        # Only include past valid times
+        if valid_time >= now:
+            continue
+
+        # Use the date of the valid time for grouping
+        date_key = valid_time.date().isoformat()
+
+        if date_key not in errors_by_date:
+            errors_by_date[date_key] = []
+
+        # Get model data
+        model_data = run_data.get(model.lower())
+        if not model_data:
+            continue
+
+        # Process each station
+        for station_id, fcst_data in model_data.items():
+            if station_id not in stations:
+                continue
+
+            fcst_values = fcst_data.get(fcst_key, [])
+            if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                continue
+
+            fcst_val = fcst_values[fcst_idx]
+
+            # Get observation
+            obs = get_stored_observation(db, station_id, valid_time)
+            if obs is None or obs.get(obs_key) is None:
+                continue
+
+            obs_val = obs[obs_key]
+            error = fcst_val - obs_val
+            errors_by_date[date_key].append(error)
+
+    # Calculate daily MAE and Bias
+    dates = sorted(errors_by_date.keys())
+    daily_mae = []
+    daily_bias = []
+    daily_counts = []
+
+    for date in dates:
+        errors = errors_by_date[date]
+        if errors:
+            mae = sum(abs(e) for e in errors) / len(errors)
+            bias = sum(errors) / len(errors)
+            daily_mae.append(mae)
+            daily_bias.append(bias)
+            daily_counts.append(len(errors))
+        else:
+            daily_mae.append(None)
+            daily_bias.append(None)
+            daily_counts.append(0)
+
+    return {
+        "dates": dates,
+        "mae": [round(m, 2) if m is not None else None for m in daily_mae],
+        "bias": [round(b, 2) if b is not None else None for b in daily_bias],
+        "counts": daily_counts
+    }
+
+
 def get_mean_verification_by_lead_time(model: str) -> dict:
     """
     Get mean verification (MAE and Bias) across all stations by lead time for a given model.
@@ -1094,8 +1345,6 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             "mslp_bias": [avg_bias_lt6, avg_bias_lt12, ...],
         }
     """
-    from datetime import timezone
-
     db = load_asos_forecasts_db()
     stations = db.get("stations", {})
     runs = db.get("runs", {})
@@ -1104,7 +1353,7 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
     if not stations:
         return {"error": "No ASOS stations available."}
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
 
     # Collect all forecast hours (from current runs and cumulative stats)
     all_forecast_hours = set()
@@ -1127,13 +1376,14 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
     aggregated_stats = {
         lt: {
             'temp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
-            'mslp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+            'mslp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
+            'precip': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
         }
         for lt in lead_times
     }
 
     # Start with cumulative stats
-    for var in ['temp', 'mslp']:
+    for var in ['temp', 'mslp', 'precip']:
         var_cumulative = model_cumulative.get(var, {})
         for lt_str, stats in var_cumulative.items():
             lt = int(lt_str)
@@ -1146,6 +1396,8 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
     for run_key, run_data in runs.items():
         try:
             init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
 
@@ -1184,13 +1436,23 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
                     aggregated_stats[lt]['mslp']['sum_errors'] += error
                     aggregated_stats[lt]['mslp']['count'] += 1
 
+                # Precipitation (6-hour accumulated)
+                fcst_precips = fcst_data.get('precips', [])
+                if i < len(fcst_precips) and fcst_precips[i] is not None and obs.get('precip_6hr') is not None:
+                    error = fcst_precips[i] - obs['precip_6hr']
+                    aggregated_stats[lt]['precip']['sum_abs_errors'] += abs(error)
+                    aggregated_stats[lt]['precip']['sum_errors'] += error
+                    aggregated_stats[lt]['precip']['count'] += 1
+
     # Calculate mean MAE and Bias for each lead time
     result = {
         "lead_times": lead_times,
         "temp_mae": [],
         "temp_bias": [],
         "mslp_mae": [],
-        "mslp_bias": []
+        "mslp_bias": [],
+        "precip_mae": [],
+        "precip_bias": []
     }
 
     for lt in lead_times:
@@ -1211,5 +1473,14 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
         else:
             result["mslp_mae"].append(None)
             result["mslp_bias"].append(None)
+
+        # Precipitation
+        precip_stats = aggregated_stats[lt]['precip']
+        if precip_stats['count'] > 0:
+            result["precip_mae"].append(round(precip_stats['sum_abs_errors'] / precip_stats['count'], 2))
+            result["precip_bias"].append(round(precip_stats['sum_errors'] / precip_stats['count'], 2))
+        else:
+            result["precip_mae"].append(None)
+            result["precip_bias"].append(None)
 
     return result
