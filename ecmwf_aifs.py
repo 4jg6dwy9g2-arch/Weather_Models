@@ -7,180 +7,382 @@ Data is freely available via ECMWF Open Data (no authentication required).
 Install: pip install ecmwf-opendata
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
 from pathlib import Path
+
 from typing import Dict, List, Optional, Tuple
+
 import logging
+
 import tempfile
 
+
+
 import numpy as np
+
 import xarray as xr
 
+
+
 from base import WeatherModel
+
 from pathlib import Path
 
+
+
 class Variable:
+
     def __init__(self, name, display_name, units, herbie_search, category, colormap, contour_levels, fill=True, level=None):
+
         self.name = name
+
         self.display_name = display_name
+
         self.units = units
+
         self.herbie_search = herbie_search
+
         self.category = category
+
         self.colormap = colormap
+
         self.contour_levels = contour_levels
+
         self.fill = fill
+
         self.level = level
 
+
+
 class Region:
+
     def __init__(self, name, bounds):
+
         self.name = name
+
         self.bounds = bounds
 
+
+
 CACHE_DIR = Path.home() / ".cache" / "weather_models"
+
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 
 logger = logging.getLogger(__name__)
 
 
+
+
+
 # AIFS variables available from ECMWF Open Data
+
 AIFS_VARIABLES: Dict[str, Variable] = {
+
     "t2m": Variable(
+
         name="t2m",
+
         display_name="2m Temperature",
+
         units="F",
+
         herbie_search="2t",  # ECMWF parameter name
+
         category="surface",
+
         colormap="RdYlBu_r",
+
         contour_levels=list(range(-40, 120, 5))
+
     ),
+
     "mslp": Variable(
+
         name="mslp",
+
         display_name="Mean Sea Level Pressure",
+
         units="mb",
+
         herbie_search="msl",
+
         category="surface",
+
         colormap="coolwarm",
+
         contour_levels=list(range(960, 1060, 4)),
+
         fill=False
+
     ),
+
     "u10": Variable(
+
         name="u10",
+
         display_name="10m U-Wind",
+
         units="m/s",
+
         herbie_search="10u",
+
         category="surface",
+
         colormap="RdBu_r",
+
         contour_levels=list(range(-50, 55, 5))
+
     ),
+
     "v10": Variable(
+
         name="v10",
+
         display_name="10m V-Wind",
+
         units="m/s",
+
         herbie_search="10v",
+
         category="surface",
+
         colormap="RdBu_r",
+
         contour_levels=list(range(-50, 55, 5))
+
     ),
+
     "tp": Variable(
+
         name="tp",
+
         display_name="Total Precipitation",
+
         units="in",
+
         herbie_search="tp",
+
         category="surface",
+
         colormap="precip",
+
         contour_levels=[0.01, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
+
     ),
+
     "tcc": Variable(
+
         name="tcc",
+
         display_name="Total Cloud Cover",
+
         units="%",
+
         herbie_search="tcc",
+
         category="surface",
+
         colormap="Greys",
+
         contour_levels=list(range(0, 110, 10))
+
     ),
+
     "z500": Variable(
+
         name="z500",
+
         display_name="500mb Geopotential Height",
+
         units="dm",
+
         herbie_search="gh",  # Geopotential height
+
         level="500",
+
         category="upper_air",
+
         colormap="terrain",
+
         contour_levels=list(range(492, 600, 6)),
+
         fill=False
+
     ),
+
     "t850": Variable(
+
         name="t850",
+
         display_name="850mb Temperature",
+
         units="C",
+
         herbie_search="t",
+
         level="850",
+
         category="upper_air",
+
         colormap="RdYlBu_r",
+
         contour_levels=list(range(-40, 40, 4))
+
     ),
+
 }
 
+
+
 # AIFS forecast hours (6-hourly out to 15 days)
+
 AIFS_FORECAST_HOURS = list(range(0, 361, 6))
 
+
+
 # AIFS runs at 00Z, 06Z, 12Z, 18Z
+
 AIFS_INIT_HOURS = [0, 6, 12, 18]
 
 
+
+
+
 class AIFSModel(WeatherModel):
+
     """ECMWF AIFS model data access via ecmwf-opendata."""
 
+
+
     def __init__(self):
+
         super().__init__("AIFS")
+
         self._client = None
+
         self._download_dir = CACHE_DIR / "aifs_downloads"
+
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
+
+
     def _get_client(self):
+
         """Get or create ECMWF Open Data client."""
+
         if self._client is None:
+
             try:
+
                 from ecmwf.opendata import Client
+
                 # Use aifs-single for deterministic AIFS forecasts
+
                 self._client = Client(model="aifs-single")
+
             except ImportError:
+
                 raise ImportError(
+
                     "ecmwf-opendata package required. Install with: pip install ecmwf-opendata"
+
                 )
+
         return self._client
 
+
+
     @property
+
     def available_variables(self) -> Dict[str, Variable]:
+
         """Return available AIFS variables."""
+
         return AIFS_VARIABLES
 
+
+
     @property
+
     def forecast_hours(self) -> List[int]:
+
         """Return AIFS forecast hours."""
+
         return AIFS_FORECAST_HOURS
 
+
+
     @property
+
     def init_hours(self) -> List[int]:
+
         """Return AIFS initialization hours."""
+
         return AIFS_INIT_HOURS
 
+
+
     def get_latest_init_time(self) -> datetime:
-        """Get the most recent available AIFS initialization time."""
-        now = datetime.utcnow()
+
+        """
+
+        Get the most recent available AIFS initialization time.
+
+        """
+
+        now = datetime.now(timezone.utc)
+
+
 
         # AIFS data typically available ~6 hours after init time
+
         for hours_back in range(6, 48, 1):
+
             candidate = now - timedelta(hours=hours_back)
+
             candidate = candidate.replace(minute=0, second=0, microsecond=0)
 
+
+
             if candidate.hour in self.init_hours:
+
                 return candidate
 
+
+
         # Fallback
+
         yesterday = now - timedelta(days=1)
+
         return yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_init_time_for_hour(self, init_hour: int) -> datetime:
+        """
+        Get the initialization time for a specific hour today (or yesterday if not ready yet).
+
+        Args:
+            init_hour: The init hour (0, 6, 12, or 18)
+
+        Returns:
+            datetime: The init time for the specified hour
+        """
+        if init_hour not in self.init_hours:
+            raise ValueError(f"Invalid init hour {init_hour}. Must be one of {self.init_hours}")
+
+        now = datetime.now(timezone.utc)
+        today = now.replace(hour=init_hour, minute=0, second=0, microsecond=0)
+
+        # AIFS data typically available ~6 hours after init time
+        hours_since_init = (now - today).total_seconds() / 3600
+
+        if hours_since_init >= 6:
+            return today
+        else:
+            # Use yesterday's run at this hour
+            return today - timedelta(days=1)
 
     def get_available_init_times(self, days_back: int = 3) -> List[datetime]:
         """Get list of available initialization times."""
@@ -218,13 +420,22 @@ class AIFSModel(WeatherModel):
             logger.info(f"Using cached GRIB: {filename}")
             return filepath
 
-        logger.info(f"Downloading AIFS {param} for F{forecast_hour:03d}")
+        # Convert to naive UTC datetime if timezone-aware
+        if init_time.tzinfo is not None:
+            init_time_naive = init_time.replace(tzinfo=None)
+        else:
+            init_time_naive = init_time
+
+        logger.info(f"Downloading AIFS {param} for F{forecast_hour:03d} from {init_time_naive.strftime('%Y%m%d %HZ')}")
 
         try:
             # Build request kwargs - use absolute path string
             kwargs = {
+                "date": init_time_naive.strftime('%Y%m%d'),
+                "time": init_time_naive.hour,
                 "step": forecast_hour,
                 "param": param,
+                "type": "fc",
                 "target": str(filepath.absolute()),
             }
 
@@ -232,7 +443,7 @@ class AIFSModel(WeatherModel):
             if level:
                 kwargs["levelist"] = int(level)
 
-            # Download (uses latest available by default)
+            # Download with specified date/time
             client.retrieve(**kwargs)
 
             if not filepath.exists():

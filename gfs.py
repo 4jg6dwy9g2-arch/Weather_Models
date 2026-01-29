@@ -4,7 +4,7 @@ GFS (Global Forecast System) model implementation.
 Uses Herbie for data access from NOMADS/AWS with automatic failover.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import logging
 from pathlib import Path
@@ -77,7 +77,7 @@ class GFSModel(WeatherModel):
 
         GFS runs take ~3.5 hours to complete, so we look back from current time.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Find the most recent init hour that's at least 4 hours old
         for hours_back in range(4, 48, 1):
@@ -91,6 +91,31 @@ class GFSModel(WeatherModel):
         # Fallback to yesterday's 00Z
         yesterday = now - timedelta(days=1)
         return yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_init_time_for_hour(self, init_hour: int) -> datetime:
+        """
+        Get the initialization time for a specific hour today (or yesterday if not ready yet).
+
+        Args:
+            init_hour: The init hour (0, 6, 12, or 18)
+
+        Returns:
+            datetime: The init time for the specified hour
+        """
+        if init_hour not in self.init_hours:
+            raise ValueError(f"Invalid init hour {init_hour}. Must be one of {self.init_hours}")
+
+        now = datetime.now(timezone.utc)
+        today = now.replace(hour=init_hour, minute=0, second=0, microsecond=0)
+
+        # GFS takes ~3.5-4 hours to complete, so only use today's run if it's been at least 4 hours
+        hours_since_init = (now - today).total_seconds() / 3600
+
+        if hours_since_init >= 4:
+            return today
+        else:
+            # Use yesterday's run at this hour
+            return today - timedelta(days=1)
 
     def get_available_init_times(self, days_back: int = 3) -> List[datetime]:
         """Get list of available initialization times."""
@@ -118,7 +143,11 @@ class GFSModel(WeatherModel):
 
         from herbie import Herbie
         from pathlib import Path
-        
+
+        # Convert to naive datetime if timezone-aware (Herbie expects naive datetimes)
+        if init_time.tzinfo is not None:
+            init_time = init_time.replace(tzinfo=None)
+
         return Herbie(
             init_time,
             model="gfs",
@@ -337,11 +366,16 @@ class GFSModel(WeatherModel):
 
     def check_data_availability(self, init_time: datetime, forecast_hour: int) -> bool:
         """Check if data is available for the given init time and forecast hour."""
+        import tempfile
+        from pathlib import Path
+
         try:
-            H = self._get_herbie(init_time, forecast_hour)
-            # Try to get the inventory - if it works, data is available
-            inv = H.inventory()
-            return len(inv) > 0
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_save_dir = Path(tmpdir)
+                H = self._get_herbie(init_time, forecast_hour, tmp_save_dir)
+                # Try to get the inventory - if it works, data is available
+                inv = H.inventory()
+                return len(inv) > 0
         except Exception:
             return False
 

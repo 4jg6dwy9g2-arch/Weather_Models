@@ -16,8 +16,8 @@ echo "======================================" >> "$LOG_FILE"
 echo "Sync started at: $(date)" >> "$LOG_FILE"
 echo "======================================" >> "$LOG_FILE"
 
-# Call the sync endpoint (assumes Flask app is running on localhost:5000)
-curl -X GET "http://localhost:5000/api/sync-all" \
+# Call the sync endpoint (assumes Flask app is running on localhost:5001)
+curl -X GET "http://localhost:5001/api/sync-all" \
   -H "Content-Type: application/json" \
   -o - 2>&1 | tee -a "$LOG_FILE"
 
