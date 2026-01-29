@@ -671,7 +671,7 @@ def sync_fairfax(force: bool = False, init_hour: Optional[int] = None):
     logger.info("=" * 60)
 
     location = "Fairfax, VA"
-    days = 7
+    days = 15
 
     bounds = LOCATIONS[location]
     region = Region(location, bounds)
