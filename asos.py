@@ -19,6 +19,8 @@ import time
 from functools import wraps
 import urllib.request
 import urllib.parse
+import urllib.error # Added for specific error handling
+import socket # Added for specific error handling
 from rate_limiter import RateLimiter
 from pathlib import Path
 import logging
@@ -111,6 +113,8 @@ def fetch_state_stations(state: str) -> List[ASOSStation]:
                 if station.station_id:
                     stations.append(station)
 
+    except (urllib.error.URLError, socket.timeout) as e:
+        logger.warning(f"Network error fetching stations for {state} from {url}: {e}")
     except Exception as e:
         logger.warning(f"Failed to fetch stations for {state}: {e}")
 
@@ -335,6 +339,8 @@ def fetch_observations(
             except (ValueError, IndexError) as e:
                 continue
 
+    except (urllib.error.URLError, socket.timeout) as e:
+        logger.error(f"Network error fetching ASOS observations from {url}: {e}")
     except Exception as e:
         logger.error(f"Error fetching ASOS observations: {e}")
 
@@ -1047,7 +1053,7 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
 
     station = stations.get(station_id)
     if not station:
-        return {"error": "Station not found"}
+        raise ValueError("Station not found")
 
     now = datetime.now(timezone.utc)
     models = [model.lower()] if model else ['gfs', 'aifs', 'ifs']
@@ -1065,7 +1071,11 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
             var_stats = model_stats.get(var, {})
             all_forecast_hours.update(int(lt) for lt in var_stats.keys())
 
-    lead_times = sorted(all_forecast_hours)
+    logger.debug(f"Raw all_forecast_hours for station detail: {sorted(list(all_forecast_hours))}")
+
+    # Filter lead times: use all unique forecast hours in sorted order
+    lead_times = sorted(list(all_forecast_hours)) # Ensure uniqueness and sort
+    logger.debug(f"Lead times for station detail after removing filtering: {lead_times}")
 
     if not lead_times:
         return {
@@ -1372,142 +1382,150 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             "mslp_bias": [avg_bias_lt6, avg_bias_lt12, ...],
         }
     """
-    db = load_asos_forecasts_db()
-    stations = db.get("stations", {})
-    runs = db.get("runs", {})
-    cumulative_by_lead_time = db.get("cumulative_stats", {}).get("by_lead_time", {})
+    try:
+        db = load_asos_forecasts_db()
+        stations = db.get("stations", {})
+        runs = db.get("runs", {})
+        cumulative_by_lead_time = db.get("cumulative_stats", {}).get("by_lead_time", {})
 
-    if not stations:
-        return {"error": "No ASOS stations available."}
+        if not stations:
+            raise ValueError("No ASOS stations available.")
 
-    now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
 
-    # Collect all forecast hours (from current runs and cumulative stats)
-    all_forecast_hours = set()
-    for run_data in runs.values():
-        all_forecast_hours.update(run_data.get("forecast_hours", []))
+        # Collect all forecast hours (from current runs and cumulative stats)
+        all_forecast_hours = set()
+        for run_data in runs.values():
+            all_forecast_hours.update(run_data.get("forecast_hours", []))
 
-    # Also include lead times from cumulative stats
-    model_cumulative = cumulative_by_lead_time.get(model.lower(), {})
-    for var in ['temp', 'mslp', 'precip']:
-        var_stats = model_cumulative.get(var, {})
-        all_forecast_hours.update(int(lt) for lt in var_stats.keys())
+        # Also include lead times from cumulative stats
+        model_cumulative = cumulative_by_lead_time.get(model.lower(), {})
+        for var in ['temp', 'mslp', 'precip']:
+            var_stats = model_cumulative.get(var, {})
+            all_forecast_hours.update(int(lt) for lt in var_stats.keys())
 
-    lead_times = sorted(all_forecast_hours)
+        logger.debug(f"Raw all_forecast_hours: {sorted(list(all_forecast_hours))}")
 
-    if not lead_times:
-        return {"error": "No lead times found in ASOS forecast runs."}
+        # Filter lead times: use all unique forecast hours in sorted order
+        lead_times = sorted(list(all_forecast_hours))
+        logger.debug(f"Lead times after removing filtering: {lead_times}")
 
-    # Aggregate errors across all stations for each lead time and variable
-    # Structure: {lead_time: {var: {sum_abs_errors, sum_errors, count}}}
-    aggregated_stats = {
-        lt: {
-            'temp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
-            'mslp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
-            'precip': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+        if not lead_times:
+            raise ValueError("No lead times found in ASOS forecast runs.")
+
+        # Aggregate errors across all stations for each lead time and variable
+        # Structure: {lead_time: {var: {sum_abs_errors, sum_errors, count}}}
+        aggregated_stats = {
+            lt: {
+                'temp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
+                'mslp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
+                'precip': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+            }
+            for lt in lead_times
         }
-        for lt in lead_times
-    }
 
-    # Start with cumulative stats
-    for var in ['temp', 'mslp', 'precip']:
-        var_cumulative = model_cumulative.get(var, {})
-        for lt_str, stats in var_cumulative.items():
-            lt = int(lt_str)
-            if lt in aggregated_stats:
-                aggregated_stats[lt][var]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
-                aggregated_stats[lt][var]['sum_errors'] += stats.get('sum_errors', 0.0)
-                aggregated_stats[lt][var]['count'] += stats.get('count', 0)
+        # Start with cumulative stats
+        for var in ['temp', 'mslp', 'precip']:
+            var_cumulative = model_cumulative.get(var, {})
+            for lt_str, stats in var_cumulative.items():
+                lt = int(lt_str)
+                if lt in aggregated_stats:
+                    aggregated_stats[lt][var]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
+                    aggregated_stats[lt][var]['sum_errors'] += stats.get('sum_errors', 0.0)
+                    aggregated_stats[lt][var]['count'] += stats.get('count', 0)
 
-    # Add fresh calculations from current runs
-    for run_key, run_data in runs.items():
-        try:
-            init_time = datetime.fromisoformat(run_key)
-            if init_time.tzinfo is None:
-                init_time = init_time.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-
-        forecast_hours = run_data.get("forecast_hours", [])
-        model_data = run_data.get(model.lower())
-
-        if not model_data:
-            continue
-
-        for station_id, fcst_data in model_data.items():
-            if station_id not in stations:
+        # Add fresh calculations from current runs
+        for run_key, run_data in runs.items():
+            try:
+                init_time = datetime.fromisoformat(run_key)
+                if init_time.tzinfo is None:
+                    init_time = init_time.replace(tzinfo=timezone.utc)
+            except ValueError:
                 continue
 
-            for i, lt in enumerate(forecast_hours):
-                valid_time = init_time + timedelta(hours=lt)
-                if valid_time >= now:
+            forecast_hours = run_data.get("forecast_hours", [])
+            model_data = run_data.get(model.lower())
+
+            if not model_data:
+                continue
+
+            for station_id, fcst_data in model_data.items():
+                if station_id not in stations:
                     continue
 
-                obs = get_stored_observation(db, station_id, valid_time)
-                if not obs:
-                    continue
+                for i, lt in enumerate(forecast_hours):
+                    valid_time = init_time + timedelta(hours=lt)
+                    if valid_time >= now:
+                        continue
 
-                # Temperature
-                fcst_temps = fcst_data.get('temps', [])
-                if i < len(fcst_temps) and fcst_temps[i] is not None and obs.get('temp') is not None:
-                    error = fcst_temps[i] - obs['temp']
-                    aggregated_stats[lt]['temp']['sum_abs_errors'] += abs(error)
-                    aggregated_stats[lt]['temp']['sum_errors'] += error
-                    aggregated_stats[lt]['temp']['count'] += 1
+                    obs = get_stored_observation(db, station_id, valid_time)
+                    if not obs:
+                        continue
 
-                # MSLP
-                fcst_mslps = fcst_data.get('mslps', [])
-                if i < len(fcst_mslps) and fcst_mslps[i] is not None and obs.get('mslp') is not None:
-                    error = fcst_mslps[i] - obs['mslp']
-                    aggregated_stats[lt]['mslp']['sum_abs_errors'] += abs(error)
-                    aggregated_stats[lt]['mslp']['sum_errors'] += error
-                    aggregated_stats[lt]['mslp']['count'] += 1
+                    # Temperature
+                    fcst_temps = fcst_data.get('temps', [])
+                    if i < len(fcst_temps) and fcst_temps[i] is not None and obs.get('temp') is not None:
+                        error = fcst_temps[i] - obs['temp']
+                        aggregated_stats[lt]['temp']['sum_abs_errors'] += abs(error)
+                        aggregated_stats[lt]['temp']['sum_errors'] += error
+                        aggregated_stats[lt]['temp']['count'] += 1
 
-                # Precipitation (6-hour accumulated)
-                fcst_precips = fcst_data.get('precips', [])
-                if i < len(fcst_precips) and fcst_precips[i] is not None and obs.get('precip_6hr') is not None:
-                    error = fcst_precips[i] - obs['precip_6hr']
-                    aggregated_stats[lt]['precip']['sum_abs_errors'] += abs(error)
-                    aggregated_stats[lt]['precip']['sum_errors'] += error
-                    aggregated_stats[lt]['precip']['count'] += 1
+                    # MSLP
+                    fcst_mslps = fcst_data.get('mslps', [])
+                    if i < len(fcst_mslps) and fcst_mslps[i] is not None and obs.get('mslp') is not None:
+                        error = fcst_mslps[i] - obs['mslp']
+                        aggregated_stats[lt]['mslp']['sum_abs_errors'] += abs(error)
+                        aggregated_stats[lt]['mslp']['sum_errors'] += error
+                        aggregated_stats[lt]['mslp']['count'] += 1
 
-    # Calculate mean MAE and Bias for each lead time
-    result = {
-        "lead_times": lead_times,
-        "temp_mae": [],
-        "temp_bias": [],
-        "mslp_mae": [],
-        "mslp_bias": [],
-        "precip_mae": [],
-        "precip_bias": []
-    }
+                    # Precipitation (6-hour accumulated)
+                    fcst_precips = fcst_data.get('precips', [])
+                    if i < len(fcst_precips) and fcst_precips[i] is not None and obs.get('precip_6hr') is not None:
+                        error = fcst_precips[i] - obs['precip_6hr']
+                        aggregated_stats[lt]['precip']['sum_abs_errors'] += abs(error)
+                        aggregated_stats[lt]['precip']['sum_errors'] += error
+                        aggregated_stats[lt]['precip']['count'] += 1
 
-    for lt in lead_times:
-        # Temperature
-        temp_stats = aggregated_stats[lt]['temp']
-        if temp_stats['count'] > 0:
-            result["temp_mae"].append(round(temp_stats['sum_abs_errors'] / temp_stats['count'], 2))
-            result["temp_bias"].append(round(temp_stats['sum_errors'] / temp_stats['count'], 2))
-        else:
-            result["temp_mae"].append(None)
-            result["temp_bias"].append(None)
+        # Calculate mean MAE and Bias for each lead time
+        result = {
+            "lead_times": lead_times,
+            "temp_mae": [],
+            "temp_bias": [],
+            "mslp_mae": [],
+            "mslp_bias": [],
+            "precip_mae": [],
+            "precip_bias": []
+        }
 
-        # MSLP
-        mslp_stats = aggregated_stats[lt]['mslp']
-        if mslp_stats['count'] > 0:
-            result["mslp_mae"].append(round(mslp_stats['sum_abs_errors'] / mslp_stats['count'], 2))
-            result["mslp_bias"].append(round(mslp_stats['sum_errors'] / mslp_stats['count'], 2))
-        else:
-            result["mslp_mae"].append(None)
-            result["mslp_bias"].append(None)
+        for lt in lead_times:
+            # Temperature
+            temp_stats = aggregated_stats[lt]['temp']
+            if temp_stats['count'] > 0:
+                result["temp_mae"].append(round(temp_stats['sum_abs_errors'] / temp_stats['count'], 2))
+                result["temp_bias"].append(round(temp_stats['sum_errors'] / temp_stats['count'], 2))
+            else:
+                result["temp_mae"].append(None)
+                result["temp_bias"].append(None)
 
-        # Precipitation
-        precip_stats = aggregated_stats[lt]['precip']
-        if precip_stats['count'] > 0:
-            result["precip_mae"].append(round(precip_stats['sum_abs_errors'] / precip_stats['count'], 2))
-            result["precip_bias"].append(round(precip_stats['sum_errors'] / precip_stats['count'], 2))
-        else:
-            result["precip_mae"].append(None)
-            result["precip_bias"].append(None)
+            # MSLP
+            mslp_stats = aggregated_stats[lt]['mslp']
+            if mslp_stats['count'] > 0:
+                result["mslp_mae"].append(round(mslp_stats['sum_abs_errors'] / mslp_stats['count'], 2))
+                result["mslp_bias"].append(round(mslp_stats['sum_errors'] / mslp_stats['count'], 2))
+            else:
+                result["mslp_mae"].append(None)
+                result["mslp_bias"].append(None)
 
-    return result
+            # Precipitation
+            precip_stats = aggregated_stats[lt]['precip']
+            if precip_stats['count'] > 0:
+                result["precip_mae"].append(round(precip_stats['sum_abs_errors'] / precip_stats['count'], 2))
+                result["precip_bias"].append(round(precip_stats['sum_errors'] / precip_stats['count'], 2))
+            else:
+                result["precip_mae"].append(None)
+                result["precip_bias"].append(None)
+
+        return result
+    except Exception as e:
+        logger.error(f"DEBUG: Exception in get_mean_verification_by_lead_time: Type: {type(e).__name__}, Value: {e}")
+        raise
