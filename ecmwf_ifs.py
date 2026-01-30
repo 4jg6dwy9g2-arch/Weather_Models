@@ -11,21 +11,19 @@ from datetime import datetime, timedelta, timezone
 
 from pathlib import Path
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import logging
-
-
+import tempfile
+from rate_limiter import RateLimiter # Import the RateLimiter
 
 import numpy as np
-
 import xarray as xr
-
-
 
 from base import WeatherModel
 
-
+# Instantiate a rate limiter for ECMWF Open Data calls (e.g., 1 call every 2 seconds)
+ecmwf_rate_limiter = RateLimiter(calls_per_second=1)
 
 CACHE_DIR = Path.home() / ".cache" / "weather_models"
 
@@ -181,9 +179,9 @@ class IFSModel(WeatherModel):
 
             try:
 
-                from ecmwf.opendata import Client
+                                from ecmwf.opendata import Client
 
-                self._client = Client(source="ecmwf", model="ifs")
+                                self._client = Client(source="aws", model="ifs")
 
             except ImportError:
 
@@ -302,6 +300,7 @@ class IFSModel(WeatherModel):
 
         return init_times
 
+    @ecmwf_rate_limiter
     def _download_grib(
         self,
         init_time: datetime,
@@ -353,6 +352,60 @@ class IFSModel(WeatherModel):
 
         except Exception as e:
             logger.error(f"Failed to download IFS data: {e}")
+            raise
+
+    @ecmwf_rate_limiter
+    def _download_grib_batch(
+        self,
+        init_time: datetime,
+        forecast_hour: int,
+        params: List[str],
+        level: Optional[Union[str, int]] = None,
+    ) -> Path:
+        """Download GRIB file with multiple parameters from ECMWF Open Data."""
+        client = self._get_client()
+
+        # Generate a filename that includes all parameters for batch download
+        param_str = "_".join(sorted(params)) # Sort for consistent filenames
+        level_str = f"_{level}" if level else ""
+        filename = f"ifs_{init_time.strftime('%Y%m%d%H')}_{forecast_hour:03d}_{param_str}{level_str}.grib2"
+        filepath = self._download_dir / filename
+
+        # Return cached file if exists
+        if filepath.exists():
+            logger.info(f"Using cached batch GRIB: {filename}")
+            return filepath
+
+        if init_time.tzinfo is not None:
+            init_time_naive = init_time.replace(tzinfo=None)
+        else:
+            init_time_naive = init_time
+
+        logger.info(f"Downloading IFS batch params ({param_str}) for F{forecast_hour:03d} from {init_time_naive.strftime('%Y%m%d %HZ')}")
+
+        try:
+            kwargs = {
+                "date": init_time_naive.strftime('%Y%m%d'),
+                "time": init_time_naive.hour,
+                "step": forecast_hour,
+                "param": params, # Pass list of parameters
+                "type": "fc",
+                "target": str(filepath.absolute()),
+            }
+
+            if level:
+                kwargs["levelist"] = int(level)
+
+            client.retrieve(**kwargs)
+
+            if not filepath.exists():
+                raise FileNotFoundError(f"Batch download completed but file not found: {filepath}")
+
+            logger.info(f"Downloaded batch {filepath.name} ({filepath.stat().st_size} bytes)")
+            return filepath
+
+        except Exception as e:
+            logger.error(f"Failed to download IFS batch data: {e}")
             raise
 
     def fetch_data(

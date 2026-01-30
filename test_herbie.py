@@ -4,6 +4,13 @@ import xarray as xr
 import numpy as np
 import tempfile
 from pathlib import Path
+from rate_limiter import RateLimiter
+
+herbie_rate_limiter = RateLimiter(calls_per_second=0.2)
+
+@herbie_rate_limiter
+def _rate_limited_herbie(*args, **kwargs):
+    return Herbie(*args, **kwargs)
 
 # Define the Fairfax, VA region (approximate bounds)
 # Coordinates: 38.8462° N, 77.3064° W
@@ -31,7 +38,7 @@ print(f"Attempting to fetch GFS data for {init_time} F{forecast_hour:03d}")
 with tempfile.TemporaryDirectory() as tmpdir:
     tmp_save_dir = Path(tmpdir)
     # Initialize Herbie
-    H = Herbie(
+    H = _rate_limited_herbie(
         init_time,
         model="gfs",
         product="pgrb2.0p25",  # 0.25 degree resolution

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from pathlib import Path
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import logging
 
@@ -28,6 +28,16 @@ import xarray as xr
 from base import WeatherModel
 
 from pathlib import Path
+
+from rate_limiter import RateLimiter # Import the RateLimiter
+
+
+
+# Instantiate a rate limiter for ECMWF Open Data calls (e.g., 1 call every 2 seconds)
+
+ecmwf_rate_limiter = RateLimiter(calls_per_second=1)
+
+
 
 
 
@@ -277,11 +287,11 @@ class AIFSModel(WeatherModel):
 
             try:
 
-                from ecmwf.opendata import Client
+                                from ecmwf.opendata import Client
 
-                # Use aifs-single for deterministic AIFS forecasts
+                                # Use aifs-single for deterministic AIFS forecasts
 
-                self._client = Client(model="aifs-single")
+                                self._client = Client(source="aws", model="aifs-single")
 
             except ImportError:
 
@@ -400,6 +410,7 @@ class AIFSModel(WeatherModel):
 
         return init_times
 
+    @ecmwf_rate_limiter
     def _download_grib(
         self,
         init_time: datetime,
@@ -454,6 +465,60 @@ class AIFSModel(WeatherModel):
 
         except Exception as e:
             logger.error(f"Failed to download AIFS data: {e}")
+            raise
+
+    @ecmwf_rate_limiter
+    def _download_grib_batch(
+        self,
+        init_time: datetime,
+        forecast_hour: int,
+        params: List[str],
+        level: Optional[Union[str, int]] = None,
+    ) -> Path:
+        """Download GRIB file with multiple parameters from ECMWF Open Data."""
+        client = self._get_client()
+
+        # Generate a filename that includes all parameters for batch download
+        param_str = "_".join(sorted(params)) # Sort for consistent filenames
+        level_str = f"_{level}" if level else ""
+        filename = f"aifs_{init_time.strftime('%Y%m%d%H')}_{forecast_hour:03d}_{param_str}{level_str}.grib2"
+        filepath = self._download_dir / filename
+
+        # Return cached file if exists
+        if filepath.exists():
+            logger.info(f"Using cached batch GRIB: {filename}")
+            return filepath
+
+        if init_time.tzinfo is not None:
+            init_time_naive = init_time.replace(tzinfo=None)
+        else:
+            init_time_naive = init_time
+
+        logger.info(f"Downloading AIFS batch params ({param_str}) for F{forecast_hour:03d} from {init_time_naive.strftime('%Y%m%d %HZ')}")
+
+        try:
+            kwargs = {
+                "date": init_time_naive.strftime('%Y%m%d'),
+                "time": init_time_naive.hour,
+                "step": forecast_hour,
+                "param": params, # Pass list of parameters
+                "type": "fc",
+                "target": str(filepath.absolute()),
+            }
+
+            if level:
+                kwargs["levelist"] = int(level)
+
+            client.retrieve(**kwargs)
+
+            if not filepath.exists():
+                raise FileNotFoundError(f"Batch download completed but file not found: {filepath}")
+
+            logger.info(f"Downloaded batch {filepath.name} ({filepath.stat().st_size} bytes)")
+            return filepath
+
+        except Exception as e:
+            logger.error(f"Failed to download AIFS batch data: {e}")
             raise
 
     def fetch_data(
@@ -525,15 +590,33 @@ class AIFSModel(WeatherModel):
             plevel = level
 
         try:
-            # Download U component
-            u_path = self._download_grib(init_time, forecast_hour, u_param, plevel)
-            ds_u = xr.open_dataset(u_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
-            u = ds_u[list(ds_u.data_vars)[0]]
+            # Download both U and V components in a single batch call
+            grib_path = self._download_grib_batch(init_time, forecast_hour, [u_param, v_param], plevel)
 
-            # Download V component
-            v_path = self._download_grib(init_time, forecast_hour, v_param, plevel)
-            ds_v = xr.open_dataset(v_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
-            v = ds_v[list(ds_v.data_vars)[0]]
+            # Open the dataset containing both variables
+            ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
+
+            # Extract U and V components
+            # The exact variable names might vary, so we'll try to find them
+            u = None
+            v = None
+            for var_name in ds.data_vars:
+                if 'u' in var_name.lower() and 'component' in var_name.lower(): # e.g., 'u_component_of_wind'
+                    u = ds[var_name]
+                elif 'v' in var_name.lower() and 'component' in var_name.lower(): # e.g., 'v_component_of_wind'
+                    v = ds[var_name]
+                # Fallback for simpler names
+                elif 'u' == var_name.lower() and not u:
+                    u = ds[var_name]
+                elif 'v' == var_name.lower() and not v:
+                    v = ds[var_name]
+                elif '10u' == var_name.lower() and not u: # Specific to 10m wind
+                    u = ds[var_name]
+                elif '10v' == var_name.lower() and not v: # Specific to 10m wind
+                    v = ds[var_name]
+
+            if u is None or v is None:
+                raise ValueError("Could not find both U and V wind components in the downloaded GRIB file.")
 
             if region is not None:
                 u = self._subset_region(u, region)
