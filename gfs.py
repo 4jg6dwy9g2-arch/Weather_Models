@@ -8,11 +8,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import logging
 from pathlib import Path
+from rate_limiter import RateLimiter # Import the RateLimiter
 
 import numpy as np
 import xarray as xr
 
 from base import WeatherModel
+
+# Instantiate a rate limiter for Herbie calls (e.g., 1 call every 5 seconds)
+herbie_rate_limiter = RateLimiter(calls_per_second=1)
 
 class Variable:
     def __init__(self, name, display_name, units, herbie_search, category, colormap, contour_levels, fill=True, level=None):
@@ -136,6 +140,7 @@ class GFSModel(WeatherModel):
 
         return init_times
 
+    @herbie_rate_limiter
     def _get_herbie(self, init_time: datetime, forecast_hour: int, save_dir: Path):
         """Create a Herbie object for the given init time and forecast hour."""
         if not self._check_herbie():
@@ -251,19 +256,21 @@ class GFSModel(WeatherModel):
             logger.info(f"Fetching wind components at {level} for {init_time} F{forecast_hour:03d}")
 
             try:
-                # Fetch U component
-                ds_u = H.xarray(u_search, remove_grib=True)
-                u_vars = [v for v in ds_u.data_vars if 'u' in v.lower() or 'ugrd' in v.lower()]
-                if not u_vars:
-                    u_vars = [v for v in ds_u.data_vars if v not in ['latitude', 'longitude', 'time', 'step', 'valid_time']]
-                u = ds_u[u_vars[0]]
+                # Fetch both U and V components in a single call
+                search_strings = [u_search, v_search]
+                ds = H.xarray(search_strings, remove_grib=True)
 
-                # Fetch V component
-                ds_v = H.xarray(v_search, remove_grib=True)
-                v_vars = [v for v in ds_v.data_vars if 'v' in v.lower() or 'vgrd' in v.lower()]
-                if not v_vars:
-                    v_vars = [v for v in ds_v.data_vars if v not in ['latitude', 'longitude', 'time', 'step', 'valid_time']]
-                v = ds_v[v_vars[0]]
+                # Extract U and V components from the dataset
+                u = None
+                v = None
+                for var_name in ds.data_vars:
+                    if u_search.replace(':', '').strip().lower() in var_name.lower():
+                        u = ds[var_name]
+                    elif v_search.replace(':', '').strip().lower() in var_name.lower():
+                        v = ds[var_name]
+                
+                if u is None or v is None:
+                    raise ValueError("Could not find both U and V wind components in the downloaded GRIB file.")
 
                 # Subset to region if specified
                 if region is not None:

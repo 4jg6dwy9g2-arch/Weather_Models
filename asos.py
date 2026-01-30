@@ -15,17 +15,27 @@ Precipitation Handling:
   (00Z, 06Z, 12Z, 18Z) to match model forecast periods
 """
 
-import json
-import logging
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+import time
+from functools import wraps
 import urllib.request
 import urllib.parse
-import time
+from rate_limiter import RateLimiter
+from pathlib import Path
+import logging
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta, timezone
+import json
+import concurrent.futures # Import for ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+
+# IEM Rate Limiter - 1 call per second
+iem_rate_limiter = RateLimiter(calls_per_second=1)
+
+@iem_rate_limiter
+def _rate_limited_urlopen(*args, **kwargs):
+    return urllib.request.urlopen(*args, **kwargs)
 
 # Cache directory for station metadata
 CACHE_DIR = Path.home() / ".cache" / "weather_models" / "asos"
@@ -81,7 +91,7 @@ def fetch_state_stations(state: str) -> List[ASOSStation]:
     stations = []
 
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
+        with _rate_limited_urlopen(url, timeout=30) as response:
             data = json.loads(response.read().decode('utf-8'))
 
         for feature in data.get('features', []):
@@ -139,11 +149,18 @@ def fetch_all_stations(force_refresh: bool = False) -> List[ASOSStation]:
     logger.info("Fetching ASOS stations from IEM...")
     all_stations = []
 
-    for state in US_STATES:
-        stations = fetch_state_stations(state)
-        all_stations.extend(stations)
-        # Be nice to IEM servers
-        time.sleep(0.1)
+    # Use ThreadPoolExecutor to fetch states concurrently
+    # The rate limiter on _rate_limited_urlopen will handle rate limiting
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit tasks for each state
+        future_to_state = {executor.submit(fetch_state_stations, state): state for state in US_STATES}
+        for future in concurrent.futures.as_completed(future_to_state):
+            state = future_to_state[future]
+            try:
+                stations = future.result()
+                all_stations.extend(stations)
+            except Exception as exc:
+                logger.warning(f"Failed to fetch stations for {state}: {exc}")
 
     logger.info(f"Fetched {len(all_stations)} ASOS stations from IEM")
 
@@ -243,7 +260,7 @@ def fetch_observations(
             short_to_full[sid[1:]] = sid  # "DCA" -> "KDCA"
 
     try:
-        with urllib.request.urlopen(url, timeout=120) as response:
+        with _rate_limited_urlopen(url, timeout=120) as response:
             content = response.read().decode('utf-8')
 
         # Parse CSV response
@@ -655,23 +672,33 @@ def fetch_and_store_observations():
 
     logger.info(f"Fetching ASOS observations from {min_time} to {max_time} for {len(times_to_fetch)} valid times")
 
-    # Fetch observations in chunks of stations
+    # Fetch observations in chunks of stations concurrently
     station_ids = list(stations.keys())
-    chunk_size = 100
+    chunk_size = 50 # Reduce chunk size to be more granular with rate limiting and concurrency
     all_observations = {}
-
-    for i in range(0, len(station_ids), chunk_size):
-        chunk_ids = station_ids[i:i+chunk_size]
-        logger.info(f"Fetching observations for stations {i+1}-{min(i+chunk_size, len(station_ids))} of {len(station_ids)}...")
-
-        obs_chunk = fetch_observations(
-            chunk_ids,
-            min_time,
-            max_time,
-            variables=['tmpf', 'mslp', 'p01i']
-        )
-        all_observations.update(obs_chunk)
-        time.sleep(0.5)  # Be nice to IEM
+    
+    # Using a smaller max_workers to avoid overwhelming the local system with too many open connections,
+    # while still allowing some concurrency. The iem_rate_limiter further paces requests.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        for i in range(0, len(station_ids), chunk_size):
+            chunk_ids = station_ids[i:i+chunk_size]
+            logger.info(f"Submitting observations fetch for stations {i+1}-{min(i+chunk_size, len(station_ids))} of {len(station_ids)}...")
+            future = executor.submit(
+                fetch_observations,
+                chunk_ids,
+                min_time,
+                max_time,
+                variables=['tmpf', 'mslp', 'p01i']
+            )
+            futures.append(future)
+        
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                obs_chunk = future.result()
+                all_observations.update(obs_chunk)
+            except Exception as exc:
+                logger.error(f"Observation fetch task generated an exception: {exc}")
 
     # Store observations keyed by station and valid time
     obs_count = 0
