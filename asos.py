@@ -50,6 +50,9 @@ STATIONS_CACHE_TTL_DAYS = 7
 # ASOS forecasts storage file (in project directory)
 ASOS_FORECASTS_FILE = Path(__file__).parent / "asos_forecasts.json"
 
+# ASOS verification cache file (precomputed stats)
+ASOS_VERIFICATION_CACHE_FILE = Path(__file__).parent / "asos_verification_cache.json"
+
 # Retention period for stored forecasts
 FORECASTS_RETENTION_DAYS = 21
 
@@ -420,8 +423,12 @@ def load_asos_forecasts_db() -> dict:
                 if "cumulative_stats" not in data:
                     data["cumulative_stats"] = {
                         "by_station": {},
-                        "by_lead_time": {}
+                        "by_lead_time": {},
+                        "time_series": {}
                     }
+                # Ensure time_series exists in cumulative_stats
+                if "time_series" not in data["cumulative_stats"]:
+                    data["cumulative_stats"]["time_series"] = {}
                 return data
         except Exception as e:
             logger.warning(f"Error loading asos_forecasts.json: {e}")
@@ -430,7 +437,8 @@ def load_asos_forecasts_db() -> dict:
         "runs": {},
         "cumulative_stats": {
             "by_station": {},
-            "by_lead_time": {}
+            "by_lead_time": {},
+            "time_series": {}
         }
     }
 
@@ -450,7 +458,7 @@ def accumulate_stats_from_run(
     """
     Accumulate statistics from a run into cumulative_stats before deletion.
 
-    Updates both by_station and by_lead_time cumulative statistics.
+    Updates both by_station and by_lead_time cumulative statistics, plus daily time series.
 
     Args:
         data: Full database dict
@@ -470,7 +478,29 @@ def accumulate_stats_from_run(
 
     # Initialize cumulative stats if needed
     if "cumulative_stats" not in data:
-        data["cumulative_stats"] = {"by_station": {}, "by_lead_time": {}}
+        data["cumulative_stats"] = {"by_station": {}, "by_lead_time": {}, "time_series": {}}
+
+    cumulative_by_station = data["cumulative_stats"]["by_station"]
+    cumulative_by_lead_time = data["cumulative_stats"]["by_lead_time"]
+
+    # Initialize time series structure if needed
+    if "time_series" not in data["cumulative_stats"]:
+        data["cumulative_stats"]["time_series"] = {}
+    cumulative_time_series = data["cumulative_stats"]["time_series"]
+
+    # Initialize time series for each model if needed
+    for model in ['gfs', 'aifs', 'ifs']:
+        if model not in cumulative_time_series:
+            cumulative_time_series[model] = {}
+        for var in ['temp', 'mslp', 'precip']:
+            if var not in cumulative_time_series[model]:
+                cumulative_time_series[model][var] = {}
+
+    var_map = {
+        'temp': ('temps', 'temp'),
+        'mslp': ('mslps', 'mslp'),
+        'precip': ('precips', 'precip_6hr')
+    }
 
     cumulative_by_station = data["cumulative_stats"]["by_station"]
     cumulative_by_lead_time = data["cumulative_stats"]["by_lead_time"]
@@ -555,6 +585,54 @@ def accumulate_stats_from_run(
                     cumulative_by_lead_time[model][var][lt_str]["sum_abs_errors"] += abs_error
                     cumulative_by_lead_time[model][var][lt_str]["sum_errors"] += error
                     cumulative_by_lead_time[model][var][lt_str]["count"] += 1
+
+    # Accumulate time series data (daily errors by lead time)
+    for model in ['gfs', 'aifs', 'ifs']:
+        model_data = run_data.get(model)
+        if not model_data:
+            continue
+
+        # Process each lead time
+        for i, lt in enumerate(forecast_hours):
+            valid_time = init_time + timedelta(hours=lt)
+
+            # Only process past times
+            if valid_time >= now:
+                continue
+
+            date_key = valid_time.date().isoformat()
+            lt_str = str(lt)
+
+            # Process each station
+            for station_id, fcst_data in model_data.items():
+                if station_id not in stations:
+                    continue
+
+                # Get stored observation
+                obs = get_stored_observation(data, station_id, valid_time)
+                if not obs:
+                    continue
+
+                # Process each variable
+                for var, (fcst_key, obs_key) in var_map.items():
+                    fcst_values = fcst_data.get(fcst_key, [])
+                    if i >= len(fcst_values) or fcst_values[i] is None:
+                        continue
+                    if obs.get(obs_key) is None:
+                        continue
+
+                    fcst_val = fcst_values[i]
+                    obs_val = obs[obs_key]
+                    error = fcst_val - obs_val
+
+                    # Initialize structures if needed
+                    if lt_str not in cumulative_time_series[model][var]:
+                        cumulative_time_series[model][var][lt_str] = {}
+                    if date_key not in cumulative_time_series[model][var][lt_str]:
+                        cumulative_time_series[model][var][lt_str][date_key] = []
+
+                    # Append error to this date's list
+                    cumulative_time_series[model][var][lt_str][date_key].append(error)
 
 
 def cleanup_old_runs(data: dict) -> dict:
@@ -731,6 +809,14 @@ def fetch_and_store_observations():
     save_asos_forecasts_db(db)
 
     logger.info(f"Stored {obs_count} observations for {len(all_observations)} stations")
+
+    # Precompute verification cache with updated observations
+    logger.info("Precomputing verification cache with updated observations...")
+    try:
+        precompute_verification_cache()
+    except Exception as e:
+        logger.error(f"Error precomputing verification cache: {e}")
+
     return obs_count
 
 
@@ -1529,3 +1615,599 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
     except Exception as e:
         logger.error(f"DEBUG: Exception in get_mean_verification_by_lead_time: Type: {type(e).__name__}, Value: {e}")
         raise
+
+
+def precompute_verification_cache() -> dict:
+    """
+    Precompute all verification statistics and save to cache file.
+
+    This should be called after fetching observations during sync to update
+    the verification cache with the latest data. This eliminates the need to
+    compute stats on-the-fly when the verification page loads.
+
+    Returns:
+        Dict with precomputed verification data
+    """
+    logger.info("Precomputing verification cache...")
+    start_time = time.time()
+
+    db = load_asos_forecasts_db()
+    stations = db.get("stations", {})
+    runs = db.get("runs", {})
+    cumulative_by_station = db.get("cumulative_stats", {}).get("by_station", {})
+    cumulative_by_lead_time = db.get("cumulative_stats", {}).get("by_lead_time", {})
+
+    if not stations:
+        logger.warning("No stations available for verification cache")
+        return {}
+
+    now = datetime.now(timezone.utc)
+
+    # Collect all forecast hours
+    all_forecast_hours = set()
+    for run_data in runs.values():
+        all_forecast_hours.update(run_data.get("forecast_hours", []))
+
+    # Also include lead times from cumulative stats
+    for model in ['gfs', 'aifs', 'ifs']:
+        model_cumulative = cumulative_by_lead_time.get(model, {})
+        for var in ['temp', 'mslp', 'precip']:
+            var_stats = model_cumulative.get(var, {})
+            all_forecast_hours.update(int(lt) for lt in var_stats.keys())
+
+    lead_times = sorted(list(all_forecast_hours))
+
+    if not lead_times:
+        logger.warning("No lead times available for verification cache")
+        return {}
+
+    # Initialize cache structure
+    cache_data = {
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "lead_times": lead_times,
+        "by_station": {},
+        "by_lead_time": {},
+        "time_series": {},
+        "stations": stations
+    }
+
+    # Map variable name to forecast/obs keys
+    var_map = {
+        'temp': ('temps', 'temp'),
+        'mslp': ('mslps', 'mslp'),
+        'precip': ('precips', 'precip_6hr')
+    }
+
+    # Initialize aggregated stats for by_station and by_lead_time
+    # Structure: station_stats[station_id][model][var][lt_str] = {sum_abs_errors, sum_errors, count}
+    station_stats = {}
+    for station_id in stations:
+        station_stats[station_id] = {
+            'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
+            'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+            'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+        }
+
+    # Structure: aggregated_stats[model][var][lt_str] = {sum_abs_errors, sum_errors, count}
+    aggregated_stats = {
+        'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+    }
+
+    # Initialize with zeros for all lead times
+    for model in ['gfs', 'aifs', 'ifs']:
+        for var in ['temp', 'mslp', 'precip']:
+            for lt in lead_times:
+                lt_str = str(lt)
+                aggregated_stats[model][var][lt_str] = {
+                    'sum_abs_errors': 0.0,
+                    'sum_errors': 0.0,
+                    'count': 0
+                }
+                for station_id in stations:
+                    station_stats[station_id][model][var][lt_str] = {
+                        'sum_abs_errors': 0.0,
+                        'sum_errors': 0.0,
+                        'count': 0
+                    }
+
+    logger.info(f"Loading cumulative stats for {len(stations)} stations...")
+
+    # Load cumulative stats
+    for station_id in stations:
+        if station_id in cumulative_by_station:
+            for model in ['gfs', 'aifs', 'ifs']:
+                model_cumulative = cumulative_by_station[station_id].get(model, {})
+                for var in ['temp', 'mslp', 'precip']:
+                    var_cumulative = model_cumulative.get(var, {})
+                    for lt_str, stats in var_cumulative.items():
+                        if int(lt_str) in lead_times:
+                            station_stats[station_id][model][var][lt_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
+                            station_stats[station_id][model][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
+                            station_stats[station_id][model][var][lt_str]['count'] += stats.get('count', 0)
+
+    for model in ['gfs', 'aifs', 'ifs']:
+        model_cumulative = cumulative_by_lead_time.get(model, {})
+        for var in ['temp', 'mslp', 'precip']:
+            var_cumulative = model_cumulative.get(var, {})
+            for lt_str, stats in var_cumulative.items():
+                if int(lt_str) in lead_times:
+                    aggregated_stats[model][var][lt_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
+                    aggregated_stats[model][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
+                    aggregated_stats[model][var][lt_str]['count'] += stats.get('count', 0)
+
+    logger.info(f"Computing fresh stats from {len(runs)} current runs...")
+
+    # Add fresh calculations from current runs
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        forecast_hours = run_data.get("forecast_hours", [])
+
+        for model in ['gfs', 'aifs', 'ifs']:
+            model_data = run_data.get(model)
+            if not model_data:
+                continue
+
+            for station_id, fcst_data in model_data.items():
+                if station_id not in stations:
+                    continue
+
+                for i, lt in enumerate(forecast_hours):
+                    if lt not in lead_times:
+                        continue
+
+                    valid_time = init_time + timedelta(hours=lt)
+                    if valid_time >= now:
+                        continue
+
+                    obs = get_stored_observation(db, station_id, valid_time)
+                    if not obs:
+                        continue
+
+                    lt_str = str(lt)
+
+                    # Process each variable
+                    for var, (fcst_key, obs_key) in var_map.items():
+                        fcst_values = fcst_data.get(fcst_key, [])
+                        if i >= len(fcst_values) or fcst_values[i] is None:
+                            continue
+                        if obs.get(obs_key) is None:
+                            continue
+
+                        fcst_val = fcst_values[i]
+                        obs_val = obs[obs_key]
+                        error = fcst_val - obs_val
+                        abs_error = abs(error)
+
+                        # Update station stats
+                        station_stats[station_id][model][var][lt_str]['sum_abs_errors'] += abs_error
+                        station_stats[station_id][model][var][lt_str]['sum_errors'] += error
+                        station_stats[station_id][model][var][lt_str]['count'] += 1
+
+                        # Update aggregated stats
+                        aggregated_stats[model][var][lt_str]['sum_abs_errors'] += abs_error
+                        aggregated_stats[model][var][lt_str]['sum_errors'] += error
+                        aggregated_stats[model][var][lt_str]['count'] += 1
+
+    logger.info("Finalizing cache data...")
+
+    # Precompute time series data (all historical data)
+    logger.info("Computing verification time series...")
+    time_series_data = precompute_verification_time_series(db, lead_times)
+
+    # Convert to final cache format - by_station
+    for station_id in stations:
+        cache_data["by_station"][station_id] = {}
+        for model in ['gfs', 'aifs', 'ifs']:
+            cache_data["by_station"][station_id][model] = {}
+            for lt in lead_times:
+                lt_str = str(lt)
+                cache_data["by_station"][station_id][model][lt_str] = {}
+                for var in ['temp', 'mslp', 'precip']:
+                    stats = station_stats[station_id][model][var][lt_str]
+                    if stats['count'] > 0:
+                        cache_data["by_station"][station_id][model][lt_str][var] = {
+                            'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                            'bias': round(stats['sum_errors'] / stats['count'], 2),
+                            'count': stats['count']
+                        }
+                    else:
+                        cache_data["by_station"][station_id][model][lt_str][var] = None
+
+    # Convert to final cache format - by_lead_time
+    for model in ['gfs', 'aifs', 'ifs']:
+        cache_data["by_lead_time"][model] = {}
+        for lt in lead_times:
+            lt_str = str(lt)
+            cache_data["by_lead_time"][model][lt_str] = {}
+            for var in ['temp', 'mslp', 'precip']:
+                stats = aggregated_stats[model][var][lt_str]
+                if stats['count'] > 0:
+                    cache_data["by_lead_time"][model][lt_str][var] = {
+                        'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                        'bias': round(stats['sum_errors'] / stats['count'], 2)
+                    }
+                else:
+                    cache_data["by_lead_time"][model][lt_str][var] = {
+                        'mae': None,
+                        'bias': None
+                    }
+
+    # Add time series data to cache
+    cache_data["time_series"] = time_series_data
+
+    # Save to file
+    try:
+        with open(ASOS_VERIFICATION_CACHE_FILE, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+
+        elapsed = time.time() - start_time
+        logger.info(f"Verification cache precomputed and saved in {elapsed:.1f}s to {ASOS_VERIFICATION_CACHE_FILE}")
+    except Exception as e:
+        logger.error(f"Error saving verification cache: {e}")
+
+    return cache_data
+
+
+def load_verification_cache() -> Optional[dict]:
+    """
+    Load precomputed verification cache from file.
+
+    Returns:
+        Dict with cached verification data, or None if cache doesn't exist
+    """
+    if not ASOS_VERIFICATION_CACHE_FILE.exists():
+        logger.warning(f"Verification cache file not found: {ASOS_VERIFICATION_CACHE_FILE}")
+        return None
+
+    try:
+        with open(ASOS_VERIFICATION_CACHE_FILE) as f:
+            cache_data = json.load(f)
+
+        last_updated = cache_data.get("last_updated", "unknown")
+        logger.info(f"Loaded verification cache (last updated: {last_updated})")
+        return cache_data
+    except Exception as e:
+        logger.error(f"Error loading verification cache: {e}")
+        return None
+
+
+def precompute_verification_time_series(db: dict, lead_times: list, days_back: int = None) -> dict:
+    """
+    Precompute verification time series data for all models, variables, and lead times.
+
+    Combines cumulative historical data (all time) with fresh calculations from current runs
+    to provide complete historical daily time series.
+
+    Args:
+        db: Loaded ASOS database
+        lead_times: List of lead times to compute for
+        days_back: How many days back to compute from current runs (None = all available)
+
+    Returns:
+        Dict with time series data: {model: {variable: {lead_time: {dates, mae, bias, counts}}}}
+    """
+    logger.info("Precomputing verification time series (all historical data)...")
+
+    stations = db.get("stations", {})
+    runs = db.get("runs", {})
+    cumulative_time_series = db.get("cumulative_stats", {}).get("time_series", {})
+
+    if not stations:
+        return {}
+
+    now = datetime.now(timezone.utc)
+    cutoff_date = now - timedelta(days=days_back) if days_back else datetime.min.replace(tzinfo=timezone.utc)
+
+    var_map = {
+        'temp': ('temps', 'temp'),
+        'mslp': ('mslps', 'mslp'),
+        'precip': ('precips', 'precip_6hr')
+    }
+
+    # Structure: time_series[model][var][lt][date] = [errors]
+    time_series = {
+        'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+    }
+
+    # Initialize for all lead times
+    for model in ['gfs', 'aifs', 'ifs']:
+        for var in ['temp', 'mslp', 'precip']:
+            for lt in lead_times:
+                time_series[model][var][lt] = {}
+
+    # Load cumulative time series data (historical data from deleted runs)
+    logger.info("Loading cumulative time series data...")
+    for model in ['gfs', 'aifs', 'ifs']:
+        model_cumulative = cumulative_time_series.get(model, {})
+        for var in ['temp', 'mslp', 'precip']:
+            var_cumulative = model_cumulative.get(var, {})
+            for lt_str, date_errors in var_cumulative.items():
+                lt = int(lt_str)
+                if lt in lead_times:
+                    # Copy the historical date->errors mapping
+                    time_series[model][var][lt] = dict(date_errors)
+
+    # Collect errors by date from current runs
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        if init_time < cutoff_date:
+            continue
+
+        forecast_hours = run_data.get("forecast_hours", [])
+
+        for model in ['gfs', 'aifs', 'ifs']:
+            model_data = run_data.get(model)
+            if not model_data:
+                continue
+
+            for lt in lead_times:
+                if lt not in forecast_hours:
+                    continue
+
+                fcst_idx = forecast_hours.index(lt)
+                valid_time = init_time + timedelta(hours=lt)
+
+                if valid_time >= now:
+                    continue
+
+                date_key = valid_time.date().isoformat()
+
+                # Process each station
+                for station_id, fcst_data in model_data.items():
+                    if station_id not in stations:
+                        continue
+
+                    obs = get_stored_observation(db, station_id, valid_time)
+                    if not obs:
+                        continue
+
+                    # Process each variable
+                    for var, (fcst_key, obs_key) in var_map.items():
+                        fcst_values = fcst_data.get(fcst_key, [])
+                        if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                            continue
+                        if obs.get(obs_key) is None:
+                            continue
+
+                        fcst_val = fcst_values[fcst_idx]
+                        obs_val = obs[obs_key]
+                        error = fcst_val - obs_val
+
+                        # Store error by date (append to any existing cumulative data)
+                        if date_key not in time_series[model][var][lt]:
+                            time_series[model][var][lt][date_key] = []
+                        time_series[model][var][lt][date_key].append(error)
+
+    # Convert to final format with MAE/bias per day
+    result = {
+        'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+    }
+
+    for model in ['gfs', 'aifs', 'ifs']:
+        for var in ['temp', 'mslp', 'precip']:
+            for lt in lead_times:
+                errors_by_date = time_series[model][var][lt]
+
+                if not errors_by_date:
+                    continue
+
+                dates = sorted(errors_by_date.keys())
+                daily_mae = []
+                daily_bias = []
+                daily_counts = []
+
+                for date in dates:
+                    errors = errors_by_date[date]
+                    if errors:
+                        mae = sum(abs(e) for e in errors) / len(errors)
+                        bias = sum(errors) / len(errors)
+                        daily_mae.append(round(mae, 2))
+                        daily_bias.append(round(bias, 2))
+                        daily_counts.append(len(errors))
+                    else:
+                        daily_mae.append(None)
+                        daily_bias.append(None)
+                        daily_counts.append(0)
+
+                result[model][var][lt] = {
+                    'dates': dates,
+                    'mae': daily_mae,
+                    'bias': daily_bias,
+                    'counts': daily_counts
+                }
+
+    return result
+
+
+def get_verification_data_from_cache(
+    model: str,
+    variable: str,
+    lead_time_hours: int
+) -> Dict[str, dict]:
+    """
+    Get verification data from cache for a specific model/variable/lead_time.
+
+    Falls back to computing on-the-fly if cache doesn't exist.
+
+    Args:
+        model: Model name ('gfs', 'aifs', 'ifs')
+        variable: Variable name ('temp', 'mslp', 'precip')
+        lead_time_hours: Lead time in hours
+
+    Returns:
+        Dict mapping station_id to verification data (same format as get_verification_data)
+    """
+    cache = load_verification_cache()
+
+    if cache is None:
+        logger.warning("Cache not available, computing verification on-the-fly")
+        return get_verification_data(model, variable, lead_time_hours)
+
+    # Extract from cache
+    lt_str = str(lead_time_hours)
+    results = {}
+
+    for station_id, station_data in cache.get("by_station", {}).items():
+        model_data = station_data.get(model.lower(), {})
+        lt_data = model_data.get(lt_str, {})
+        var_data = lt_data.get(variable)
+
+        if var_data:
+            station_info = cache.get("stations", {}).get(station_id, {})
+            results[station_id] = {
+                'mae': var_data['mae'],
+                'bias': var_data['bias'],
+                'count': var_data['count'],
+                'lat': station_info.get('lat'),
+                'lon': station_info.get('lon'),
+                'name': station_info.get('name', station_id),
+                'state': station_info.get('state', '')
+            }
+
+    return results
+
+
+def get_mean_verification_from_cache(model: str) -> dict:
+    """
+    Get mean verification from cache for a specific model.
+
+    Falls back to computing on-the-fly if cache doesn't exist.
+
+    Args:
+        model: Model name ('gfs', 'aifs', 'ifs')
+
+    Returns:
+        Dict with mean verification data (same format as get_mean_verification_by_lead_time)
+    """
+    cache = load_verification_cache()
+
+    if cache is None:
+        logger.warning("Cache not available, computing verification on-the-fly")
+        return get_mean_verification_by_lead_time(model)
+
+    # Extract from cache
+    lead_times = cache.get("lead_times", [])
+    model_data = cache.get("by_lead_time", {}).get(model.lower(), {})
+
+    result = {
+        "lead_times": lead_times,
+        "temp_mae": [],
+        "temp_bias": [],
+        "mslp_mae": [],
+        "mslp_bias": [],
+        "precip_mae": [],
+        "precip_bias": []
+    }
+
+    for lt in lead_times:
+        lt_str = str(lt)
+        lt_data = model_data.get(lt_str, {})
+
+        result["temp_mae"].append(lt_data.get("temp", {}).get("mae"))
+        result["temp_bias"].append(lt_data.get("temp", {}).get("bias"))
+        result["mslp_mae"].append(lt_data.get("mslp", {}).get("mae"))
+        result["mslp_bias"].append(lt_data.get("mslp", {}).get("bias"))
+        result["precip_mae"].append(lt_data.get("precip", {}).get("mae"))
+        result["precip_bias"].append(lt_data.get("precip", {}).get("bias"))
+
+    return result
+
+
+def get_verification_time_series_from_cache(
+    model: str,
+    variable: str,
+    lead_time_hours: int,
+    days_back: int = 30
+) -> dict:
+    """
+    Get verification time series from cache for a specific model/variable/lead_time.
+
+    Falls back to computing on-the-fly if cache doesn't exist.
+
+    Args:
+        model: Model name ('gfs', 'aifs', 'ifs')
+        variable: Variable name ('temp', 'mslp', 'precip')
+        lead_time_hours: Lead time in hours
+        days_back: Number of days to include (default 30)
+
+    Returns:
+        Dict with time series data (same format as get_verification_time_series)
+    """
+    cache = load_verification_cache()
+
+    if cache is None:
+        logger.warning("Cache not available, computing time series on-the-fly")
+        return get_verification_time_series(model, variable, lead_time_hours, days_back)
+
+    # Extract from cache
+    time_series = cache.get("time_series", {})
+    model_data = time_series.get(model.lower(), {})
+    var_data = model_data.get(variable, {})
+    lt_data = var_data.get(lead_time_hours)
+
+    if not lt_data:
+        # No data for this combination, return empty result
+        return {
+            "dates": [],
+            "mae": [],
+            "bias": [],
+            "counts": []
+        }
+
+    # Get all dates and slice to requested days_back
+    all_dates = lt_data.get('dates', [])
+    all_mae = lt_data.get('mae', [])
+    all_bias = lt_data.get('bias', [])
+    all_counts = lt_data.get('counts', [])
+
+    if not all_dates:
+        return {
+            "dates": [],
+            "mae": [],
+            "bias": [],
+            "counts": []
+        }
+
+    # Filter to last N days
+    try:
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).date().isoformat()
+
+        # Find the index where dates >= cutoff_date
+        start_idx = 0
+        for i, date in enumerate(all_dates):
+            if date >= cutoff_date:
+                start_idx = i
+                break
+
+        return {
+            "dates": all_dates[start_idx:],
+            "mae": all_mae[start_idx:],
+            "bias": all_bias[start_idx:],
+            "counts": all_counts[start_idx:]
+        }
+    except Exception as e:
+        logger.error(f"Error filtering time series data: {e}")
+        return {
+            "dates": all_dates,
+            "mae": all_mae,
+            "bias": all_bias,
+            "counts": all_counts
+        }
