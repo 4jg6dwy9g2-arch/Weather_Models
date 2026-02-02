@@ -807,6 +807,150 @@ def calculate_lead_time_verification(location_name: str) -> dict:
     return result
 
 
+def calculate_verification_time_series(location_name: str, variable: str = 'temp', lead_time_hours: int = 24, days_back: int = 30) -> dict:
+    """
+    Calculate verification time series (daily MAE and bias) for a location.
+
+    Args:
+        location_name: Location name (e.g., "Fairfax, VA")
+        variable: Variable to verify ('temp' or 'mslp')
+        lead_time_hours: Forecast lead time in hours
+        days_back: Number of days to look back
+
+    Returns:
+        Dict with structure:
+        {
+            "dates": ["2026-01-20", "2026-01-21", ...],
+            "gfs": {"mae": [2.1, 2.3, ...], "bias": [0.5, 0.3, ...], "counts": [1, 1, ...]},
+            "aifs": {"mae": [2.0, 2.2, ...], "bias": [0.4, 0.2, ...], "counts": [1, 1, ...]},
+            "ifs": {"mae": [1.9, 2.1, ...], "bias": [0.3, 0.1, ...], "counts": [1, 1, ...]}
+        }
+    """
+    db = load_forecasts_db()
+
+    if location_name not in db:
+        return {"error": "Location not found"}
+
+    runs = db[location_name].get("runs", {})
+    now = datetime.now(timezone.utc)
+    cutoff_date = now - timedelta(days=days_back)
+
+    # Variable mapping
+    var_map = {
+        'temp': ('temps', 'temps'),
+        'mslp': ('mslps', 'mslps')
+    }
+
+    if variable not in var_map:
+        return {"error": "Invalid variable"}
+
+    fcst_key, obs_key = var_map[variable]
+
+    # Collect errors grouped by date
+    # Key: date string (YYYY-MM-DD), Value: {"gfs": [errors], "aifs": [errors], "ifs": [errors]}
+    errors_by_date = {}
+
+    for run_id, run_data in runs.items():
+        observed = run_data.get("observed")
+        if not observed or not observed.get(obs_key):
+            continue
+
+        gfs_data = run_data.get("gfs", {})
+        aifs_data = run_data.get("aifs", {})
+        ifs_data = run_data.get("ifs", {})
+
+        init_time_str = gfs_data.get("init_time")
+        if not init_time_str:
+            continue
+
+        try:
+            init_time = datetime.fromisoformat(init_time_str)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        # Skip runs outside the time window
+        if init_time < cutoff_date:
+            continue
+
+        forecast_times = gfs_data.get("times", [])
+        gfs_values = gfs_data.get(fcst_key, [])
+        aifs_values = aifs_data.get(fcst_key, [])
+        ifs_values = ifs_data.get(fcst_key, []) if ifs_data else []
+        obs_values = observed.get(obs_key, [])
+
+        for i, time_str in enumerate(forecast_times):
+            try:
+                valid_time = datetime.fromisoformat(time_str)
+                if valid_time.tzinfo is None:
+                    valid_time = valid_time.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+
+            # Only include past times
+            if valid_time >= now:
+                continue
+
+            # Calculate lead time in hours
+            lead_time = int((valid_time - init_time).total_seconds() / 3600)
+
+            # Only include the requested lead time
+            if lead_time != lead_time_hours:
+                continue
+
+            # Use the date of the valid time for grouping
+            date_key = valid_time.date().isoformat()
+
+            if date_key not in errors_by_date:
+                errors_by_date[date_key] = {"gfs": [], "aifs": [], "ifs": []}
+
+            # Collect errors for each model
+            if i < len(gfs_values) and i < len(obs_values):
+                gfs_val = gfs_values[i]
+                obs_val = obs_values[i]
+                if gfs_val is not None and obs_val is not None:
+                    errors_by_date[date_key]["gfs"].append(gfs_val - obs_val)
+
+            if i < len(aifs_values) and i < len(obs_values):
+                aifs_val = aifs_values[i]
+                obs_val = obs_values[i]
+                if aifs_val is not None and obs_val is not None:
+                    errors_by_date[date_key]["aifs"].append(aifs_val - obs_val)
+
+            if ifs_values and i < len(ifs_values) and i < len(obs_values):
+                ifs_val = ifs_values[i]
+                obs_val = obs_values[i]
+                if ifs_val is not None and obs_val is not None:
+                    errors_by_date[date_key]["ifs"].append(ifs_val - obs_val)
+
+    # Calculate daily MAE and Bias
+    dates = sorted(errors_by_date.keys())
+
+    result = {
+        "dates": dates,
+        "gfs": {"mae": [], "bias": [], "counts": []},
+        "aifs": {"mae": [], "bias": [], "counts": []},
+        "ifs": {"mae": [], "bias": [], "counts": []}
+    }
+
+    for date in dates:
+        for model in ["gfs", "aifs", "ifs"]:
+            errors = errors_by_date[date][model]
+            if errors:
+                mae = sum(abs(e) for e in errors) / len(errors)
+                bias = sum(errors) / len(errors)
+                result[model]["mae"].append(round(mae, 2))
+                result[model]["bias"].append(round(bias, 2))
+                result[model]["counts"].append(len(errors))
+            else:
+                result[model]["mae"].append(None)
+                result[model]["bias"].append(None)
+                result[model]["counts"].append(0)
+
+    return result
+
+
 def save_forecast_data(location_name, gfs_data, aifs_data, observed=None, verification=None, ifs_data=None):
     """
     Save forecast data to the central JSON file.
@@ -1073,6 +1217,36 @@ def api_verification_by_lead_time():
         })
     except Exception as e:
         logger.error(f"Error calculating lead-time verification: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/verification-time-series')
+def api_verification_time_series():
+    """
+    Get verification time series (daily MAE and bias) for a location.
+    Shows trends in forecast accuracy over time.
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+    variable = request.args.get('variable', 'temp')
+    lead_time = int(request.args.get('lead_time', 24))
+    days_back = int(request.args.get('days_back', 30))
+
+    try:
+        result = calculate_verification_time_series(location_name, variable, lead_time, days_back)
+
+        if "error" in result:
+            return jsonify({"success": False, "error": result["error"]})
+
+        return jsonify({
+            "success": True,
+            "location": location_name,
+            "variable": variable,
+            "lead_time": lead_time,
+            "days_back": days_back,
+            "time_series": result
+        })
+    except Exception as e:
+        logger.error(f"Error calculating verification time series: {e}")
         return jsonify({"success": False, "error": str(e)})
 
 
@@ -1386,8 +1560,8 @@ def api_asos_verification_map():
             return jsonify(_verification_cache[cache_key])
 
     try:
-        # Get verification data
-        verification = asos.get_verification_data(model, variable, lead_time)
+        # Get verification data from cache
+        verification = asos.get_verification_data_from_cache(model, variable, lead_time)
 
         if not verification:
             return jsonify({
@@ -1520,9 +1694,9 @@ def api_asos_verification_time_series():
     days_back = int(request.args.get('days_back', 30))
 
     try:
-        gfs_data = asos.get_verification_time_series('gfs', variable, lead_time, days_back)
-        aifs_data = asos.get_verification_time_series('aifs', variable, lead_time, days_back)
-        ifs_data = asos.get_verification_time_series('ifs', variable, lead_time, days_back)
+        gfs_data = asos.get_verification_time_series_from_cache('gfs', variable, lead_time, days_back)
+        aifs_data = asos.get_verification_time_series_from_cache('aifs', variable, lead_time, days_back)
+        ifs_data = asos.get_verification_time_series_from_cache('ifs', variable, lead_time, days_back)
 
         # Check for errors
         if "error" in gfs_data:
@@ -1564,9 +1738,9 @@ def api_asos_mean_verification():
     # Location is not directly used for mean across all stations.
 
     try:
-        gfs_results = asos.get_mean_verification_by_lead_time('gfs')
-        aifs_results = asos.get_mean_verification_by_lead_time('aifs')
-        ifs_results = asos.get_mean_verification_by_lead_time('ifs')
+        gfs_results = asos.get_mean_verification_from_cache('gfs')
+        aifs_results = asos.get_mean_verification_from_cache('aifs')
+        ifs_results = asos.get_mean_verification_from_cache('ifs')
 
         # Check for errors from asos functions
         if "error" in gfs_results:
@@ -2031,6 +2205,21 @@ def api_asos_status():
     except Exception as e:
         logger.error(f"Error getting ASOS status: {e}")
         return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    """Shutdown the Flask server."""
+    logger.info("Shutdown request received")
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        # Alternative shutdown method for production servers
+        import os
+        import signal
+        os.kill(os.getpid(), signal.SIGINT)
+    else:
+        func()
+    return jsonify({"success": True, "message": "Server shutting down..."})
 
 
 if __name__ == '__main__':

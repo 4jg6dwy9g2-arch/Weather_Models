@@ -124,6 +124,53 @@
         </div>
     </div>
 
+    <!-- Verification Time Series Chart -->
+    <div id="fairfaxTimeSeriesSection" class="row mb-4" style="display: none;">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div>
+                        <i class="bi bi-graph-up"></i> Verification Trends Over Time
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap">
+                        <select class="form-select form-select-sm" id="fairfaxTsVariable" style="width: auto;">
+                            <option value="temp" selected>Temperature</option>
+                            <option value="mslp">Pressure</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="fairfaxTsMetric" style="width: auto;">
+                            <option value="mae" selected>MAE</option>
+                            <option value="bias">Bias</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="fairfaxTsLeadTime" style="width: auto;">
+                            <option value="6">6h</option>
+                            <option value="12">12h</option>
+                            <option value="24" selected>24h</option>
+                            <option value="48">48h</option>
+                            <option value="72">72h</option>
+                            <option value="120">5d</option>
+                            <option value="168">7d</option>
+                            <option value="240">10d</option>
+                            <option value="288">12d</option>
+                            <option value="360">15d</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="fairfaxTsTimeFrame" style="width: auto;">
+                            <option value="7">1 week</option>
+                            <option value="30" selected>1 month</option>
+                            <option value="90">3 months</option>
+                            <option value="180">6 months</option>
+                            <option value="365">1 year</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container" style="position: relative; height: 400px;">
+                        <canvas id="fairfaxTimeSeriesChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Temperature Chart -->
     <div class="row mb-4">
         <div class="col-12">
@@ -1037,16 +1084,185 @@ function renderRunsTable(runs) {
     }
 }
 
+// ============================================================================
+// Fairfax Verification Time Series
+// ============================================================================
+
+let fairfaxTimeSeriesChart = null;
+
+// Load and display Fairfax time series chart
+async function loadFairfaxTimeSeriesChart() {
+    const location = document.getElementById('locationSelect').value;
+    const variable = document.getElementById('fairfaxTsVariable').value;
+    const metric = document.getElementById('fairfaxTsMetric').value;
+    const leadTime = document.getElementById('fairfaxTsLeadTime').value;
+    const timeFrame = document.getElementById('fairfaxTsTimeFrame').value;
+
+    try {
+        const response = await fetch(
+            `/api/verification-time-series?location=${encodeURIComponent(location)}&variable=${variable}&lead_time=${leadTime}&days_back=${timeFrame}`
+        );
+        const data = await response.json();
+
+        if (!data.success) {
+            console.error('Error loading Fairfax time series:', data.error);
+            document.getElementById('fairfaxTimeSeriesSection').style.display = 'none';
+            return;
+        }
+
+        // Show the section if data is available
+        if (data.time_series && data.time_series.dates && data.time_series.dates.length > 0) {
+            document.getElementById('fairfaxTimeSeriesSection').style.display = '';
+            renderFairfaxTimeSeriesChart(data.time_series, metric, variable);
+        } else {
+            document.getElementById('fairfaxTimeSeriesSection').style.display = 'none';
+        }
+
+    } catch (error) {
+        console.error('Error loading Fairfax time series chart:', error);
+        document.getElementById('fairfaxTimeSeriesSection').style.display = 'none';
+    }
+}
+
+// Render Fairfax time series chart
+function renderFairfaxTimeSeriesChart(data, metric, variable) {
+    const ctx = document.getElementById('fairfaxTimeSeriesChart');
+
+    // Get the appropriate data arrays based on metric
+    const gfsData = metric === 'mae' ? data.gfs.mae : data.gfs.bias;
+    const aifsData = metric === 'mae' ? data.aifs.mae : data.aifs.bias;
+    const ifsData = metric === 'mae' ? data.ifs.mae : data.ifs.bias;
+
+    // Format dates for display
+    const labels = data.dates.map(d => {
+        const date = new Date(d);
+        return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    });
+
+    // Determine units and labels
+    const units = {
+        'temp': '°F',
+        'mslp': 'mb'
+    };
+    const unit = units[variable] || '';
+    const metricLabel = metric.toUpperCase();
+    const yAxisLabel = `${metricLabel} (${unit})`;
+
+    // Destroy existing chart
+    if (fairfaxTimeSeriesChart) {
+        fairfaxTimeSeriesChart.destroy();
+    }
+
+    // Create new chart
+    fairfaxTimeSeriesChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'GFS',
+                    data: gfsData,
+                    borderColor: '#dc3545',
+                    backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 5
+                },
+                {
+                    label: 'AIFS',
+                    data: aifsData,
+                    borderColor: '#ffc107',
+                    backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 5
+                },
+                {
+                    label: 'IFS',
+                    data: ifsData,
+                    borderColor: '#198754',
+                    backgroundColor: 'rgba(25, 135, 84, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 5
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            let label = context.dataset.label || '';
+                            if (label) {
+                                label += ': ';
+                            }
+                            if (context.parsed.y !== null) {
+                                label += context.parsed.y.toFixed(2) + ' ' + unit;
+                            }
+                            return label;
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: {
+                        display: true,
+                        text: yAxisLabel
+                    }
+                },
+                x: {
+                    grid: { display: false },
+                    title: {
+                        display: true,
+                        text: 'Date'
+                    },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45
+                    }
+                }
+            }
+        }
+    });
+}
+
 // Event listeners
 document.getElementById('locationSelect').addEventListener('change', function() {
     loadForecast();
     loadLeadTimeVerification();
+    loadFairfaxTimeSeriesChart();
 });
+
+// Event listeners for Fairfax time series controls
+document.getElementById('fairfaxTsVariable').addEventListener('change', loadFairfaxTimeSeriesChart);
+document.getElementById('fairfaxTsMetric').addEventListener('change', loadFairfaxTimeSeriesChart);
+document.getElementById('fairfaxTsLeadTime').addEventListener('change', loadFairfaxTimeSeriesChart);
+document.getElementById('fairfaxTsTimeFrame').addEventListener('change', loadFairfaxTimeSeriesChart);
 
 // Initial load
 document.addEventListener('DOMContentLoaded', function() {
     loadForecast();
     loadLeadTimeVerification();
+    loadFairfaxTimeSeriesChart();
 });
 
 </script>
