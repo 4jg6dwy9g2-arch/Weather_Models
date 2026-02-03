@@ -1,0 +1,781 @@
+{% extends "base.html" %}
+
+{% block title %}Historical Weather - Weather Forecast{% endblock %}
+
+{% block content %}
+<!-- Date Range Picker Card -->
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="row align-items-end">
+            <div class="col-md-3 mb-2">
+                <label for="start-date" class="form-label">Start Date</label>
+                <input type="date" class="form-control" id="start-date" value="{{ start_date }}">
+            </div>
+            <div class="col-md-3 mb-2">
+                <label for="end-date" class="form-label">End Date</label>
+                <input type="date" class="form-control" id="end-date" value="{{ end_date }}">
+            </div>
+            <div class="col-md-4 mb-2">
+                <label class="form-label">Quick Select</label>
+                <div class="btn-group w-100" role="group">
+                    <button type="button" class="btn btn-outline-secondary" onclick="setDateRange(7)">7 Days</button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="setDateRange(30)">30 Days</button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="setDateRange(90)">90 Days</button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="setYTD()">YTD</button>
+                </div>
+            </div>
+            <div class="col-md-2 mb-2">
+                <button class="btn btn-primary w-100" onclick="loadData()">
+                    <i class="bi bi-search"></i> Load Data
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Summary Stats -->
+<div class="row mb-4" id="summary-section">
+    <div class="col-md-3 col-6 mb-3">
+        <div class="card h-100">
+            <div class="stat-card">
+                <div class="stat-label">Temperature Range</div>
+                <div class="stat-value temp" style="font-size: 1.5rem;">
+                    <span id="temp-min">{{ summary.temp_min if summary.temp_min else '--' }}</span> -
+                    <span id="temp-max">{{ summary.temp_max if summary.temp_max else '--' }}</span><span class="stat-unit">&deg;F</span>
+                </div>
+                <div class="text-muted small">
+                    Avg: <span id="temp-avg">{{ summary.temp_avg if summary.temp_avg else '--' }}</span>&deg;F
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 col-6 mb-3">
+        <div class="card h-100">
+            <div class="stat-card">
+                <div class="stat-label">Total Rainfall</div>
+                <div class="stat-value rain" id="rain-total">
+                    {{ summary.rain_total if summary.rain_total else '0' }}<span class="stat-unit"> in</span>
+                </div>
+                <div class="text-muted small">
+                    <span id="rainy-days">{{ summary.rainy_days if summary.rainy_days else '0' }}</span> rainy days
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 col-6 mb-3">
+        <div class="card h-100">
+            <div class="stat-card">
+                <div class="stat-label">Avg Solar Radiation (daylight)</div>
+                <div class="stat-value sun" id="solar-avg">
+                    {{ summary.solar_rad_avg|int if summary.solar_rad_avg else '--' }}<span class="stat-unit"> W/m&sup2;</span>
+                </div>
+                <div class="text-muted small">
+                    Normal: <span id="solar-historical">{{ summary.solar_rad_historical|int if summary.solar_rad_historical else '--' }}</span> W/m&sup2;
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 col-6 mb-3">
+        <div class="card h-100">
+            <div class="stat-card">
+                <div class="stat-label">Avg Wind / Gust</div>
+                <div class="stat-value" id="wind-avg">
+                    {{ summary.wind_speed_avg if summary.wind_speed_avg else '--' }}<span class="stat-unit"> / </span><span id="wind-gust-avg">{{ summary.wind_gust_avg if summary.wind_gust_avg else '--' }}</span><span class="stat-unit"> mph</span>
+                </div>
+                <div class="text-muted small">
+                    Normal: <span id="wind-historical">{{ summary.wind_speed_historical if summary.wind_speed_historical else '--' }}</span> / <span id="wind-gust-historical">{{ summary.wind_gust_historical if summary.wind_gust_historical else '--' }}</span> mph
+                </div>
+                <div class="text-muted small">
+                    <span id="days-count">{{ summary.days if summary.days else '0' }}</span> days of data
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Charts -->
+<div class="row">
+    <!-- Temperature Chart with Climatology -->
+    <div class="col-lg-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-thermometer-half"></i> Temperature vs. Historical (Dulles IAD 1990-2021)
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="tempChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Temperature Anomalies Chart -->
+    <div class="col-lg-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-graph-up-arrow"></i> Temperature Anomalies (Departure from Normal)
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="anomalyChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Rainfall Chart -->
+    <div class="col-lg-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-cloud-rain"></i> Daily Rainfall
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="rainChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Soil Temperature Chart -->
+    <div class="col-lg-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-thermometer"></i> Soil Temperature
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="soilTempChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Soil Moisture Chart -->
+    <div class="col-lg-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-moisture"></i> Soil Moisture
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="soilMoistureChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Solar Radiation Chart -->
+    <div class="col-lg-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-sun"></i> Solar Radiation
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="solarChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Wind Speed Chart -->
+    <div class="col-lg-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-wind"></i> Wind Speed
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="windChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let tempChart, anomalyChart, rainChart, soilTempChart, soilMoistureChart, solarChart, windChart;
+
+Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+Chart.defaults.color = '#555';
+
+function initCharts() {
+    const commonOptions = {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: {
+                position: 'top',
+            }
+        },
+        scales: {
+            x: {
+                grid: { display: false }
+            },
+            y: {
+                grid: { color: '#eee' }
+            }
+        }
+    };
+
+    tempChart = new Chart(document.getElementById('tempChart'), {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'High Normal Range',
+                    data: [],
+                    borderColor: 'transparent',
+                    backgroundColor: 'rgba(255, 99, 71, 0.15)',
+                    fill: '+1',
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 10
+                },
+                {
+                    label: 'High 25th %ile',
+                    data: [],
+                    borderColor: 'transparent',
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 10
+                },
+                {
+                    label: 'Low Normal Range',
+                    data: [],
+                    borderColor: 'transparent',
+                    backgroundColor: 'rgba(70, 130, 180, 0.15)',
+                    fill: '+1',
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 10
+                },
+                {
+                    label: 'Low 25th %ile',
+                    data: [],
+                    borderColor: 'transparent',
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 10
+                },
+                {
+                    label: 'Normal High',
+                    data: [],
+                    borderColor: 'rgba(220, 53, 69, 0.6)',
+                    borderWidth: 2,
+                    borderDash: [5, 5],
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 5
+                },
+                {
+                    label: 'Normal Low',
+                    data: [],
+                    borderColor: 'rgba(0, 123, 255, 0.6)',
+                    borderWidth: 2,
+                    borderDash: [5, 5],
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 5
+                },
+                {
+                    label: 'Observed High',
+                    data: [],
+                    borderColor: '#dc3545',
+                    backgroundColor: '#dc3545',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 3,
+                    pointHoverRadius: 5,
+                    order: 1
+                },
+                {
+                    label: 'Observed Low',
+                    data: [],
+                    borderColor: '#007bff',
+                    backgroundColor: '#007bff',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 3,
+                    pointHoverRadius: 5,
+                    order: 1
+                },
+                {
+                    label: '95th %ile High',
+                    data: [],
+                    borderColor: 'rgba(255, 99, 71, 0.3)',
+                    borderWidth: 1,
+                    borderDash: [2, 2],
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 8
+                },
+                {
+                    label: '5th %ile Low',
+                    data: [],
+                    borderColor: 'rgba(70, 130, 180, 0.3)',
+                    borderWidth: 1,
+                    borderDash: [2, 2],
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    order: 8
+                }
+            ]
+        },
+        options: {
+            ...commonOptions,
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        filter: function(item, chart) {
+                            return !item.text.includes('25th %ile');
+                        }
+                    }
+                }
+            },
+            scales: {
+                ...commonOptions.scales,
+                y: { ...commonOptions.scales.y, title: { display: true, text: 'Temperature (deg F)' } }
+            }
+        }
+    });
+
+    anomalyChart = new Chart(document.getElementById('anomalyChart'), {
+        type: 'bar',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Daily Anomaly',
+                    data: [],
+                    backgroundColor: [],
+                    borderColor: [],
+                    borderWidth: 1
+                },
+                {
+                    label: 'Running Mean',
+                    data: [],
+                    type: 'line',
+                    borderColor: '#333',
+                    backgroundColor: 'transparent',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    order: 0
+                }
+            ]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: {
+                    ...commonOptions.scales.y,
+                    title: { display: true, text: 'Anomaly (deg F)' },
+                    suggestedMin: -20,
+                    suggestedMax: 20
+                }
+            },
+            plugins: {
+                legend: {
+                    position: 'top'
+                },
+                annotation: {
+                    annotations: {
+                        zeroLine: {
+                            type: 'line',
+                            yMin: 0,
+                            yMax: 0,
+                            borderColor: 'rgba(0, 0, 0, 0.3)',
+                            borderWidth: 1,
+                            borderDash: [5, 5]
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    rainChart = new Chart(document.getElementById('rainChart'), {
+        type: 'bar',
+        data: {
+            labels: [],
+            datasets: [{
+                label: 'Daily Rain',
+                data: [],
+                backgroundColor: '#1976d2',
+                borderRadius: 4
+            }]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: { ...commonOptions.scales.y, title: { display: true, text: 'Rainfall (in)' }, beginAtZero: true }
+            }
+        }
+    });
+
+    soilTempChart = new Chart(document.getElementById('soilTempChart'), {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: '5" Deep',
+                    data: [],
+                    borderColor: '#8d6e63',
+                    fill: false,
+                    tension: 0.3
+                },
+                {
+                    label: '10" Deep',
+                    data: [],
+                    borderColor: '#6d4c41',
+                    fill: false,
+                    tension: 0.3
+                },
+                {
+                    label: '20" Deep',
+                    data: [],
+                    borderColor: '#4e342e',
+                    fill: false,
+                    tension: 0.3
+                }
+            ]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: { ...commonOptions.scales.y, title: { display: true, text: 'Temperature (deg F)' } }
+            }
+        }
+    });
+
+    soilMoistureChart = new Chart(document.getElementById('soilMoistureChart'), {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: '5" Deep',
+                    data: [],
+                    borderColor: '#2196f3',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.3
+                },
+                {
+                    label: '10" Deep',
+                    data: [],
+                    borderColor: '#1976d2',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.3
+                },
+                {
+                    label: '20" Deep',
+                    data: [],
+                    borderColor: '#0d47a1',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0.3
+                }
+            ]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: {
+                    ...commonOptions.scales.y,
+                    title: { display: true, text: 'Soil Moisture (cb)' },
+                    beginAtZero: true,
+                    max: 80
+                }
+            },
+            plugins: {
+                ...commonOptions.plugins,
+                annotation: {
+                    annotations: {
+                        saturatedZone: {
+                            type: 'box',
+                            yMin: 0,
+                            yMax: 10,
+                            backgroundColor: 'rgba(25, 118, 210, 0.15)',
+                            borderWidth: 0,
+                            label: {
+                                display: true,
+                                content: 'Saturated',
+                                position: 'start',
+                                font: { size: 10 },
+                                color: '#1976d2'
+                            }
+                        },
+                        adequateZone: {
+                            type: 'box',
+                            yMin: 10,
+                            yMax: 30,
+                            backgroundColor: 'rgba(76, 175, 80, 0.15)',
+                            borderWidth: 0,
+                            label: {
+                                display: true,
+                                content: 'Adequate',
+                                position: 'start',
+                                font: { size: 10 },
+                                color: '#4caf50'
+                            }
+                        },
+                        dryZone: {
+                            type: 'box',
+                            yMin: 30,
+                            yMax: 60,
+                            backgroundColor: 'rgba(255, 152, 0, 0.15)',
+                            borderWidth: 0,
+                            label: {
+                                display: true,
+                                content: 'Needs Water',
+                                position: 'start',
+                                font: { size: 10 },
+                                color: '#ff9800'
+                            }
+                        },
+                        veryDryZone: {
+                            type: 'box',
+                            yMin: 60,
+                            yMax: 80,
+                            backgroundColor: 'rgba(244, 67, 54, 0.15)',
+                            borderWidth: 0,
+                            label: {
+                                display: true,
+                                content: 'Very Dry',
+                                position: 'start',
+                                font: { size: 10 },
+                                color: '#f44336'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    solarChart = new Chart(document.getElementById('solarChart'), {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [{
+                label: 'Avg Solar Rad',
+                data: [],
+                borderColor: '#ffc107',
+                backgroundColor: 'rgba(255, 193, 7, 0.2)',
+                fill: true,
+                tension: 0.3
+            },
+            {
+                label: 'Max Solar Rad',
+                data: [],
+                borderColor: '#ff9800',
+                borderDash: [5, 5],
+                fill: false,
+                tension: 0.3
+            }]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: { ...commonOptions.scales.y, title: { display: true, text: 'W/m2' }, beginAtZero: true }
+            }
+        }
+    });
+
+    windChart = new Chart(document.getElementById('windChart'), {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [{
+                label: 'Avg Wind',
+                data: [],
+                borderColor: '#607d8b',
+                fill: false,
+                tension: 0.3
+            },
+            {
+                label: 'Max Gust',
+                data: [],
+                borderColor: '#455a64',
+                borderDash: [5, 5],
+                fill: false,
+                tension: 0.3
+            }]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: { ...commonOptions.scales.y, title: { display: true, text: 'Wind Speed (mph)' }, beginAtZero: true }
+            }
+        }
+    });
+}
+
+function updateCharts(data) {
+    const daily = data.daily || [];
+    const climo = data.climo || [];
+    const anomalies = data.anomalies || [];
+
+    const labels = daily.map(d => {
+        const date = new Date(d.date);
+        return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    });
+
+    tempChart.data.labels = labels;
+
+    tempChart.data.datasets[0].data = climo.map(c => c.high_p75);
+    tempChart.data.datasets[1].data = climo.map(c => c.high_p25);
+    tempChart.data.datasets[2].data = climo.map(c => c.low_p75);
+    tempChart.data.datasets[3].data = climo.map(c => c.low_p25);
+    tempChart.data.datasets[4].data = climo.map(c => c.high_median);
+    tempChart.data.datasets[5].data = climo.map(c => c.low_median);
+    tempChart.data.datasets[6].data = daily.map(d => d.temp_high);
+    tempChart.data.datasets[7].data = daily.map(d => d.temp_low);
+    tempChart.data.datasets[8].data = climo.map(c => c.high_p95);
+    tempChart.data.datasets[9].data = climo.map(c => c.low_p05);
+
+    tempChart.update();
+
+    anomalyChart.data.labels = labels;
+
+    const anomalyValues = anomalies.map(a => a.anomaly);
+    const anomalyColors = anomalyValues.map(v => {
+        if (v === null) return 'rgba(128, 128, 128, 0.5)';
+        return v >= 0 ? 'rgba(220, 53, 69, 0.7)' : 'rgba(0, 123, 255, 0.7)';
+    });
+    const anomalyBorders = anomalyValues.map(v => {
+        if (v === null) return 'rgba(128, 128, 128, 0.8)';
+        return v >= 0 ? 'rgba(220, 53, 69, 1)' : 'rgba(0, 123, 255, 1)';
+    });
+
+    anomalyChart.data.datasets[0].data = anomalyValues;
+    anomalyChart.data.datasets[0].backgroundColor = anomalyColors;
+    anomalyChart.data.datasets[0].borderColor = anomalyBorders;
+
+    anomalyChart.data.datasets[1].data = anomalies.map(a => a.running_mean);
+
+    anomalyChart.update();
+
+    rainChart.data.labels = labels;
+    rainChart.data.datasets[0].data = daily.map(d => d.rain_total);
+    rainChart.update();
+
+    soilTempChart.data.labels = labels;
+    soilTempChart.data.datasets[0].data = daily.map(d => d.soil_temp_5in_avg);
+    soilTempChart.data.datasets[1].data = daily.map(d => d.soil_temp_10in_avg);
+    soilTempChart.data.datasets[2].data = daily.map(d => d.soil_temp_20in_avg);
+    soilTempChart.update();
+
+    soilMoistureChart.data.labels = labels;
+    soilMoistureChart.data.datasets[0].data = daily.map(d => d.soil_moisture_5in_avg);
+    soilMoistureChart.data.datasets[1].data = daily.map(d => d.soil_moisture_10in_avg);
+    soilMoistureChart.data.datasets[2].data = daily.map(d => d.soil_moisture_20in_avg);
+    soilMoistureChart.update();
+
+    solarChart.data.labels = labels;
+    solarChart.data.datasets[0].data = daily.map(d => d.solar_rad_avg);
+    solarChart.data.datasets[1].data = daily.map(d => d.solar_rad_max);
+    solarChart.update();
+
+    windChart.data.labels = labels;
+    windChart.data.datasets[0].data = daily.map(d => d.wind_speed_avg);
+    windChart.data.datasets[1].data = daily.map(d => d.wind_gust_max);
+    windChart.update();
+}
+
+function updateSummary(summary) {
+    const fmt = (val, decimals = 1) => val !== null && val !== undefined ? Number(val).toFixed(decimals) : '--';
+    const fmtInt = (val) => val !== null && val !== undefined ? Math.round(val) : '--';
+
+    document.getElementById('temp-min').textContent = fmt(summary.temp_min);
+    document.getElementById('temp-max').textContent = fmt(summary.temp_max);
+    document.getElementById('temp-avg').textContent = fmt(summary.temp_avg);
+    document.getElementById('rain-total').innerHTML = fmt(summary.rain_total, 2) + '<span class="stat-unit"> in</span>';
+    document.getElementById('rainy-days').textContent = summary.rainy_days || 0;
+    document.getElementById('solar-avg').innerHTML = fmtInt(summary.solar_rad_avg) + '<span class="stat-unit"> W/m2</span>';
+    document.getElementById('solar-historical').textContent = fmtInt(summary.solar_rad_historical);
+    document.getElementById('wind-avg').innerHTML = fmt(summary.wind_speed_avg) + '<span class="stat-unit"> / </span><span id="wind-gust-avg">' + fmt(summary.wind_gust_avg) + '</span><span class="stat-unit"> mph</span>';
+    document.getElementById('wind-historical').textContent = fmt(summary.wind_speed_historical);
+    document.getElementById('wind-gust-historical').textContent = fmt(summary.wind_gust_historical);
+    document.getElementById('days-count').textContent = summary.days || 0;
+}
+
+function loadData() {
+    const startDate = document.getElementById('start-date').value;
+    const endDate = document.getElementById('end-date').value;
+
+    if (!startDate || !endDate) {
+        alert('Please select both start and end dates');
+        return;
+    }
+
+    fetch(`/api/historical?start=${startDate}&end=${endDate}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                alert(data.error);
+                return;
+            }
+            updateCharts(data);
+            updateSummary(data.summary || {});
+
+            const url = new URL(window.location);
+            url.searchParams.set('start', startDate);
+            url.searchParams.set('end', endDate);
+            window.history.pushState({}, '', url);
+        })
+        .catch(error => {
+            console.error('Error loading data:', error);
+            alert('Error loading weather data');
+        });
+}
+
+function setDateRange(days) {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - days);
+
+    document.getElementById('start-date').value = start.toISOString().split('T')[0];
+    document.getElementById('end-date').value = end.toISOString().split('T')[0];
+    loadData();
+}
+
+function setYTD() {
+    const end = new Date();
+    const start = new Date(end.getFullYear(), 0, 1);
+
+    document.getElementById('start-date').value = start.toISOString().split('T')[0];
+    document.getElementById('end-date').value = end.toISOString().split('T')[0];
+    loadData();
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    initCharts();
+    loadData();
+});
+</script>
+{% endblock %}

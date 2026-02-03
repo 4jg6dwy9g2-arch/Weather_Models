@@ -10,6 +10,8 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
     <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Chart.js Annotation Plugin -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
     <!-- Chart.js Time Adapter -->
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
     <!-- Leaflet.js for maps -->
@@ -259,7 +261,17 @@
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto">
                     <li class="nav-item">
-                        <a class="nav-link {% if request.path == '/' %}active{% endif %}" href="/">
+                        <a class="nav-link {% if request.path == '/' or request.path == '/current' %}active{% endif %}" href="/">
+                            <i class="bi bi-broadcast"></i> Current Weather
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/historical' %}active{% endif %}" href="/historical">
+                            <i class="bi bi-graph-up"></i> Historical Weather
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/dashboard' %}active{% endif %}" href="/dashboard">
                             <i class="bi bi-speedometer2"></i> Fairfax Verification
                         </a>
                     </li>
