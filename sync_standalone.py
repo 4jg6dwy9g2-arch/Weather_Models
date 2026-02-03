@@ -26,6 +26,7 @@ from ecmwf_aifs import AIFSModel, AIFS_VARIABLES
 from ecmwf_ifs import IFSModel, IFS_VARIABLES
 import weatherlink
 import asos
+import rossby_waves
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +88,16 @@ MSLP_GFS = Variable(
     category="surface",
     colormap="coolwarm",
     contour_levels=list(range(960, 1060, 4))
+)
+
+Z500_GFS = Variable(
+    name="z500",
+    display_name="500 hPa Geopotential Height",
+    units="dm",
+    herbie_search=":HGT:500 mb:",
+    category="upper_air",
+    colormap="viridis",
+    contour_levels=list(range(480, 600, 6))
 )
 
 # Preset locations
@@ -189,12 +200,54 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
 
         times.append((init_time + timedelta(hours=hour)).isoformat())
 
+    # Calculate wave number forecast at 24-hour intervals for 15 days
+    z500_waves = None  # Current wave number (F000)
+    z500_waves_forecast = {
+        "times": [],
+        "wave_numbers": [],
+        "ridges": [],
+        "troughs": []
+    }
+
+    # Calculate at 24-hour intervals up to 360 hours (15 days)
+    wave_forecast_hours = list(range(0, 361, 24))
+    global_region = Region("Global", (-180, 180, 20, 70))
+
+    for fhr in wave_forecast_hours:
+        try:
+            logger.info(f"Calculating Rossby wave number for GFS F{fhr:03d}")
+            z500_data = gfs_model.fetch_data(Z500_GFS, init_time, fhr, global_region)
+            wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
+
+            # Store forecast time series
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
+            z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
+            z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+
+            # Store F000 as current wave number
+            if fhr == 0:
+                z500_waves = wave_metrics
+                logger.info(f"GFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+
+        except Exception as e:
+            logger.warning(f"Wave analysis failed for GFS F{fhr:03d}: {e}")
+            # Add None values to maintain array alignment
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(None)
+            z500_waves_forecast["ridges"].append(None)
+            z500_waves_forecast["troughs"].append(None)
+
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
-        "init_time": init_time.isoformat()
+        "init_time": init_time.isoformat(),
+        "z500_waves": z500_waves,
+        "z500_waves_forecast": z500_waves_forecast
     }
 
 
@@ -258,12 +311,56 @@ def fetch_aifs_data(region, forecast_hours, init_hour: Optional[int] = None):
             else:
                 precips.append(None)
 
+    # Calculate wave number forecast at 24-hour intervals for 15 days
+    z500_var = AIFS_VARIABLES.get("z500")
+    z500_waves = None
+    z500_waves_forecast = {
+        "times": [],
+        "wave_numbers": [],
+        "ridges": [],
+        "troughs": []
+    }
+
+    # Calculate at 24-hour intervals up to 360 hours (15 days)
+    wave_forecast_hours = list(range(0, 361, 24))
+    global_region = Region("Global", (-180, 180, 20, 70))
+
+    if z500_var:
+        for fhr in wave_forecast_hours:
+            try:
+                logger.info(f"Calculating Rossby wave number for AIFS F{fhr:03d}")
+                z500_data = aifs_model.fetch_data(z500_var, init_time, fhr, global_region)
+                wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
+
+                # Store forecast time series
+                valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+                z500_waves_forecast["times"].append(valid_time)
+                z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
+                z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
+                z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+
+                # Store F000 as current wave number
+                if fhr == 0:
+                    z500_waves = wave_metrics
+                    logger.info(f"AIFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+
+            except Exception as e:
+                logger.warning(f"Wave analysis failed for AIFS F{fhr:03d}: {e}")
+                # Add None values to maintain array alignment
+                valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+                z500_waves_forecast["times"].append(valid_time)
+                z500_waves_forecast["wave_numbers"].append(None)
+                z500_waves_forecast["ridges"].append(None)
+                z500_waves_forecast["troughs"].append(None)
+
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
-        "init_time": init_time.isoformat()
+        "init_time": init_time.isoformat(),
+        "z500_waves": z500_waves,
+        "z500_waves_forecast": z500_waves_forecast
     }
 
 
@@ -338,12 +435,56 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
         mslps.append(None)
         times.append(None)
 
+    # Calculate wave number forecast at 24-hour intervals (IFS: up to 240 hours / 10 days)
+    z500_var = IFS_VARIABLES.get("z500")
+    z500_waves = None
+    z500_waves_forecast = {
+        "times": [],
+        "wave_numbers": [],
+        "ridges": [],
+        "troughs": []
+    }
+
+    # Calculate at 24-hour intervals up to 240 hours (10 days - IFS limit)
+    wave_forecast_hours = list(range(0, min(241, 361), 24))
+    global_region = Region("Global", (-180, 180, 20, 70))
+
+    if z500_var:
+        for fhr in wave_forecast_hours:
+            try:
+                logger.info(f"Calculating Rossby wave number for IFS F{fhr:03d}")
+                z500_data = ifs_model.fetch_data(z500_var, init_time, fhr, global_region)
+                wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
+
+                # Store forecast time series
+                valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+                z500_waves_forecast["times"].append(valid_time)
+                z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
+                z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
+                z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+
+                # Store F000 as current wave number
+                if fhr == 0:
+                    z500_waves = wave_metrics
+                    logger.info(f"IFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+
+            except Exception as e:
+                logger.warning(f"Wave analysis failed for IFS F{fhr:03d}: {e}")
+                # Add None values to maintain array alignment
+                valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+                z500_waves_forecast["times"].append(valid_time)
+                z500_waves_forecast["wave_numbers"].append(None)
+                z500_waves_forecast["ridges"].append(None)
+                z500_waves_forecast["troughs"].append(None)
+
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
-        "init_time": init_time.isoformat()
+        "init_time": init_time.isoformat(),
+        "z500_waves": z500_waves,
+        "z500_waves_forecast": z500_waves_forecast
     }
 
 

@@ -288,9 +288,24 @@
 
     <!-- Auto-shutdown server when browser closes -->
     <script>
+        // Track if navigating within the app
+        let navigatingInternally = false;
+
+        // Mark internal navigation
+        document.addEventListener('click', function(event) {
+            const link = event.target.closest('a');
+            if (link && link.hostname === window.location.hostname) {
+                navigatingInternally = true;
+                setTimeout(() => { navigatingInternally = false; }, 100);
+            }
+        });
+
+        // Only shutdown if truly leaving (not navigating within the app)
         window.addEventListener('beforeunload', function(event) {
-            // Send shutdown request to server
-            navigator.sendBeacon('/shutdown', new URLSearchParams({shutdown: 'true'}));
+            if (!navigatingInternally) {
+                // Send shutdown request to server only when actually closing
+                navigator.sendBeacon('/shutdown', new URLSearchParams({shutdown: 'true'}));
+            }
         });
     </script>
 </body>
