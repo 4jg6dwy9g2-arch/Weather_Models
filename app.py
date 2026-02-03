@@ -14,6 +14,18 @@ from functools import lru_cache
 import time
 import queue
 import threading
+import os
+import math
+import hmac
+import hashlib
+import collections
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+import requests
 
 from gfs import GFSModel
 from ecmwf_aifs import AIFSModel, AIFS_VARIABLES
@@ -24,6 +36,33 @@ import rossby_waves
 
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = Path(__file__).parent / "forecasts.json"
+
+if load_dotenv:
+    load_dotenv()
+
+# WeatherLink API Credentials (Davis Weather Station)
+WEATHERLINK_API_KEY = os.getenv("WEATHERLINK_API_KEY")
+WEATHERLINK_API_SECRET = os.getenv("WEATHERLINK_API_SECRET")
+WEATHERLINK_STATION_ID = os.getenv("WEATHERLINK_STATION_ID", "117994")
+
+# Default location: Fairfax, VA (matches Workout_Data)
+DEFAULT_LAT = 38.8419
+DEFAULT_LON = -77.3091
+
+# EPA AQI color scale
+AQI_COLORS = {
+    "Good": "#00e400",
+    "Moderate": "#ffff00",
+    "USG": "#ff7e00",
+    "Unhealthy": "#ff0000",
+    "Very Unhealthy": "#8f3f97",
+    "Hazardous": "#7e0023",
+}
+
+try:
+    import weather_data_local as local_weather_data
+except Exception:
+    local_weather_data = None
 
 
 def load_forecasts_db():
@@ -176,6 +215,267 @@ class Region:
     def __init__(self, name, bounds):
         self.name = name
         self.bounds = bounds
+
+
+def get_aqi_color(aqi: int) -> str:
+    """Return EPA color for an AQI value."""
+    if aqi <= 50:
+        return AQI_COLORS["Good"]
+    elif aqi <= 100:
+        return AQI_COLORS["Moderate"]
+    elif aqi <= 150:
+        return AQI_COLORS["USG"]
+    elif aqi <= 200:
+        return AQI_COLORS["Unhealthy"]
+    elif aqi <= 300:
+        return AQI_COLORS["Very Unhealthy"]
+    else:
+        return AQI_COLORS["Hazardous"]
+
+
+def get_aqi_category(aqi: int) -> str:
+    """Return EPA category name for an AQI value."""
+    if aqi <= 50:
+        return "Good"
+    elif aqi <= 100:
+        return "Moderate"
+    elif aqi <= 150:
+        return "USG"
+    elif aqi <= 200:
+        return "Unhealthy"
+    elif aqi <= 300:
+        return "Very Unhealthy"
+    else:
+        return "Hazardous"
+
+
+def calculate_sunrise_sunset(lat: float, lon: float, date: datetime) -> tuple:
+    """
+    Calculate sunrise and sunset times for a given location and date.
+    Returns (sunrise, sunset) as datetime objects in local time.
+    """
+    day_of_year = date.timetuple().tm_yday
+    lat_rad = math.radians(lat)
+    declination = 23.45 * math.sin(math.radians(360 / 365 * (day_of_year - 81)))
+    decl_rad = math.radians(declination)
+    cos_hour_angle = -math.tan(lat_rad) * math.tan(decl_rad)
+    cos_hour_angle = max(-1, min(1, cos_hour_angle))
+    hour_angle = math.degrees(math.acos(cos_hour_angle))
+
+    # Approximate local solar noon; UTC offset for Eastern (rough)
+    utc_offset = -5
+    solar_noon_utc = 12 - (lon / 15)
+    solar_noon_local = solar_noon_utc + utc_offset
+
+    sunrise_hour = solar_noon_local - (hour_angle / 15)
+    sunset_hour = solar_noon_local + (hour_angle / 15)
+
+    sunrise = date.replace(
+        hour=int(sunrise_hour),
+        minute=int((sunrise_hour % 1) * 60),
+        second=0,
+        microsecond=0,
+    )
+    sunset = date.replace(
+        hour=int(sunset_hour),
+        minute=int((sunset_hour % 1) * 60),
+        second=0,
+        microsecond=0,
+    )
+
+    return sunrise, sunset
+
+
+def is_daylight(dt: datetime, lat: float, lon: float) -> bool:
+    """Check if a given datetime is during daylight hours."""
+    sunrise, sunset = calculate_sunrise_sunset(lat, lon, dt)
+    return sunrise <= dt.replace(tzinfo=None) <= sunset
+
+
+def generate_weatherlink_signature(parameters: dict) -> str:
+    """Generate HMAC SHA-256 signature for WeatherLink API."""
+    parameters = collections.OrderedDict(sorted(parameters.items()))
+    api_secret = parameters.pop("api-secret")
+
+    data = ""
+    for key in parameters:
+        data = data + key + str(parameters[key])
+
+    signature = hmac.new(
+        api_secret.encode("utf-8"),
+        data.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return signature
+
+
+def fetch_current_weather() -> dict:
+    """Fetch current conditions from WeatherLink API."""
+    if not WEATHERLINK_API_KEY or not WEATHERLINK_API_SECRET:
+        raise RuntimeError("Missing WeatherLink API credentials")
+
+    parameters = {
+        "api-key": WEATHERLINK_API_KEY,
+        "api-secret": WEATHERLINK_API_SECRET,
+        "station-id": WEATHERLINK_STATION_ID,
+        "t": int(time.time()),
+    }
+
+    signature = generate_weatherlink_signature(parameters.copy())
+
+    url = (
+        f"https://api.weatherlink.com/v2/current/{WEATHERLINK_STATION_ID}"
+        f"?api-key={WEATHERLINK_API_KEY}"
+        f"&api-signature={signature}"
+        f"&t={parameters['t']}"
+    )
+
+    response = requests.get(url, timeout=10)
+    if response.status_code != 200:
+        raise RuntimeError(f"WeatherLink API Error: {response.status_code} - {response.text}")
+
+    return response.json()
+
+
+def parse_current_weather(json_data: dict) -> dict:
+    """Parse WeatherLink current conditions JSON into a clean dict."""
+    result = {
+        "timestamp": None,
+        "temp_f": None,
+        "dew_point_f": None,
+        "humidity": None,
+        "heat_index_f": None,
+        "wind_speed_mph": None,
+        "wind_gust_mph": None,
+        "wind_direction": None,
+        "wind_direction_deg": None,
+        "solar_rad": None,
+        "rain_today_in": None,
+        "rain_rate_in": None,
+        "barometer_mb": None,
+        "aqi": None,
+        "pm25": None,
+        "inside_temp_f": None,
+        "inside_humidity": None,
+        "soil_temp_5in": None,
+        "soil_temp_10in": None,
+        "soil_temp_20in": None,
+        "soil_moisture_5in": None,
+        "soil_moisture_10in": None,
+        "soil_moisture_20in": None,
+    }
+
+    if not json_data or "sensors" not in json_data:
+        return result
+
+    def wind_dir_to_compass(degrees):
+        if degrees is None:
+            return "--"
+        directions = [
+            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+        ]
+        idx = round(degrees / 22.5) % 16
+        return directions[idx]
+
+    for sensor in json_data["sensors"]:
+        sensor_type = sensor.get("sensor_type")
+
+        for record in sensor.get("data", []):
+            ts = record.get("ts")
+            if ts and (result["timestamp"] is None or ts > result["timestamp"]):
+                result["timestamp"] = ts
+
+            if sensor_type == 243:  # Inside Temp/Hum (from AirLink)
+                result["inside_temp_f"] = record.get("temp_in", record.get("temp_in_last"))
+                result["inside_humidity"] = record.get("hum_in", record.get("hum_in_last"))
+
+            elif sensor_type == 242:  # Barometer
+                bar_inhg = record.get("bar_sea_level")
+                if bar_inhg is not None:
+                    result["barometer_mb"] = round(bar_inhg * 33.8639, 1)
+
+            elif sensor_type == 45:  # ISS (main weather station)
+                result["temp_f"] = record.get("temp", record.get("temp_last"))
+                result["dew_point_f"] = record.get("dew_point", record.get("dew_point_last"))
+                result["humidity"] = record.get("hum", record.get("hum_last"))
+                result["heat_index_f"] = record.get("heat_index", record.get("heat_index_last"))
+                result["wind_speed_mph"] = record.get("wind_speed_avg_last_10_min", record.get("wind_speed_avg"))
+                result["wind_gust_mph"] = record.get("wind_speed_hi_last_10_min", record.get("wind_speed_hi"))
+                wind_deg = record.get("wind_dir_scalar_avg_last_10_min", record.get("wind_dir_of_prevail"))
+                result["wind_direction_deg"] = wind_deg
+                result["wind_direction"] = wind_dir_to_compass(wind_deg)
+                result["solar_rad"] = record.get("solar_rad")
+                result["rain_today_in"] = record.get("rainfall_daily_in", record.get("rainfall_in"))
+                result["rain_rate_in"] = record.get("rain_rate_hi_in", record.get("rain_rate_last_in"))
+
+            elif sensor_type == 323:  # Outside AirLink
+                result["aqi"] = record.get("aqi_val")
+                result["pm25"] = record.get("pm_2p5")
+
+            elif sensor_type == 56:  # Soil/Leaf station
+                result["soil_temp_10in"] = record.get("temp_1")
+                result["soil_temp_5in"] = record.get("temp_2")
+                result["soil_temp_20in"] = record.get("temp_4")
+                result["soil_moisture_10in"] = record.get("moist_soil_1")
+                result["soil_moisture_5in"] = record.get("moist_soil_2")
+                result["soil_moisture_20in"] = record.get("moist_soil_4")
+
+    return result
+
+
+def calculate_rain_24h() -> Optional[float]:
+    """Calculate the last 24-hour precipitation total from local CSV data."""
+    if not local_weather_data:
+        return None
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(hours=24)
+
+    try:
+        records = local_weather_data.get_historical_data(start_time, end_time)
+    except Exception as e:
+        logger.warning(f"Rain 24h calculation failed: {e}")
+        return None
+
+    if not records:
+        return None
+
+    def parse_dt(val):
+        try:
+            return datetime.fromisoformat(val)
+        except Exception:
+            return None
+
+    filtered = []
+    for r in records:
+        dt = parse_dt(r.get("datetime"))
+        if dt is not None:
+            filtered.append((dt, r.get("rain")))
+
+    if not filtered:
+        return None
+
+    filtered.sort(key=lambda x: x[0])
+
+    total = 0.0
+    prev_val = None
+    for _, rain_val in filtered:
+        if rain_val is None:
+            continue
+        if prev_val is None:
+            prev_val = rain_val
+            continue
+        diff = rain_val - prev_val
+        if diff < 0:
+            diff = rain_val
+        total += max(diff, 0.0)
+        prev_val = rain_val
+
+    return round(total, 2)
+
+
 
 
 # GFS variable definitions
@@ -1174,12 +1474,52 @@ def check_if_already_fetched(location_name, gfs_init, aifs_init):
 
 @app.route('/')
 def dashboard():
-    """Main dashboard page - displays latest saved data."""
+    """Main page - current conditions."""
+    return render_template('current.html')
+
+
+@app.route('/dashboard')
+def forecast_dashboard():
+    """Fairfax verification dashboard."""
     return render_template(
         'dashboard.html',
         locations=list(LOCATIONS.keys()),
         selected_location="Fairfax, VA",
         forecast_days=15
+    )
+
+
+@app.route('/historical')
+def historical_weather():
+    """Historical weather page with date range queries and charts."""
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=7)
+
+    if request.args.get('start'):
+        try:
+            start_date = datetime.strptime(request.args.get('start'), '%Y-%m-%d')
+        except ValueError:
+            pass
+
+    if request.args.get('end'):
+        try:
+            end_date = datetime.strptime(request.args.get('end'), '%Y-%m-%d')
+            end_date = end_date.replace(hour=23, minute=59, second=59)
+        except ValueError:
+            pass
+
+    summary = {}
+    if local_weather_data:
+        try:
+            summary = local_weather_data.get_period_summary(start_date, end_date)
+        except Exception as e:
+            logger.warning(f"Historical summary error: {e}")
+
+    return render_template(
+        'historical.html',
+        start_date=start_date.strftime('%Y-%m-%d'),
+        end_date=end_date.strftime('%Y-%m-%d'),
+        summary=summary
     )
 
 
@@ -1191,6 +1531,12 @@ def sync():
         locations=list(LOCATIONS.keys()),
         selected_location="Fairfax, VA"
     )
+
+
+@app.route('/current')
+def current_conditions():
+    """Current weather conditions page."""
+    return render_template('current.html')
 
 
 @app.route('/api/forecast')
@@ -1962,6 +2308,85 @@ def api_observations():
     except Exception as e:
         logger.error(f"Error fetching observations: {e}")
         return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/current-weather')
+def api_current_weather():
+    """API endpoint for current Davis weather station data."""
+    try:
+        json_data = fetch_current_weather()
+        weather = parse_current_weather(json_data)
+
+        weather["rain_24h_in"] = calculate_rain_24h()
+
+        if local_weather_data:
+            try:
+                percentiles = local_weather_data.get_soil_moisture_percentiles(weather)
+                weather.update(percentiles)
+            except Exception as e:
+                logger.warning(f"Soil moisture percentile error: {e}")
+
+        aqi = weather.get("aqi")
+        aqi_category = get_aqi_category(int(aqi)) if aqi is not None else None
+        aqi_color = get_aqi_color(int(aqi)) if aqi is not None else None
+
+        timestamp = weather.get("timestamp")
+        if timestamp:
+            dt = datetime.fromtimestamp(timestamp)
+            weather["timestamp_formatted"] = dt.strftime("%I:%M %p")
+            weather["timestamp_iso"] = dt.isoformat()
+        else:
+            weather["timestamp_formatted"] = "--"
+            weather["timestamp_iso"] = None
+
+        is_day = is_daylight(datetime.now(), DEFAULT_LAT, DEFAULT_LON)
+
+        return jsonify({
+            "success": True,
+            "weather": weather,
+            "aqi_category": aqi_category,
+            "aqi_color": aqi_color,
+            "is_daylight": is_day,
+            "location": {
+                "name": "Fairfax, VA",
+                "lat": DEFAULT_LAT,
+                "lon": DEFAULT_LON,
+            },
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching current weather: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/historical')
+def api_historical():
+    """API endpoint for historical data with climatology comparison."""
+    if not local_weather_data:
+        return jsonify({'error': 'Historical data module not available'}), 500
+
+    start_str = request.args.get('start')
+    end_str = request.args.get('end')
+
+    if not start_str or not end_str:
+        return jsonify({'error': 'start and end parameters required'}), 400
+
+    try:
+        start_date = datetime.strptime(start_str, '%Y-%m-%d')
+        end_date = datetime.strptime(end_str, '%Y-%m-%d')
+        end_date = end_date.replace(hour=23, minute=59, second=59)
+    except ValueError:
+        return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+
+    data = local_weather_data.get_daily_summaries_with_climo(start_date, end_date)
+    summary = local_weather_data.get_period_summary(start_date, end_date)
+
+    return jsonify({
+        'daily': data.get('daily', []),
+        'climo': data.get('climo', []),
+        'anomalies': data.get('anomalies', []),
+        'summary': summary
+    })
 
 
 # ============================================================================

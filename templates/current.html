@@ -1,0 +1,433 @@
+{% extends "base.html" %}
+
+{% block title %}Current Conditions - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .weather-header {
+        background: linear-gradient(135deg, #0088cc 0%, #00a86b 100%);
+        color: white;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+    }
+
+    .weather-card {
+        background: white;
+        border-radius: 12px;
+        padding: 1.5rem;
+        height: 100%;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    .weather-metric {
+        text-align: center;
+        padding: 1rem;
+    }
+
+    .metric-icon {
+        font-size: 2rem;
+        margin-bottom: 0.5rem;
+        color: var(--accent-blue);
+    }
+
+    .metric-value {
+        font-size: 2.5rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        line-height: 1.2;
+    }
+
+    .metric-unit {
+        font-size: 1rem;
+        color: #666;
+    }
+
+    .metric-label {
+        font-size: 0.85rem;
+        color: #888;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-top: 0.25rem;
+    }
+
+    .loading-spinner {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 400px;
+    }
+
+    .refresh-btn {
+        cursor: pointer;
+        transition: transform 0.3s;
+    }
+    .refresh-btn:hover {
+        transform: rotate(180deg);
+    }
+    .refresh-btn.spinning {
+        animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+    }
+
+    #profile-schematic {
+        width: 100%;
+        height: auto;
+        max-height: 520px;
+    }
+
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="weather-header">
+    <div class="row align-items-center">
+        <div class="col-md-8">
+            <h1 class="mb-1"><i class="bi bi-broadcast"></i> Current Conditions</h1>
+            <p class="mb-0 opacity-75">Live data from Davis WeatherLink station</p>
+        </div>
+        <div class="col-md-4 text-md-end">
+            <span id="lastUpdate" class="text-white-50 me-3">--</span>
+            <i class="bi bi-arrow-clockwise refresh-btn text-white fs-4" id="refreshBtn" onclick="loadCurrentWeather()" title="Refresh"></i>
+        </div>
+    </div>
+</div>
+
+<div id="loadingState" class="loading-spinner">
+    <div class="text-center">
+        <div class="spinner-border text-primary" role="status"></div>
+        <p class="mt-2 text-muted">Loading current conditions...</p>
+    </div>
+</div>
+
+<div id="errorState" class="alert alert-danger d-none">
+    <i class="bi bi-exclamation-triangle"></i>
+    <span id="errorMessage">Failed to load weather data.</span>
+</div>
+
+<div id="weatherContent" class="d-none">
+    <!-- Soil Profile Schematic -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-layers"></i> Current Townhome Conditions
+                </div>
+                <div class="card-body p-0">
+                    <svg id="profile-schematic" viewBox="0 0 800 600">
+                        <defs>
+                            <linearGradient id="skyGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#87CEEB;stop-opacity:1" />
+                                <stop offset="100%" style="stop-color:#E0F4FF;stop-opacity:1" />
+                            </linearGradient>
+                            <linearGradient id="soilGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#8B7355;stop-opacity:1" />
+                                <stop offset="50%" style="stop-color:#6B5344;stop-opacity:1" />
+                                <stop offset="100%" style="stop-color:#5B4334;stop-opacity:1" />
+                            </linearGradient>
+                        </defs>
+
+                        <!-- Sky layer -->
+                        <rect x="0" y="0" width="800" height="260" fill="url(#skyGradient)" />
+
+                        <!-- Sun icon -->
+                        <g id="sun-icon" transform="translate(720, 50)">
+                            <circle cx="0" cy="0" r="22" fill="#FFD700" />
+                            <g stroke="#FFD700" stroke-width="3">
+                                <line x1="0" y1="-32" x2="0" y2="-42" />
+                                <line x1="22" y1="-22" x2="29" y2="-29" />
+                                <line x1="32" y1="0" x2="42" y2="0" />
+                                <line x1="22" y1="22" x2="29" y2="29" />
+                                <line x1="0" y1="32" x2="0" y2="42" />
+                                <line x1="-22" y1="22" x2="-29" y2="29" />
+                                <line x1="-32" y1="0" x2="-42" y2="0" />
+                                <line x1="-22" y1="-22" x2="-29" y2="-29" />
+                            </g>
+                        </g>
+
+                        <!-- Sky readouts -->
+                        <g transform="translate(60, 40)">
+                            <text x="0" y="0" font-size="16" fill="#d32f2f" font-weight="600">Air:</text>
+                            <text x="0" y="24" font-size="16" fill="#d32f2f" font-weight="700" id="schematic-air-temp">--</text>
+                            <text x="0" y="68" font-size="16" fill="#2e7d32" font-weight="600">Dew point:</text>
+                            <text x="0" y="92" font-size="16" fill="#2e7d32" font-weight="700" id="schematic-dewpoint">--</text>
+                        </g>
+
+                        <g transform="translate(250, 40)">
+                            <text x="0" y="0" font-size="16" fill="#2e7d32" font-weight="600">Wind gust:</text>
+                            <text x="0" y="24" font-size="16" fill="#2e7d32" font-weight="700" id="schematic-wind-gust">--</text>
+                            <text x="0" y="48" font-size="16" fill="#2e7d32" id="schematic-wind-dir">--</text>
+                        </g>
+
+                        <g transform="translate(560, 220)">
+                            <g transform="translate(0, 0)">
+                                <rect x="0" y="0" width="18" height="28" rx="3" fill="#bbdefb" stroke="#1e88e5" stroke-width="2" />
+                                <rect x="4" y="4" width="10" height="20" rx="2" fill="#90caf9" />
+                            </g>
+                            <text x="26" y="14" font-size="16" fill="#1e88e5" font-weight="600">Rain 24h:</text>
+                            <text x="26" y="34" font-size="16" fill="#1e88e5" font-weight="700" id="schematic-rain-24h">--</text>
+                        </g>
+
+                        <g transform="translate(470, 40)">
+                            <text x="0" y="0" font-size="16" fill="#1565c0" font-weight="600">Aqi:</text>
+                            <text x="0" y="24" font-size="16" fill="#1565c0" font-weight="700" id="schematic-aqi">--</text>
+                            <text x="0" y="48" font-size="16" fill="#1565c0" id="schematic-pm25">--</text>
+                        </g>
+                        <g transform="translate(470, 90)">
+                            <rect x="0" y="0" width="100" height="18" rx="4" fill="#e0e0e0" id="schematic-aqi-badge" />
+                            <text x="50" y="13" font-size="12" fill="#333" text-anchor="middle" id="schematic-aqi-label">--</text>
+                        </g>
+
+                        <g transform="translate(240, 180)">
+                            <text x="0" y="0" font-size="16" fill="#455a64" font-weight="600">Pressure:</text>
+                            <text x="0" y="24" font-size="16" fill="#455a64" font-weight="700" id="schematic-pressure">--</text>
+                        </g>
+
+                        <g transform="translate(620, 40)">
+                            <text x="0" y="0" font-size="16" fill="#e6a000" font-weight="600">Solar:</text>
+                            <text x="0" y="24" font-size="16" fill="#e6a000" font-weight="700" id="schematic-solar">--</text>
+                        </g>
+
+                        <!-- House with indoor conditions -->
+                        <g id="house-icon" transform="translate(340, 160)">
+                            <polygon points="20,40 60,10 100,40" fill="#c9a26a" stroke="#8d6e63" stroke-width="2" />
+                            <rect x="25" y="40" width="70" height="60" fill="#f5e6c8" stroke="#8d6e63" stroke-width="2" />
+                            <rect x="55" y="65" width="20" height="35" fill="#8d6e63" />
+                            <rect x="32" y="55" width="16" height="16" fill="#b3d9ff" stroke="#8d6e63" stroke-width="1" />
+                            <rect x="72" y="55" width="16" height="16" fill="#b3d9ff" stroke="#8d6e63" stroke-width="1" />
+                        </g>
+                        <g id="house-indoor-readout" transform="translate(460, 180)">
+                            <text x="0" y="0" font-size="16" fill="#d32f2f" font-weight="600">Indoor temp:</text>
+                            <text x="0" y="24" font-size="16" fill="#d32f2f" font-weight="700" id="schematic-indoor-temp">--</text>
+                            <text x="0" y="48" font-size="16" fill="#2e7d32" font-weight="600">Humidity:</text>
+                            <text x="0" y="72" font-size="16" fill="#2e7d32" font-weight="700" id="schematic-indoor-hum">--</text>
+                        </g>
+
+                        <!-- Soil layer -->
+                        <rect x="0" y="260" width="800" height="340" fill="url(#soilGradient)" />
+
+                        <g font-size="16" fill="#fff" font-weight="600">
+                            <text x="15" y="258" fill="#333">Surface</text>
+                            <line x1="0" y1="320" x2="60" y2="320" stroke="#fff" stroke-width="1" stroke-dasharray="4,2" opacity="0.5" />
+                            <text x="15" y="325">5 in</text>
+                            <line x1="0" y1="410" x2="60" y2="410" stroke="#fff" stroke-width="1" stroke-dasharray="4,2" opacity="0.5" />
+                            <text x="15" y="415">10 in</text>
+                            <line x1="0" y1="520" x2="60" y2="520" stroke="#fff" stroke-width="1" stroke-dasharray="4,2" opacity="0.5" />
+                            <text x="15" y="525">20 in</text>
+                        </g>
+
+                        <g transform="translate(220, 320)">
+                            <rect x="-55" y="-18" width="110" height="36" rx="6" fill="rgba(255,255,255,0.92)" stroke="#795548" stroke-width="2" />
+                            <text x="0" y="7" font-size="18" fill="#795548" font-weight="700" text-anchor="middle" id="schematic-soil-temp-5">--</text>
+                        </g>
+                        <g transform="translate(220, 410)">
+                            <rect x="-55" y="-18" width="110" height="36" rx="6" fill="rgba(255,255,255,0.92)" stroke="#795548" stroke-width="2" />
+                            <text x="0" y="7" font-size="18" fill="#795548" font-weight="700" text-anchor="middle" id="schematic-soil-temp-10">--</text>
+                        </g>
+                        <g transform="translate(220, 520)">
+                            <rect x="-55" y="-18" width="110" height="36" rx="6" fill="rgba(255,255,255,0.92)" stroke="#795548" stroke-width="2" />
+                            <text x="0" y="7" font-size="18" fill="#795548" font-weight="700" text-anchor="middle" id="schematic-soil-temp-20">--</text>
+                        </g>
+
+                        <g transform="translate(470, 320)">
+                            <rect x="-55" y="-22" width="110" height="44" rx="6" fill="rgba(255,255,255,0.92)" stroke="#1976d2" stroke-width="2" id="schematic-soil-moisture-5-rect" />
+                            <text x="0" y="2" font-size="18" fill="#1976d2" font-weight="700" text-anchor="middle" id="schematic-soil-moisture-5">--</text>
+                            <text x="0" y="18" font-size="11" fill="#666" text-anchor="middle" id="schematic-soil-moisture-5-pct">--</text>
+                        </g>
+                        <g transform="translate(470, 410)">
+                            <rect x="-55" y="-22" width="110" height="44" rx="6" fill="rgba(255,255,255,0.92)" stroke="#1976d2" stroke-width="2" id="schematic-soil-moisture-10-rect" />
+                            <text x="0" y="2" font-size="18" fill="#1976d2" font-weight="700" text-anchor="middle" id="schematic-soil-moisture-10">--</text>
+                            <text x="0" y="18" font-size="11" fill="#666" text-anchor="middle" id="schematic-soil-moisture-10-pct">--</text>
+                        </g>
+                        <g transform="translate(470, 520)">
+                            <rect x="-55" y="-22" width="110" height="44" rx="6" fill="rgba(255,255,255,0.92)" stroke="#1976d2" stroke-width="2" id="schematic-soil-moisture-20-rect" />
+                            <text x="0" y="2" font-size="18" fill="#1976d2" font-weight="700" text-anchor="middle" id="schematic-soil-moisture-20">--</text>
+                            <text x="0" y="18" font-size="11" fill="#666" text-anchor="middle" id="schematic-soil-moisture-20-pct">--</text>
+                        </g>
+
+                        <g transform="translate(610, 310)">
+                            <rect x="0" y="0" width="170" height="130" rx="8" fill="rgba(255,255,255,0.95)" stroke="#ccc" />
+                            <text x="85" y="20" font-size="12" fill="#555" font-weight="600" text-anchor="middle">Soil moisture:</text>
+                            <g transform="translate(10, 32)">
+                                <rect x="0" y="0" width="12" height="12" fill="#1976d2" rx="2" />
+                            <text x="18" y="10" font-size="11" fill="#333">0-10 cb: Saturated</text>
+                            </g>
+                            <g transform="translate(10, 52)">
+                                <rect x="0" y="0" width="12" height="12" fill="#4caf50" rx="2" />
+                            <text x="18" y="10" font-size="11" fill="#333">10-30 cb: Adequate</text>
+                            </g>
+                            <g transform="translate(10, 72)">
+                                <rect x="0" y="0" width="12" height="12" fill="#ff9800" rx="2" />
+                            <text x="18" y="10" font-size="11" fill="#333">30-60 cb: Dry</text>
+                            </g>
+                            <g transform="translate(10, 92)">
+                                <rect x="0" y="0" width="12" height="12" fill="#f44336" rx="2" />
+                            <text x="18" y="10" font-size="11" fill="#333">60+ cb: Very Dry</text>
+                            </g>
+                        </g>
+                    </svg>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function formatValue(value, decimals = 0, suffix = '') {
+    if (value === null || value === undefined) return '--';
+    return value.toFixed(decimals) + suffix;
+}
+
+async function loadCurrentWeather() {
+    const refreshBtn = document.getElementById('refreshBtn');
+    refreshBtn.classList.add('spinning');
+
+    document.getElementById('loadingState').classList.remove('d-none');
+    document.getElementById('weatherContent').classList.add('d-none');
+    document.getElementById('errorState').classList.add('d-none');
+
+    try {
+        const response = await fetch('/api/current-weather');
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'Failed to load weather data');
+        }
+
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('weatherContent').classList.remove('d-none');
+
+        const weather = data.weather;
+
+        const schematicAirTemp = document.getElementById('schematic-air-temp');
+        if (schematicAirTemp) {
+            schematicAirTemp.textContent = (weather.temp_f === null || weather.temp_f === undefined)
+                ? '--' : `${Math.round(weather.temp_f)} deg F`;
+        }
+        const schematicDew = document.getElementById('schematic-dewpoint');
+        if (schematicDew) {
+            schematicDew.textContent = (weather.dew_point_f === null || weather.dew_point_f === undefined)
+                ? '--' : `${Math.round(weather.dew_point_f)} deg F`;
+        }
+        const schematicGust = document.getElementById('schematic-wind-gust');
+        if (schematicGust) {
+            schematicGust.textContent = (weather.wind_gust_mph === null || weather.wind_gust_mph === undefined)
+                ? '--' : `${Math.round(weather.wind_gust_mph)} mph`;
+        }
+        const schematicWindDir = document.getElementById('schematic-wind-dir');
+        if (schematicWindDir) {
+            schematicWindDir.textContent = weather.wind_direction || '--';
+        }
+        const schematicRain24h = document.getElementById('schematic-rain-24h');
+        if (schematicRain24h) {
+            schematicRain24h.textContent = (weather.rain_24h_in === null || weather.rain_24h_in === undefined)
+                ? '--' : `${Number(weather.rain_24h_in).toFixed(2)} in`;
+        }
+        const schematicAqi = document.getElementById('schematic-aqi');
+        if (schematicAqi) {
+            schematicAqi.textContent = (weather.aqi === null || weather.aqi === undefined) ? '--' : `${Math.round(weather.aqi)} AQI`;
+        }
+        const schematicAqiBadge = document.getElementById('schematic-aqi-badge');
+        const schematicAqiLabel = document.getElementById('schematic-aqi-label');
+        if (schematicAqiBadge && schematicAqiLabel) {
+            if (data.aqi_category) {
+                schematicAqiBadge.setAttribute('fill', data.aqi_color || '#e0e0e0');
+                schematicAqiLabel.textContent = data.aqi_category;
+                schematicAqiLabel.setAttribute('fill', (weather.aqi !== null && weather.aqi > 100) ? '#ffffff' : '#000000');
+            } else {
+                schematicAqiBadge.setAttribute('fill', '#e0e0e0');
+                schematicAqiLabel.textContent = 'No Data';
+                schematicAqiLabel.setAttribute('fill', '#666666');
+            }
+        }
+        const schematicPm = document.getElementById('schematic-pm25');
+        if (schematicPm) {
+            schematicPm.textContent = (weather.pm25 === null || weather.pm25 === undefined) ? '--' : `PM2.5 ${Number(weather.pm25).toFixed(1)}`;
+        }
+        const schematicPressure = document.getElementById('schematic-pressure');
+        if (schematicPressure) {
+            schematicPressure.textContent = (weather.barometer_mb === null || weather.barometer_mb === undefined)
+                ? '--' : `${Number(weather.barometer_mb).toFixed(1)} mb`;
+        }
+        const schematicSolar = document.getElementById('schematic-solar');
+        if (schematicSolar) {
+            schematicSolar.textContent = (weather.solar_rad === null || weather.solar_rad === undefined)
+                ? '--' : `${Math.round(weather.solar_rad)} W/m2`;
+        }
+        const schematicIndoorTemp = document.getElementById('schematic-indoor-temp');
+        if (schematicIndoorTemp) {
+            schematicIndoorTemp.textContent = (weather.inside_temp_f === null || weather.inside_temp_f === undefined)
+                ? '--' : `${Math.round(weather.inside_temp_f)} deg F`;
+        }
+        const schematicIndoorHum = document.getElementById('schematic-indoor-hum');
+        if (schematicIndoorHum) {
+            schematicIndoorHum.textContent = (weather.inside_humidity === null || weather.inside_humidity === undefined)
+                ? '--' : `${Math.round(weather.inside_humidity)} %`;
+        }
+        const sunIcon = document.getElementById('sun-icon');
+        if (sunIcon) {
+            sunIcon.style.opacity = (weather.solar_rad && weather.solar_rad > 0) ? 1 : 0.3;
+        }
+
+        const fmtSoil = (val) => (val === null || val === undefined) ? '--' : Number(val).toFixed(1);
+        const getMoistureColor = (val) => {
+            if (val === null || val === undefined || val <= 10) return '#1976d2';
+            if (val <= 30) return '#4caf50';
+            if (val <= 60) return '#ff9800';
+            return '#f44336';
+        };
+        const updateMoisture = (depth, value) => {
+            const color = getMoistureColor(value);
+            const textEl = document.getElementById(`schematic-soil-moisture-${depth}`);
+            const rectEl = document.getElementById(`schematic-soil-moisture-${depth}-rect`);
+            const pctEl = document.getElementById(`schematic-soil-moisture-${depth}-pct`);
+            if (textEl) {
+                textEl.textContent = (value === null || value === undefined) ? '--' : `${Number(value).toFixed(1)} cb`;
+                textEl.setAttribute('fill', color);
+            }
+            if (rectEl) {
+                rectEl.setAttribute('stroke', color);
+            }
+            if (pctEl) {
+                const pctKey = `soil_moisture_${depth}in_percentile`;
+                const pctVal = weather[pctKey];
+                pctEl.textContent = (pctVal === null || pctVal === undefined) ? '--' : `${pctVal}th percentile`;
+            }
+        };
+
+        const temp5 = document.getElementById('schematic-soil-temp-5');
+        if (temp5) temp5.textContent = (weather.soil_temp_5in === null || weather.soil_temp_5in === undefined)
+            ? '--' : fmtSoil(weather.soil_temp_5in) + ' deg F';
+        const temp10 = document.getElementById('schematic-soil-temp-10');
+        if (temp10) temp10.textContent = (weather.soil_temp_10in === null || weather.soil_temp_10in === undefined)
+            ? '--' : fmtSoil(weather.soil_temp_10in) + ' deg F';
+        const temp20 = document.getElementById('schematic-soil-temp-20');
+        if (temp20) temp20.textContent = (weather.soil_temp_20in === null || weather.soil_temp_20in === undefined)
+            ? '--' : fmtSoil(weather.soil_temp_20in) + ' deg F';
+
+        updateMoisture('5', weather.soil_moisture_5in);
+        updateMoisture('10', weather.soil_moisture_10in);
+        updateMoisture('20', weather.soil_moisture_20in);
+
+        document.getElementById('lastUpdate').textContent = 'Updated: ' + weather.timestamp_formatted;
+
+    } catch (error) {
+        console.error('Error loading weather:', error);
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('errorState').classList.remove('d-none');
+        document.getElementById('errorMessage').textContent = error.message;
+    } finally {
+        refreshBtn.classList.remove('spinning');
+    }
+}
+
+loadCurrentWeather();
+setInterval(loadCurrentWeather, 5 * 60 * 1000);
+</script>
+{% endblock %}
