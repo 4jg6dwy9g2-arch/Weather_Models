@@ -171,17 +171,99 @@
         </div>
     </div>
 
+    <!-- Rossby Wave Analysis Card -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-wind"></i> Rossby Wave Analysis (500 hPa, 55°N)
+                </div>
+                <div class="card-body">
+                    <div class="row text-center">
+                        <div class="col-md-4">
+                            <h5>GFS</h5>
+                            <div class="display-4 text-primary" id="gfs-wave-number">-</div>
+                            <small class="text-muted">waves</small>
+                            <div class="mt-2">
+                                <small id="gfs-wave-detail" class="text-muted"></small>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <h5>AIFS</h5>
+                            <div class="display-4 text-warning" id="aifs-wave-number">-</div>
+                            <small class="text-muted">waves</small>
+                            <div class="mt-2">
+                                <small id="aifs-wave-detail" class="text-muted"></small>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <h5>IFS</h5>
+                            <div class="display-4 text-success" id="ifs-wave-number">-</div>
+                            <small class="text-muted">waves</small>
+                            <div class="mt-2">
+                                <small id="ifs-wave-detail" class="text-muted"></small>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="alert alert-info mt-3">
+                        <strong>Interpretation:</strong> Lower wave numbers (2-4) indicate larger, more persistent patterns with better forecast reliability. Higher wave numbers (5-8+) suggest faster-evolving, more chaotic patterns with reduced predictability.
+                    </div>
+
+                    <!-- Combined Forecast & History Chart -->
+                    <div class="mt-4">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h6 class="mb-0">Wave Number Forecast & History</h6>
+                            <select class="form-select form-select-sm" id="waveHistoryDays" style="width: auto;">
+                                <option value="7">1 week history</option>
+                                <option value="14">2 weeks history</option>
+                                <option value="30" selected>1 month history</option>
+                                <option value="60">2 months history</option>
+                                <option value="90">3 months history</option>
+                            </select>
+                        </div>
+                        <div class="chart-container" style="position: relative; height: 400px;">
+                            <canvas id="waveChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Temperature Chart -->
     <div class="row mb-4">
         <div class="col-12">
             <div class="card">
-                <div class="card-header d-flex justify-content-between align-items-center">
-                    <span><i class="bi bi-thermometer-half"></i> Temperature Forecast</span>
-                    <small class="text-muted" id="gfsInitTime"></small>
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div>
+                        <span><i class="bi bi-thermometer-half"></i> Temperature Forecast & Historical Bias</span>
+                        <small class="text-muted d-block" id="gfsInitTime"></small>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap">
+                        <select class="form-select form-select-sm" id="tempBiasLeadTime" style="width: auto;">
+                            <option value="6">6h lead</option>
+                            <option value="12">12h lead</option>
+                            <option value="24" selected>24h lead</option>
+                            <option value="48">48h lead</option>
+                            <option value="72">72h lead</option>
+                            <option value="120">5d lead</option>
+                            <option value="168">7d lead</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="tempBiasTimeFrame" style="width: auto;">
+                            <option value="7">1 week history</option>
+                            <option value="14">2 weeks history</option>
+                            <option value="30" selected>1 month history</option>
+                            <option value="60">2 months history</option>
+                            <option value="90">3 months history</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div class="chart-container chart-container-large">
                         <canvas id="tempChart"></canvas>
+                    </div>
+                    <div class="alert alert-info mt-3 mb-0">
+                        <strong>Interpretation:</strong> Black dots with line show observed temperatures (historical). Colored bars extend from observations showing model bias (upward = too warm, downward = too cold). Colored lines show model forecasts extending into the future.
                     </div>
                 </div>
             </div>
@@ -209,12 +291,35 @@
     <div class="row mb-4">
         <div class="col-12">
             <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-speedometer"></i> Mean Sea Level Pressure
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div>
+                        <span><i class="bi bi-speedometer"></i> Mean Sea Level Pressure Forecast & Historical Bias</span>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap">
+                        <select class="form-select form-select-sm" id="mslpBiasLeadTime" style="width: auto;">
+                            <option value="6">6h lead</option>
+                            <option value="12">12h lead</option>
+                            <option value="24" selected>24h lead</option>
+                            <option value="48">48h lead</option>
+                            <option value="72">72h lead</option>
+                            <option value="120">5d lead</option>
+                            <option value="168">7d lead</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="mslpBiasTimeFrame" style="width: auto;">
+                            <option value="7">1 week history</option>
+                            <option value="14">2 weeks history</option>
+                            <option value="30" selected>1 month history</option>
+                            <option value="60">2 months history</option>
+                            <option value="90">3 months history</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div class="chart-container chart-container-large">
                         <canvas id="mslpChart"></canvas>
+                    </div>
+                    <div class="alert alert-info mt-3 mb-0">
+                        <strong>Interpretation:</strong> Black dots with line show observed pressure (historical). Colored bars extend from observations showing model bias (upward = too high, downward = too low). Colored lines show model forecasts extending into the future.
                     </div>
                 </div>
             </div>
@@ -369,20 +474,28 @@ function getTempClass(temp) {
 // Load forecast data from saved files
 async function loadForecast() {
     const location = document.getElementById('locationSelect').value;
+    const tempLeadTime = document.getElementById('tempBiasLeadTime').value;
+    const tempTimeFrame = document.getElementById('tempBiasTimeFrame').value;
+    const mslpLeadTime = document.getElementById('mslpBiasLeadTime').value;
+    const mslpTimeFrame = document.getElementById('mslpBiasTimeFrame').value;
 
     document.getElementById('loadingState').classList.remove('d-none');
     document.getElementById('forecastContent').classList.add('d-none');
     document.getElementById('errorState').classList.add('d-none');
 
     try {
-        // Load from saved data and verification across all runs
-        const [forecastResponse, verificationResponse] = await Promise.all([
+        // Load from saved data, verification, and historical bias for both temp and MSLP
+        const [forecastResponse, verificationResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse] = await Promise.all([
             fetch(`/api/latest-forecast?location=${encodeURIComponent(location)}`),
-            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`)
+            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`),
+            fetch(`/api/temp-bias-history?location=${encodeURIComponent(location)}&lead_time=${tempLeadTime}&days_back=${tempTimeFrame}`),
+            fetch(`/api/mslp-bias-history?location=${encodeURIComponent(location)}&lead_time=${mslpLeadTime}&days_back=${mslpTimeFrame}`)
         ]);
 
         const data = await forecastResponse.json();
         const verificationData = await verificationResponse.json();
+        const tempBiasHistoryData = await tempBiasHistoryResponse.json();
+        const mslpBiasHistoryData = await mslpBiasHistoryResponse.json();
 
         if (!data.success) {
             throw new Error(data.error || 'No saved data available');
@@ -392,7 +505,10 @@ async function loadForecast() {
         document.getElementById('loadingState').classList.add('d-none');
         document.getElementById('forecastContent').classList.remove('d-none');
 
-        renderForecastCharts(data);
+        // Render combined forecast + historical bias charts
+        const tempHistoryData = tempBiasHistoryData.success ? tempBiasHistoryData.history : null;
+        const mslpHistoryData = mslpBiasHistoryData.success ? mslpBiasHistoryData.history : null;
+        renderForecastCharts(data, tempHistoryData, mslpHistoryData);
 
         updateInitTimes(data);
         updateFetchedTime(data);
@@ -544,111 +660,36 @@ function renderVerificationTable(v) {
     }
 }
 
-// Render charts
-function renderForecastCharts(data) {
-    // Convert data to {x, y} format with actual timestamps for proper alignment
+// Render temperature chart only
+function renderTempChart(data, tempHistoryData) {
+    // Convert forecast data to {x, y} format
     const gfsData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.temps[i] }));
     const aifsData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.temps[i] }));
     const ifsData = data.ifs ? data.ifs.times.map((t, i) => ({ x: new Date(t), y: data.ifs.temps[i] })) : [];
 
-    // Calculate x-axis range from all available data
+    // Calculate x-axis range
     const allTimes = [...data.gfs.times, ...data.aifs.times];
     if (data.ifs && data.ifs.times) {
         allTimes.push(...data.ifs.times);
     }
-    // Filter out null/undefined and convert to valid dates only
+    if (tempHistoryData && tempHistoryData.dates) {
+        allTimes.push(...tempHistoryData.dates);
+    }
+
     const allDates = allTimes
         .filter(t => t != null)
         .map(t => new Date(t))
-        .filter(d => !isNaN(d.getTime())); // Filter out invalid dates
+        .filter(d => !isNaN(d.getTime()));
 
     const minDate = allDates.length > 0 ? new Date(Math.min(...allDates)) : null;
     const maxDate = allDates.length > 0 ? new Date(Math.max(...allDates)) : null;
-
-    // Debug: Log first few data points to console
-    console.log('GFS first 3 points:', gfsData.slice(0, 3));
-    console.log('AIFS first 3 points:', aifsData.slice(0, 3));
-    console.log('IFS first 3 points:', ifsData.slice(0, 3));
-    console.log('X-axis range:', minDate, 'to', maxDate);
-
-    const gfsPrecipData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.precips[i] }));
-    const aifsPrecipData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.precips[i] }));
-    const ifsPrecipData = data.ifs ? data.ifs.times.map((t, i) => ({ x: new Date(t), y: data.ifs.precips[i] })) : [];
-
-    const gfsMslpData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.mslps[i] }));
-    const aifsMslpData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.mslps[i] }));
-    const ifsMslpData = data.ifs ? data.ifs.times.map((t, i) => ({ x: new Date(t), y: data.ifs.mslps[i] })) : [];
-
-    // Check if we have observed data
-    const hasObserved = data.observed && data.observed.temps && data.observed.temps.some(t => t !== null);
-    const observedData = hasObserved ? data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.observed.temps[i] })) : [];
-
-    // Temperature chart datasets
-    const tempDatasets = [
-        {
-            label: 'GFS',
-            data: gfsData,
-            borderColor: '#0d6efd',
-            backgroundColor: 'rgba(13, 110, 253, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 2,
-            pointHoverRadius: 5,
-            borderWidth: 2
-        },
-        {
-            label: 'AIFS',
-            data: aifsData,
-            borderColor: '#0dcaf0',
-            backgroundColor: 'rgba(13, 202, 240, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 2,
-            pointHoverRadius: 5,
-            borderWidth: 2,
-            borderDash: [5, 5]
-        }
-    ];
-
-    // Add IFS dataset if available
-    if (data.ifs && data.ifs.temps) {
-        tempDatasets.push({
-            label: 'IFS',
-            data: ifsData,
-            borderColor: '#20c997',
-            backgroundColor: 'rgba(32, 201, 151, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 2,
-            pointHoverRadius: 5,
-            borderWidth: 2,
-            borderDash: [2, 2]
-        });
-    }
-
-    // Add observed dataset if available
-    if (hasObserved) {
-        tempDatasets.push({
-            label: 'Observed',
-            data: observedData,
-            borderColor: '#28a745',
-            backgroundColor: 'rgba(40, 167, 69, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            pointHoverRadius: 6,
-            borderWidth: 2.5
-        });
-    }
 
     // Build x-axis configuration
     const xAxisConfig = {
         type: 'time',
         time: {
             unit: 'day',
-            displayFormats: {
-                day: 'MMM d'
-            },
+            displayFormats: { day: 'MMM d' },
             tooltipFormat: 'MMM d, ha'
         },
         grid: { display: false },
@@ -657,20 +698,178 @@ function renderForecastCharts(data) {
             minRotation: 45
         }
     };
-
-    // Only add min/max if we have valid dates
     if (minDate && maxDate) {
         xAxisConfig.min = minDate;
         xAxisConfig.max = maxDate;
     }
 
-    // Temperature chart
+    // Temperature chart datasets
+    const tempDatasets = [];
+
+    // Add historical observed line with points and bias bars if available
+    if (tempHistoryData && tempHistoryData.dates && tempHistoryData.observed) {
+        const historicalObserved = tempHistoryData.dates.map((d, i) => ({
+            x: new Date(d),
+            y: tempHistoryData.observed[i]
+        }));
+
+        tempDatasets.push({
+            label: 'Observed (Historical)',
+            data: historicalObserved,
+            type: 'line',
+            borderColor: '#000000',
+            backgroundColor: 'rgba(0, 0, 0, 0.1)',
+            borderWidth: 2.5,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            pointBackgroundColor: '#000000',
+            tension: 0.3,
+            order: 0,
+            spanGaps: true
+        });
+
+        // GFS bias bars
+        const gfsBiasRanges = tempHistoryData.dates.map((d, i) => {
+            if (tempHistoryData.observed[i] !== null && tempHistoryData.gfs_bias[i] !== null) {
+                return {
+                    x: new Date(d),
+                    y: [tempHistoryData.observed[i], tempHistoryData.observed[i] + tempHistoryData.gfs_bias[i]]
+                };
+            }
+            return null;
+        }).filter(v => v !== null);
+
+        tempDatasets.push({
+            label: 'GFS Bias',
+            data: gfsBiasRanges,
+            type: 'bar',
+            backgroundColor: 'rgba(13, 110, 253, 0.7)',
+            borderColor: '#0d6efd',
+            borderWidth: 2,
+            barThickness: 6,
+            order: 4
+        });
+
+        // AIFS bias bars
+        const aifsBiasRanges = tempHistoryData.dates.map((d, i) => {
+            if (tempHistoryData.observed[i] !== null && tempHistoryData.aifs_bias[i] !== null) {
+                return {
+                    x: new Date(d),
+                    y: [tempHistoryData.observed[i], tempHistoryData.observed[i] + tempHistoryData.aifs_bias[i]]
+                };
+            }
+            return null;
+        }).filter(v => v !== null);
+
+        tempDatasets.push({
+            label: 'AIFS Bias',
+            data: aifsBiasRanges,
+            type: 'bar',
+            backgroundColor: 'rgba(13, 202, 240, 0.7)',
+            borderColor: '#0dcaf0',
+            borderWidth: 2,
+            barThickness: 6,
+            order: 5
+        });
+
+        // IFS bias bars
+        const ifsBiasRanges = tempHistoryData.dates.map((d, i) => {
+            if (tempHistoryData.observed[i] !== null && tempHistoryData.ifs_bias[i] !== null) {
+                return {
+                    x: new Date(d),
+                    y: [tempHistoryData.observed[i], tempHistoryData.observed[i] + tempHistoryData.ifs_bias[i]]
+                };
+            }
+            return null;
+        }).filter(v => v !== null);
+
+        tempDatasets.push({
+            label: 'IFS Bias',
+            data: ifsBiasRanges,
+            type: 'bar',
+            backgroundColor: 'rgba(32, 201, 151, 0.7)',
+            borderColor: '#20c997',
+            borderWidth: 2,
+            barThickness: 6,
+            order: 6
+        });
+    }
+
+    // Add forecast lines
+    tempDatasets.push({
+        label: 'GFS Forecast',
+        data: gfsData,
+        type: 'line',
+        borderColor: '#0d6efd',
+        backgroundColor: 'rgba(13, 110, 253, 0.1)',
+        fill: false,
+        tension: 0.3,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+        order: 1
+    });
+
+    tempDatasets.push({
+        label: 'AIFS Forecast',
+        data: aifsData,
+        type: 'line',
+        borderColor: '#0dcaf0',
+        backgroundColor: 'rgba(13, 202, 240, 0.1)',
+        fill: false,
+        tension: 0.3,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+        borderDash: [5, 5],
+        order: 2
+    });
+
+    if (data.ifs && data.ifs.temps) {
+        tempDatasets.push({
+            label: 'IFS Forecast',
+            data: ifsData,
+            type: 'line',
+            borderColor: '#20c997',
+            backgroundColor: 'rgba(32, 201, 151, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 0,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [2, 2],
+            order: 3
+        });
+    }
+
+    // Calculate y-axis range
+    let tempMin = Infinity;
+    let tempMax = -Infinity;
+
+    tempDatasets.forEach(dataset => {
+        dataset.data.forEach(point => {
+            if (!point) return;
+            if (Array.isArray(point.y)) {
+                const [min, max] = point.y;
+                tempMin = Math.min(tempMin, min, max);
+                tempMax = Math.max(tempMax, min, max);
+            } else if (point.y !== null && point.y !== undefined) {
+                tempMin = Math.min(tempMin, point.y);
+                tempMax = Math.max(tempMax, point.y);
+            }
+        });
+    });
+
+    const tempRange = tempMax - tempMin;
+    const tempPadding = tempRange * 0.1;
+    const tempYMin = tempMin - tempPadding;
+    const tempYMax = tempMax + tempPadding;
+
+    // Render temperature chart
     if (tempChart) tempChart.destroy();
     tempChart = new Chart(document.getElementById('tempChart'), {
-        type: 'line',
-        data: {
-            datasets: tempDatasets
-        },
+        type: 'bar',
+        data: { datasets: tempDatasets },
         options: {
             responsive: true,
             maintainAspectRatio: false,
@@ -683,14 +882,40 @@ function renderForecastCharts(data) {
                     position: 'top',
                     labels: {
                         usePointStyle: true,
-                        padding: 20
+                        padding: 15
                     }
                 },
                 tooltip: {
+                    filter: function(tooltipItem) {
+                        const hasData = tooltipItem.parsed.y !== null && tooltipItem.parsed.y !== undefined;
+                        if (!hasData) return false;
+
+                        const label = tooltipItem.dataset.label;
+                        const chart = tooltipItem.chart;
+                        const hasHistoricalDataHere = chart.data.datasets.some(ds => {
+                            const point = ds.data[tooltipItem.dataIndex];
+                            return point && point.y && Array.isArray(point.y);
+                        });
+
+                        if (hasHistoricalDataHere) {
+                            return label.includes('Historical') || label.includes('Bias');
+                        }
+                        return label.includes('Forecast');
+                    },
                     callbacks: {
                         label: function(context) {
+                            const label = context.dataset.label || '';
+                            if (label.includes('Bias') && tempHistoryData) {
+                                const dataPoint = context.dataset.data[context.dataIndex];
+                                if (dataPoint && Array.isArray(dataPoint.y)) {
+                                    const [obs, fcst] = dataPoint.y;
+                                    const bias = fcst - obs;
+                                    return label + ': ' + (bias > 0 ? '+' : '') + bias.toFixed(2) + '°F' +
+                                           ' (obs: ' + obs.toFixed(1) + '°F, fcst: ' + fcst.toFixed(1) + '°F)';
+                                }
+                            }
                             const value = context.parsed.y;
-                            return context.dataset.label + ': ' +
+                            return label + ': ' +
                                 (value !== null && value !== undefined ? value.toFixed(1) + '°F' : 'N/A');
                         }
                     }
@@ -698,6 +923,8 @@ function renderForecastCharts(data) {
             },
             scales: {
                 y: {
+                    min: isFinite(tempYMin) ? tempYMin : undefined,
+                    max: isFinite(tempYMax) ? tempYMax : undefined,
                     grid: { color: '#e0e0e0' },
                     title: { display: true, text: 'Temperature (°F)' }
                 },
@@ -705,6 +932,325 @@ function renderForecastCharts(data) {
             }
         }
     });
+}
+
+// Render MSLP chart only
+function renderMslpChart(data, mslpHistoryData) {
+    // Convert forecast data to {x, y} format
+    const gfsMslpData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.mslps[i] }));
+    const aifsMslpData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.mslps[i] }));
+    const ifsMslpData = data.ifs ? data.ifs.times.map((t, i) => ({ x: new Date(t), y: data.ifs.mslps[i] })) : [];
+
+    // Calculate x-axis range
+    const allTimes = [...data.gfs.times, ...data.aifs.times];
+    if (data.ifs && data.ifs.times) {
+        allTimes.push(...data.ifs.times);
+    }
+    if (mslpHistoryData && mslpHistoryData.dates) {
+        allTimes.push(...mslpHistoryData.dates);
+    }
+
+    const allDates = allTimes
+        .filter(t => t != null)
+        .map(t => new Date(t))
+        .filter(d => !isNaN(d.getTime()));
+
+    const minDate = allDates.length > 0 ? new Date(Math.min(...allDates)) : null;
+    const maxDate = allDates.length > 0 ? new Date(Math.max(...allDates)) : null;
+
+    // Build x-axis configuration
+    const xAxisConfig = {
+        type: 'time',
+        time: {
+            unit: 'day',
+            displayFormats: { day: 'MMM d' },
+            tooltipFormat: 'MMM d, ha'
+        },
+        grid: { display: false },
+        ticks: {
+            maxRotation: 45,
+            minRotation: 45
+        }
+    };
+    if (minDate && maxDate) {
+        xAxisConfig.min = minDate;
+        xAxisConfig.max = maxDate;
+    }
+
+    // MSLP chart datasets
+    const mslpDatasets = [];
+
+    // Add historical observed line with points and bias bars if available
+    if (mslpHistoryData && mslpHistoryData.dates && mslpHistoryData.observed) {
+        const historicalObservedMslp = mslpHistoryData.dates.map((d, i) => ({
+            x: new Date(d),
+            y: mslpHistoryData.observed[i]
+        }));
+
+        mslpDatasets.push({
+            label: 'Observed (Historical)',
+            data: historicalObservedMslp,
+            type: 'line',
+            borderColor: '#000000',
+            backgroundColor: 'rgba(0, 0, 0, 0.1)',
+            borderWidth: 2.5,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            pointBackgroundColor: '#000000',
+            tension: 0.3,
+            order: 0,
+            spanGaps: true
+        });
+
+        // GFS bias bars
+        const gfsMslpBiasRanges = mslpHistoryData.dates.map((d, i) => {
+            if (mslpHistoryData.observed[i] !== null && mslpHistoryData.gfs_bias[i] !== null) {
+                return {
+                    x: new Date(d),
+                    y: [mslpHistoryData.observed[i], mslpHistoryData.observed[i] + mslpHistoryData.gfs_bias[i]]
+                };
+            }
+            return null;
+        }).filter(v => v !== null);
+
+        mslpDatasets.push({
+            label: 'GFS Bias',
+            data: gfsMslpBiasRanges,
+            type: 'bar',
+            backgroundColor: 'rgba(13, 110, 253, 0.7)',
+            borderColor: '#0d6efd',
+            borderWidth: 2,
+            barThickness: 6,
+            order: 4
+        });
+
+        // AIFS bias bars
+        const aifsMslpBiasRanges = mslpHistoryData.dates.map((d, i) => {
+            if (mslpHistoryData.observed[i] !== null && mslpHistoryData.aifs_bias[i] !== null) {
+                return {
+                    x: new Date(d),
+                    y: [mslpHistoryData.observed[i], mslpHistoryData.observed[i] + mslpHistoryData.aifs_bias[i]]
+                };
+            }
+            return null;
+        }).filter(v => v !== null);
+
+        mslpDatasets.push({
+            label: 'AIFS Bias',
+            data: aifsMslpBiasRanges,
+            type: 'bar',
+            backgroundColor: 'rgba(13, 202, 240, 0.7)',
+            borderColor: '#0dcaf0',
+            borderWidth: 2,
+            barThickness: 6,
+            order: 5
+        });
+
+        // IFS bias bars
+        const ifsMslpBiasRanges = mslpHistoryData.dates.map((d, i) => {
+            if (mslpHistoryData.observed[i] !== null && mslpHistoryData.ifs_bias[i] !== null) {
+                return {
+                    x: new Date(d),
+                    y: [mslpHistoryData.observed[i], mslpHistoryData.observed[i] + mslpHistoryData.ifs_bias[i]]
+                };
+            }
+            return null;
+        }).filter(v => v !== null);
+
+        mslpDatasets.push({
+            label: 'IFS Bias',
+            data: ifsMslpBiasRanges,
+            type: 'bar',
+            backgroundColor: 'rgba(32, 201, 151, 0.7)',
+            borderColor: '#20c997',
+            borderWidth: 2,
+            barThickness: 6,
+            order: 6
+        });
+    }
+
+    // Add forecast lines
+    mslpDatasets.push({
+        label: 'GFS Forecast',
+        data: gfsMslpData,
+        type: 'line',
+        borderColor: '#0d6efd',
+        backgroundColor: 'rgba(13, 110, 253, 0.1)',
+        fill: false,
+        tension: 0.3,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+        order: 1
+    });
+
+    mslpDatasets.push({
+        label: 'AIFS Forecast',
+        data: aifsMslpData,
+        type: 'line',
+        borderColor: '#0dcaf0',
+        backgroundColor: 'rgba(13, 202, 240, 0.1)',
+        fill: false,
+        tension: 0.3,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+        borderDash: [5, 5],
+        order: 2
+    });
+
+    if (data.ifs && data.ifs.mslps) {
+        mslpDatasets.push({
+            label: 'IFS Forecast',
+            data: ifsMslpData,
+            type: 'line',
+            borderColor: '#20c997',
+            backgroundColor: 'rgba(32, 201, 151, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 0,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            borderDash: [2, 2],
+            order: 3
+        });
+    }
+
+    // Calculate y-axis range
+    let mslpMin = Infinity;
+    let mslpMax = -Infinity;
+
+    mslpDatasets.forEach(dataset => {
+        dataset.data.forEach(point => {
+            if (!point) return;
+            if (Array.isArray(point.y)) {
+                const [min, max] = point.y;
+                mslpMin = Math.min(mslpMin, min, max);
+                mslpMax = Math.max(mslpMax, min, max);
+            } else if (point.y !== null && point.y !== undefined) {
+                mslpMin = Math.min(mslpMin, point.y);
+                mslpMax = Math.max(mslpMax, point.y);
+            }
+        });
+    });
+
+    const mslpRange = mslpMax - mslpMin;
+    const mslpPadding = mslpRange * 0.1;
+    const mslpYMin = mslpMin - mslpPadding;
+    const mslpYMax = mslpMax + mslpPadding;
+
+    // Render MSLP chart
+    if (mslpChart) mslpChart.destroy();
+    mslpChart = new Chart(document.getElementById('mslpChart'), {
+        type: 'bar',
+        data: { datasets: mslpDatasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 15
+                    }
+                },
+                tooltip: {
+                    filter: function(tooltipItem) {
+                        const hasData = tooltipItem.parsed.y !== null && tooltipItem.parsed.y !== undefined;
+                        if (!hasData) return false;
+
+                        const label = tooltipItem.dataset.label;
+                        const chart = tooltipItem.chart;
+                        const hasHistoricalDataHere = chart.data.datasets.some(ds => {
+                            const point = ds.data[tooltipItem.dataIndex];
+                            return point && point.y && Array.isArray(point.y);
+                        });
+
+                        if (hasHistoricalDataHere) {
+                            return label.includes('Historical') || label.includes('Bias');
+                        }
+                        return label.includes('Forecast');
+                    },
+                    callbacks: {
+                        label: function(context) {
+                            const label = context.dataset.label || '';
+                            if (label.includes('Bias') && mslpHistoryData) {
+                                const dataPoint = context.dataset.data[context.dataIndex];
+                                if (dataPoint && Array.isArray(dataPoint.y)) {
+                                    const [obs, fcst] = dataPoint.y;
+                                    const bias = fcst - obs;
+                                    return label + ': ' + (bias > 0 ? '+' : '') + bias.toFixed(2) + ' mb' +
+                                           ' (obs: ' + obs.toFixed(1) + ' mb, fcst: ' + fcst.toFixed(1) + ' mb)';
+                                }
+                            }
+                            const value = context.parsed.y;
+                            return label + ': ' +
+                                (value !== null && value !== undefined ? value.toFixed(1) + ' mb' : 'N/A');
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    min: isFinite(mslpYMin) ? mslpYMin : undefined,
+                    max: isFinite(mslpYMax) ? mslpYMax : undefined,
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Pressure (mb)' }
+                },
+                x: xAxisConfig
+            }
+        }
+    });
+}
+
+// Render charts
+function renderForecastCharts(data, tempHistoryData, mslpHistoryData) {
+    // Render temperature and MSLP charts using dedicated functions
+    renderTempChart(data, tempHistoryData);
+    renderMslpChart(data, mslpHistoryData);
+
+    // Prepare precipitation chart data
+    const gfsPrecipData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.precips[i] }));
+    const aifsPrecipData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.precips[i] }));
+    const ifsPrecipData = data.ifs ? data.ifs.times.map((t, i) => ({ x: new Date(t), y: data.ifs.precips[i] })) : [];
+
+    // Calculate x-axis range
+    const allTimes = [...data.gfs.times, ...data.aifs.times];
+    if (data.ifs && data.ifs.times) {
+        allTimes.push(...data.ifs.times);
+    }
+
+    const allDates = allTimes
+        .filter(t => t != null)
+        .map(t => new Date(t))
+        .filter(d => !isNaN(d.getTime()));
+
+    const minDate = allDates.length > 0 ? new Date(Math.min(...allDates)) : null;
+    const maxDate = allDates.length > 0 ? new Date(Math.max(...allDates)) : null;
+
+    // Build x-axis configuration
+    const xAxisConfig = {
+        type: 'time',
+        time: {
+            unit: 'day',
+            displayFormats: { day: 'MMM d' },
+            tooltipFormat: 'MMM d, ha'
+        },
+        grid: { display: false },
+        ticks: {
+            maxRotation: 45,
+            minRotation: 45
+        }
+    };
+    if (minDate && maxDate) {
+        xAxisConfig.min = minDate;
+        xAxisConfig.max = maxDate;
+    }
 
     // Precipitation chart datasets
     const precipDatasets = [
@@ -791,112 +1337,7 @@ function renderForecastCharts(data) {
             }
         }
     });
-
-    // MSLP chart datasets
-    const hasObservedMslp = data.observed && data.observed.mslps && data.observed.mslps.some(m => m !== null);
-    const observedMslpData = hasObservedMslp ? data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.observed.mslps[i] })) : [];
-
-    const mslpDatasets = [
-        {
-            label: 'GFS',
-            data: gfsMslpData,
-            borderColor: '#0d6efd',
-            backgroundColor: 'rgba(13, 110, 253, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 2,
-            pointHoverRadius: 5,
-            borderWidth: 2
-        },
-        {
-            label: 'AIFS',
-            data: aifsMslpData,
-            borderColor: '#0dcaf0',
-            backgroundColor: 'rgba(13, 202, 240, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 2,
-            pointHoverRadius: 5,
-            borderWidth: 2,
-            borderDash: [5, 5]
-        }
-    ];
-
-    // Add IFS MSLP if available
-    if (data.ifs && data.ifs.mslps) {
-        mslpDatasets.push({
-            label: 'IFS',
-            data: ifsMslpData,
-            borderColor: '#20c997',
-            backgroundColor: 'rgba(32, 201, 151, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 2,
-            pointHoverRadius: 5,
-            borderWidth: 2,
-            borderDash: [2, 2]
-        });
-    }
-
-    // Add observed MSLP if available
-    if (hasObservedMslp) {
-        mslpDatasets.push({
-            label: 'Observed',
-            data: observedMslpData,
-            borderColor: '#28a745',
-            backgroundColor: 'rgba(40, 167, 69, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            pointHoverRadius: 6,
-            borderWidth: 2.5
-        });
-    }
-
-    // MSLP chart
-    if (mslpChart) mslpChart.destroy();
-    mslpChart = new Chart(document.getElementById('mslpChart'), {
-        type: 'line',
-        data: {
-            datasets: mslpDatasets
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: {
-                mode: 'index',
-                intersect: false
-            },
-            plugins: {
-                legend: {
-                    position: 'top',
-                    labels: {
-                        usePointStyle: true,
-                        padding: 20
-                    }
-                },
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            const value = context.parsed.y;
-                            return context.dataset.label + ': ' +
-                                (value !== null && value !== undefined ? value.toFixed(1) + ' mb' : 'N/A');
-                        }
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    grid: { color: '#e0e0e0' },
-                    title: { display: true, text: 'Pressure (mb)' }
-                },
-                x: xAxisConfig
-            }
-        }
-    });
 }
-
-
 
 let tempMaeChart, tempBiasChart, mslpMaeChart, mslpBiasChart;
 
@@ -1162,8 +1603,8 @@ function renderFairfaxTimeSeriesChart(data, metric, variable) {
                 {
                     label: 'GFS',
                     data: gfsData,
-                    borderColor: '#dc3545',
-                    backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                    borderColor: '#0d6efd',
+                    backgroundColor: 'rgba(13, 110, 253, 0.1)',
                     borderWidth: 2,
                     tension: 0.3,
                     pointRadius: 2,
@@ -1172,8 +1613,8 @@ function renderFairfaxTimeSeriesChart(data, metric, variable) {
                 {
                     label: 'AIFS',
                     data: aifsData,
-                    borderColor: '#ffc107',
-                    backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                    borderColor: '#0dcaf0',
+                    backgroundColor: 'rgba(13, 202, 240, 0.1)',
                     borderWidth: 2,
                     tension: 0.3,
                     pointRadius: 2,
@@ -1182,8 +1623,8 @@ function renderFairfaxTimeSeriesChart(data, metric, variable) {
                 {
                     label: 'IFS',
                     data: ifsData,
-                    borderColor: '#198754',
-                    backgroundColor: 'rgba(25, 135, 84, 0.1)',
+                    borderColor: '#20c997',
+                    backgroundColor: 'rgba(32, 201, 151, 0.1)',
                     borderWidth: 2,
                     tension: 0.3,
                     pointRadius: 2,
@@ -1250,6 +1691,8 @@ document.getElementById('locationSelect').addEventListener('change', function() 
     loadForecast();
     loadLeadTimeVerification();
     loadFairfaxTimeSeriesChart();
+    loadWaveAnalysis();
+    loadWaveChart();
 });
 
 // Event listeners for Fairfax time series controls
@@ -1258,11 +1701,319 @@ document.getElementById('fairfaxTsMetric').addEventListener('change', loadFairfa
 document.getElementById('fairfaxTsLeadTime').addEventListener('change', loadFairfaxTimeSeriesChart);
 document.getElementById('fairfaxTsTimeFrame').addEventListener('change', loadFairfaxTimeSeriesChart);
 
+// Event listener for wave history dropdown
+document.getElementById('waveHistoryDays').addEventListener('change', loadWaveChart);
+
+// Update just the temperature chart without reloading everything
+async function updateTempChart() {
+    if (!currentData) return;
+
+    const location = document.getElementById('locationSelect').value;
+    const leadTime = document.getElementById('tempBiasLeadTime').value;
+    const timeFrame = document.getElementById('tempBiasTimeFrame').value;
+
+    const tempBiasHistoryResponse = await fetch(
+        `/api/temp-bias-history?location=${encodeURIComponent(location)}&lead_time=${leadTime}&days_back=${timeFrame}`
+    );
+    const tempBiasHistoryData = await tempBiasHistoryResponse.json();
+    const tempHistoryData = tempBiasHistoryData.success ? tempBiasHistoryData.history : null;
+
+    // Re-render just the temperature chart
+    renderTempChart(currentData, tempHistoryData);
+}
+
+// Update just the MSLP chart without reloading everything
+async function updateMslpChart() {
+    if (!currentData) return;
+
+    const location = document.getElementById('locationSelect').value;
+    const leadTime = document.getElementById('mslpBiasLeadTime').value;
+    const timeFrame = document.getElementById('mslpBiasTimeFrame').value;
+
+    const mslpBiasHistoryResponse = await fetch(
+        `/api/mslp-bias-history?location=${encodeURIComponent(location)}&lead_time=${leadTime}&days_back=${timeFrame}`
+    );
+    const mslpBiasHistoryData = await mslpBiasHistoryResponse.json();
+    const mslpHistoryData = mslpBiasHistoryData.success ? mslpBiasHistoryData.history : null;
+
+    // Re-render just the MSLP chart
+    renderMslpChart(currentData, mslpHistoryData);
+}
+
+// Event listeners for temperature bias history controls
+document.getElementById('tempBiasLeadTime').addEventListener('change', updateTempChart);
+document.getElementById('tempBiasTimeFrame').addEventListener('change', updateTempChart);
+
+// Event listeners for MSLP bias history controls
+document.getElementById('mslpBiasLeadTime').addEventListener('change', updateMslpChart);
+document.getElementById('mslpBiasTimeFrame').addEventListener('change', updateMslpChart);
+
+// ============================================================================
+// Rossby Wave Analysis
+// ============================================================================
+
+let waveChart = null;
+
+// Load and display current wave analysis
+async function loadWaveAnalysis() {
+    const location = document.getElementById('locationSelect').value;
+
+    try {
+        const response = await fetch(`/api/wave-analysis?location=${encodeURIComponent(location)}`);
+        const data = await response.json();
+
+        if (!data.success) {
+            console.error('Error loading wave analysis:', data.error);
+            return;
+        }
+
+        // Update GFS
+        if (data.gfs_waves && data.gfs_waves.wave_number !== null) {
+            document.getElementById('gfs-wave-number').textContent = data.gfs_waves.wave_number;
+            document.getElementById('gfs-wave-detail').textContent =
+                `${data.gfs_waves.ridges} ridges, ${data.gfs_waves.troughs} troughs`;
+        } else {
+            document.getElementById('gfs-wave-number').textContent = '-';
+            document.getElementById('gfs-wave-detail').textContent = '';
+        }
+
+        // Update AIFS
+        if (data.aifs_waves && data.aifs_waves.wave_number !== null) {
+            document.getElementById('aifs-wave-number').textContent = data.aifs_waves.wave_number;
+            document.getElementById('aifs-wave-detail').textContent =
+                `${data.aifs_waves.ridges} ridges, ${data.aifs_waves.troughs} troughs`;
+        } else {
+            document.getElementById('aifs-wave-number').textContent = '-';
+            document.getElementById('aifs-wave-detail').textContent = '';
+        }
+
+        // Update IFS
+        if (data.ifs_waves && data.ifs_waves.wave_number !== null) {
+            document.getElementById('ifs-wave-number').textContent = data.ifs_waves.wave_number;
+            document.getElementById('ifs-wave-detail').textContent =
+                `${data.ifs_waves.ridges} ridges, ${data.ifs_waves.troughs} troughs`;
+        } else {
+            document.getElementById('ifs-wave-number').textContent = '-';
+            document.getElementById('ifs-wave-detail').textContent = '';
+        }
+    } catch (error) {
+        console.error('Error loading wave analysis:', error);
+    }
+}
+
+// Load and display combined wave chart (history + forecast)
+async function loadWaveChart() {
+    const location = document.getElementById('locationSelect').value;
+    const daysBack = document.getElementById('waveHistoryDays').value;
+
+    try {
+        // Fetch both historical and forecast data in parallel
+        const [historyResponse, forecastResponse] = await Promise.all([
+            fetch(`/api/wave-time-series?location=${encodeURIComponent(location)}&days_back=${daysBack}`),
+            fetch(`/api/wave-forecast?location=${encodeURIComponent(location)}`)
+        ]);
+
+        const historyData = await historyResponse.json();
+        const forecastData = await forecastResponse.json();
+
+        renderWaveChart(historyData, forecastData);
+    } catch (error) {
+        console.error('Error loading wave chart:', error);
+    }
+}
+
+// Render combined wave chart
+function renderWaveChart(historyData, forecastData) {
+    const ctx = document.getElementById('waveChart');
+
+    // Destroy existing chart
+    if (waveChart) {
+        waveChart.destroy();
+    }
+
+    // Prepare datasets array
+    const datasets = [];
+
+    // Add historical data as a single black line (if available)
+    if (historyData.success && historyData.dates && historyData.dates.length > 0) {
+        // Use the average of all three models for history, or just use one model
+        // For simplicity, let's use GFS historical data as the "history" line
+        const historyLabels = historyData.dates.map(d => {
+            const date = new Date(d);
+            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        });
+
+        datasets.push({
+            label: 'History',
+            data: historyData.gfs,  // Using GFS as representative history
+            borderColor: '#000000',
+            backgroundColor: 'rgba(0, 0, 0, 0.05)',
+            borderWidth: 2.5,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            spanGaps: true
+        });
+    }
+
+    // Add forecast data for each model (if available)
+    if (forecastData.success) {
+        const gfsForecast = forecastData.gfs_forecast || {};
+        const aifsForecast = forecastData.aifs_forecast || {};
+        const ifsForecast = forecastData.ifs_forecast || {};
+
+        if (gfsForecast.times && gfsForecast.times.length > 0) {
+            datasets.push({
+                label: 'GFS Forecast',
+                data: gfsForecast.wave_numbers || [],
+                borderColor: '#0d6efd',
+                backgroundColor: 'rgba(13, 110, 253, 0.1)',
+                borderWidth: 2,
+                tension: 0.3,
+                pointRadius: 3,
+                pointHoverRadius: 6,
+                spanGaps: true
+            });
+        }
+
+        if (aifsForecast.wave_numbers && aifsForecast.wave_numbers.length > 0) {
+            datasets.push({
+                label: 'AIFS Forecast',
+                data: aifsForecast.wave_numbers || [],
+                borderColor: '#0dcaf0',
+                backgroundColor: 'rgba(13, 202, 240, 0.1)',
+                borderWidth: 2,
+                tension: 0.3,
+                pointRadius: 3,
+                pointHoverRadius: 6,
+                spanGaps: true
+            });
+        }
+
+        if (ifsForecast.wave_numbers && ifsForecast.wave_numbers.length > 0) {
+            datasets.push({
+                label: 'IFS Forecast',
+                data: ifsForecast.wave_numbers || [],
+                borderColor: '#20c997',
+                backgroundColor: 'rgba(32, 201, 151, 0.1)',
+                borderWidth: 2,
+                tension: 0.3,
+                pointRadius: 3,
+                pointHoverRadius: 6,
+                spanGaps: true
+            });
+        }
+    }
+
+    // Combine all labels (history + forecast)
+    let allLabels = [];
+    if (historyData.success && historyData.dates) {
+        allLabels = historyData.dates.map(d => {
+            const date = new Date(d);
+            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        });
+    }
+    if (forecastData.success && forecastData.gfs_forecast && forecastData.gfs_forecast.times) {
+        const forecastLabels = forecastData.gfs_forecast.times.map(t => {
+            const date = new Date(t);
+            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        });
+        allLabels = allLabels.concat(forecastLabels);
+    }
+
+    // Pad datasets to match label length
+    datasets.forEach(dataset => {
+        const currentLength = dataset.data.length;
+        if (currentLength < allLabels.length) {
+            // Pad with nulls at the end
+            dataset.data = dataset.data.concat(Array(allLabels.length - currentLength).fill(null));
+        }
+    });
+
+    // For forecast datasets, pad with nulls at the beginning to align with history
+    const historyLength = historyData.success && historyData.dates ? historyData.dates.length : 0;
+    datasets.forEach(dataset => {
+        if (dataset.label !== 'History') {
+            // This is a forecast dataset - shift it to the right
+            const forecastData = dataset.data.filter(d => d !== null);
+            dataset.data = Array(historyLength).fill(null).concat(forecastData);
+        }
+    });
+
+    // Create new chart
+    waveChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: allLabels,
+            datasets: datasets
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 15
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            let label = context.dataset.label || '';
+                            if (label) {
+                                label += ': ';
+                            }
+                            if (context.parsed.y !== null) {
+                                label += context.parsed.y.toFixed(1) + ' waves';
+                            }
+                            return label;
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: {
+                        display: true,
+                        text: 'Wave Number'
+                    },
+                    min: 2,
+                    max: 9,
+                    ticks: {
+                        stepSize: 1
+                    }
+                },
+                x: {
+                    grid: { display: false },
+                    title: {
+                        display: true,
+                        text: 'Date'
+                    },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        maxTicksLimit: 20  // Limit number of x-axis labels
+                    }
+                }
+            }
+        }
+    });
+}
+
 // Initial load
 document.addEventListener('DOMContentLoaded', function() {
     loadForecast();
     loadLeadTimeVerification();
     loadFairfaxTimeSeriesChart();
+    loadWaveAnalysis();
+    loadWaveChart();
 });
 
 </script>
