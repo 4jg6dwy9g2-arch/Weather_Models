@@ -2161,7 +2161,7 @@ def get_verification_time_series_from_cache(
     time_series = cache.get("time_series", {})
     model_data = time_series.get(model.lower(), {})
     var_data = model_data.get(variable, {})
-    lt_data = var_data.get(lead_time_hours)
+    lt_data = var_data.get(str(lead_time_hours))
 
     if not lt_data:
         # No data for this combination, return empty result

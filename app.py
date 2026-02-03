@@ -20,6 +20,7 @@ from ecmwf_aifs import AIFSModel, AIFS_VARIABLES
 from ecmwf_ifs import IFSModel, IFS_VARIABLES
 import weatherlink
 import asos
+import rossby_waves
 
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = Path(__file__).parent / "forecasts.json"
@@ -208,6 +209,16 @@ MSLP_GFS = Variable(
     contour_levels=list(range(960, 1060, 4))
 )
 
+Z500_GFS = Variable(
+    name="z500",
+    display_name="500 hPa Geopotential Height",
+    units="dm",
+    herbie_search=":HGT:500 mb:",
+    category="upper_air",
+    colormap="viridis",
+    contour_levels=list(range(480, 600, 6))
+)
+
 
 # Preset locations (bounds aligned to 0.25 degree grid)
 LOCATIONS = {
@@ -274,12 +285,54 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
 
         times.append((init_time + timedelta(hours=hour)).isoformat())
 
+    # Calculate wave number forecast at 24-hour intervals for 15 days
+    z500_waves = None  # Current wave number (F000)
+    z500_waves_forecast = {
+        "times": [],
+        "wave_numbers": [],
+        "ridges": [],
+        "troughs": []
+    }
+
+    # Calculate at 24-hour intervals up to 360 hours (15 days)
+    wave_forecast_hours = list(range(0, 361, 24))
+    global_region = Region("Global", (-180, 180, 20, 70))
+
+    for fhr in wave_forecast_hours:
+        try:
+            logger.info(f"Calculating Rossby wave number for GFS F{fhr:03d}")
+            z500_data = gfs_model.fetch_data(Z500_GFS, init_time, fhr, global_region)
+            wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
+
+            # Store forecast time series
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
+            z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
+            z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+
+            # Store F000 as current wave number
+            if fhr == 0:
+                z500_waves = wave_metrics
+                logger.info(f"GFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+
+        except Exception as e:
+            logger.warning(f"Wave analysis failed for GFS F{fhr:03d}: {e}")
+            # Add None values to maintain array alignment
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(None)
+            z500_waves_forecast["ridges"].append(None)
+            z500_waves_forecast["troughs"].append(None)
+
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
-        "init_time": init_time.isoformat()
+        "init_time": init_time.isoformat(),
+        "z500_waves": z500_waves,
+        "z500_waves_forecast": z500_waves_forecast
     }
 
 
@@ -354,12 +407,55 @@ def fetch_aifs_data(region, forecast_hours, init_hour: Optional[int] = None):
             else:
                 precips.append(None)
 
+    # Calculate wave number forecast at 24-hour intervals for 15 days
+    z500_waves = None  # Current wave number (F000)
+    z500_waves_forecast = {
+        "times": [],
+        "wave_numbers": [],
+        "ridges": [],
+        "troughs": []
+    }
+
+    # Calculate at 24-hour intervals up to 360 hours (15 days)
+    wave_forecast_hours = list(range(0, 361, 24))
+    global_region = Region("Global", (-180, 180, 20, 70))
+    z500_var = AIFS_VARIABLES["z500"]
+
+    for fhr in wave_forecast_hours:
+        try:
+            logger.info(f"Calculating Rossby wave number for AIFS F{fhr:03d}")
+            z500_data = aifs_model.fetch_data(z500_var, init_time, fhr, global_region)
+            wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
+
+            # Store forecast time series
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
+            z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
+            z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+
+            # Store F000 as current wave number
+            if fhr == 0:
+                z500_waves = wave_metrics
+                logger.info(f"AIFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+
+        except Exception as e:
+            logger.warning(f"Wave analysis failed for AIFS F{fhr:03d}: {e}")
+            # Add None values to maintain array alignment
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(None)
+            z500_waves_forecast["ridges"].append(None)
+            z500_waves_forecast["troughs"].append(None)
+
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
-        "init_time": init_time.isoformat()
+        "init_time": init_time.isoformat(),
+        "z500_waves": z500_waves,
+        "z500_waves_forecast": z500_waves_forecast
     }
 
 
@@ -443,12 +539,55 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
         mslps.append(None)
         times.append(None)
 
+    # Calculate wave number forecast at 24-hour intervals (IFS only goes to 240 hours)
+    z500_waves = None  # Current wave number (F000)
+    z500_waves_forecast = {
+        "times": [],
+        "wave_numbers": [],
+        "ridges": [],
+        "troughs": []
+    }
+
+    # Calculate at 24-hour intervals up to 240 hours (10 days for IFS)
+    wave_forecast_hours = list(range(0, 241, 24))
+    global_region = Region("Global", (-180, 180, 20, 70))
+    z500_var = IFS_VARIABLES["z500"]
+
+    for fhr in wave_forecast_hours:
+        try:
+            logger.info(f"Calculating Rossby wave number for IFS F{fhr:03d}")
+            z500_data = ifs_model.fetch_data(z500_var, init_time, fhr, global_region)
+            wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
+
+            # Store forecast time series
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
+            z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
+            z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+
+            # Store F000 as current wave number
+            if fhr == 0:
+                z500_waves = wave_metrics
+                logger.info(f"IFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+
+        except Exception as e:
+            logger.warning(f"Wave analysis failed for IFS F{fhr:03d}: {e}")
+            # Add None values to maintain array alignment
+            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
+            z500_waves_forecast["times"].append(valid_time)
+            z500_waves_forecast["wave_numbers"].append(None)
+            z500_waves_forecast["ridges"].append(None)
+            z500_waves_forecast["troughs"].append(None)
+
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
-        "init_time": init_time.isoformat()
+        "init_time": init_time.isoformat(),
+        "z500_waves": z500_waves,
+        "z500_waves_forecast": z500_waves_forecast
     }
 
 
@@ -1220,6 +1359,136 @@ def api_verification_by_lead_time():
         return jsonify({"success": False, "error": str(e)})
 
 
+def calculate_temp_bias_history(location_name: str, lead_time_hours: int = 24, days_back: int = 30) -> dict:
+    """
+    Calculate temperature bias history with observed values for visualization.
+    Returns observed temperatures and model biases for each verification time.
+
+    Args:
+        location_name: Location name (e.g., "Fairfax, VA")
+        lead_time_hours: Forecast lead time in hours
+        days_back: Number of days to look back
+
+    Returns:
+        Dict with structure:
+        {
+            "dates": ["2026-01-20T12:00:00", "2026-01-20T18:00:00", ...],
+            "observed": [32.5, 35.2, ...],  # Observed temperature for each time
+            "gfs_bias": [1.2, -0.5, ...],    # GFS bias for each time
+            "aifs_bias": [0.8, -0.3, ...],   # AIFS bias for each time
+            "ifs_bias": [0.5, -0.1, ...]     # IFS bias for each time
+        }
+    """
+    db = load_forecasts_db()
+
+    if location_name not in db:
+        return {"error": "Location not found"}
+
+    runs = db[location_name].get("runs", {})
+    now = datetime.now(timezone.utc)
+    cutoff_date = now - timedelta(days=days_back)
+
+    # Collect individual verification points
+    # Key: valid_time ISO string
+    verification_points = {}
+
+    for run_id, run_data in runs.items():
+        observed = run_data.get("observed")
+        if not observed or not observed.get("temps"):
+            continue
+
+        gfs_data = run_data.get("gfs", {})
+        aifs_data = run_data.get("aifs", {})
+        ifs_data = run_data.get("ifs", {})
+
+        init_time_str = gfs_data.get("init_time")
+        if not init_time_str:
+            continue
+
+        try:
+            init_time = datetime.fromisoformat(init_time_str)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        # Skip runs outside the time window
+        if init_time < cutoff_date:
+            continue
+
+        forecast_times = gfs_data.get("times", [])
+        gfs_temps = gfs_data.get("temps", [])
+        aifs_temps = aifs_data.get("temps", [])
+        ifs_temps = ifs_data.get("temps", []) if ifs_data else []
+        obs_temps = observed.get("temps", [])
+
+        for i, time_str in enumerate(forecast_times):
+            try:
+                valid_time = datetime.fromisoformat(time_str)
+                if valid_time.tzinfo is None:
+                    valid_time = valid_time.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+
+            # Only include past times
+            if valid_time >= now:
+                continue
+
+            # Calculate lead time in hours
+            lead_time = int((valid_time - init_time).total_seconds() / 3600)
+
+            # Only include the requested lead time
+            if lead_time != lead_time_hours:
+                continue
+
+            # Only include 00Z and 12Z verification times (reduce clutter)
+            if valid_time.hour not in [0, 12]:
+                continue
+
+            # Use the valid time as the key
+            time_key = valid_time.isoformat()
+
+            # Only store one verification per valid time (latest forecast run)
+            if i < len(obs_temps) and obs_temps[i] is not None:
+                obs_val = obs_temps[i]
+
+                verification_points[time_key] = {
+                    "observed": obs_val,
+                    "gfs_bias": None,
+                    "aifs_bias": None,
+                    "ifs_bias": None
+                }
+
+                if i < len(gfs_temps) and gfs_temps[i] is not None:
+                    verification_points[time_key]["gfs_bias"] = gfs_temps[i] - obs_val
+
+                if i < len(aifs_temps) and aifs_temps[i] is not None:
+                    verification_points[time_key]["aifs_bias"] = aifs_temps[i] - obs_val
+
+                if ifs_temps and i < len(ifs_temps) and ifs_temps[i] is not None:
+                    verification_points[time_key]["ifs_bias"] = ifs_temps[i] - obs_val
+
+    # Sort by time and build result arrays
+    sorted_times = sorted(verification_points.keys())
+
+    result = {
+        "dates": sorted_times,
+        "observed": [],
+        "gfs_bias": [],
+        "aifs_bias": [],
+        "ifs_bias": []
+    }
+
+    for time_key in sorted_times:
+        point = verification_points[time_key]
+        result["observed"].append(round(point["observed"], 1) if point["observed"] is not None else None)
+        result["gfs_bias"].append(round(point["gfs_bias"], 2) if point["gfs_bias"] is not None else None)
+        result["aifs_bias"].append(round(point["aifs_bias"], 2) if point["aifs_bias"] is not None else None)
+        result["ifs_bias"].append(round(point["ifs_bias"], 2) if point["ifs_bias"] is not None else None)
+
+    return result
+
+
 @app.route('/api/verification-time-series')
 def api_verification_time_series():
     """
@@ -1247,6 +1516,365 @@ def api_verification_time_series():
         })
     except Exception as e:
         logger.error(f"Error calculating verification time series: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/temp-bias-history')
+def api_temp_bias_history():
+    """
+    Get temperature bias history with observed values.
+    Shows observed temperatures and model biases over time.
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+    lead_time = int(request.args.get('lead_time', 24))
+    days_back = int(request.args.get('days_back', 30))
+
+    try:
+        result = calculate_temp_bias_history(location_name, lead_time, days_back)
+
+        if "error" in result:
+            return jsonify({"success": False, "error": result["error"]})
+
+        return jsonify({
+            "success": True,
+            "location": location_name,
+            "lead_time": lead_time,
+            "days_back": days_back,
+            "history": result
+        })
+    except Exception as e:
+        logger.error(f"Error calculating temp bias history: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+def calculate_mslp_bias_history(location_name: str, lead_time_hours: int = 24, days_back: int = 30) -> dict:
+    """
+    Calculate MSLP bias history with observed values for visualization.
+    Returns observed MSLP and model biases for each verification time.
+
+    Args:
+        location_name: Location name (e.g., "Fairfax, VA")
+        lead_time_hours: Forecast lead time in hours
+        days_back: Number of days to look back
+
+    Returns:
+        Dict with structure:
+        {
+            "dates": ["2026-01-20T12:00:00", "2026-01-20T18:00:00", ...],
+            "observed": [1013.2, 1015.8, ...],  # Observed MSLP for each time
+            "gfs_bias": [1.2, -0.5, ...],       # GFS bias for each time
+            "aifs_bias": [0.8, -0.3, ...],      # AIFS bias for each time
+            "ifs_bias": [0.5, -0.1, ...]        # IFS bias for each time
+        }
+    """
+    db = load_forecasts_db()
+
+    if location_name not in db:
+        return {"error": "Location not found"}
+
+    runs = db[location_name].get("runs", {})
+    now = datetime.now(timezone.utc)
+    cutoff_date = now - timedelta(days=days_back)
+
+    # Collect individual verification points
+    # Key: valid_time ISO string
+    verification_points = {}
+
+    for run_id, run_data in runs.items():
+        observed = run_data.get("observed")
+        if not observed or not observed.get("mslps"):
+            continue
+
+        gfs_data = run_data.get("gfs", {})
+        aifs_data = run_data.get("aifs", {})
+        ifs_data = run_data.get("ifs", {})
+
+        init_time_str = gfs_data.get("init_time")
+        if not init_time_str:
+            continue
+
+        try:
+            init_time = datetime.fromisoformat(init_time_str)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        # Skip runs outside the time window
+        if init_time < cutoff_date:
+            continue
+
+        forecast_times = gfs_data.get("times", [])
+        gfs_mslps = gfs_data.get("mslps", [])
+        aifs_mslps = aifs_data.get("mslps", [])
+        ifs_mslps = ifs_data.get("mslps", []) if ifs_data else []
+        obs_mslps = observed.get("mslps", [])
+
+        for i, time_str in enumerate(forecast_times):
+            try:
+                valid_time = datetime.fromisoformat(time_str)
+                if valid_time.tzinfo is None:
+                    valid_time = valid_time.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+
+            # Only include past times
+            if valid_time >= now:
+                continue
+
+            # Calculate lead time in hours
+            lead_time = int((valid_time - init_time).total_seconds() / 3600)
+
+            # Only include the requested lead time
+            if lead_time != lead_time_hours:
+                continue
+
+            # Only include 00Z and 12Z verification times (reduce clutter)
+            if valid_time.hour not in [0, 12]:
+                continue
+
+            # Use the valid time as the key
+            time_key = valid_time.isoformat()
+
+            # Only store one verification per valid time (latest forecast run)
+            if i < len(obs_mslps) and obs_mslps[i] is not None:
+                obs_val = obs_mslps[i]
+
+                verification_points[time_key] = {
+                    "observed": obs_val,
+                    "gfs_bias": None,
+                    "aifs_bias": None,
+                    "ifs_bias": None
+                }
+
+                if i < len(gfs_mslps) and gfs_mslps[i] is not None:
+                    verification_points[time_key]["gfs_bias"] = gfs_mslps[i] - obs_val
+
+                if i < len(aifs_mslps) and aifs_mslps[i] is not None:
+                    verification_points[time_key]["aifs_bias"] = aifs_mslps[i] - obs_val
+
+                if ifs_mslps and i < len(ifs_mslps) and ifs_mslps[i] is not None:
+                    verification_points[time_key]["ifs_bias"] = ifs_mslps[i] - obs_val
+
+    # Sort by time and build result arrays
+    sorted_times = sorted(verification_points.keys())
+
+    result = {
+        "dates": sorted_times,
+        "observed": [],
+        "gfs_bias": [],
+        "aifs_bias": [],
+        "ifs_bias": []
+    }
+
+    for time_key in sorted_times:
+        point = verification_points[time_key]
+        result["observed"].append(round(point["observed"], 1) if point["observed"] is not None else None)
+        result["gfs_bias"].append(round(point["gfs_bias"], 2) if point["gfs_bias"] is not None else None)
+        result["aifs_bias"].append(round(point["aifs_bias"], 2) if point["aifs_bias"] is not None else None)
+        result["ifs_bias"].append(round(point["ifs_bias"], 2) if point["ifs_bias"] is not None else None)
+
+    return result
+
+
+@app.route('/api/mslp-bias-history')
+def api_mslp_bias_history():
+    """
+    Get MSLP bias history with observed values.
+    Shows observed MSLP and model biases over time.
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+    lead_time = int(request.args.get('lead_time', 24))
+    days_back = int(request.args.get('days_back', 30))
+
+    try:
+        result = calculate_mslp_bias_history(location_name, lead_time, days_back)
+
+        if "error" in result:
+            return jsonify({"success": False, "error": result["error"]})
+
+        return jsonify({
+            "success": True,
+            "location": location_name,
+            "lead_time": lead_time,
+            "days_back": days_back,
+            "history": result
+        })
+    except Exception as e:
+        logger.error(f"Error calculating MSLP bias history: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/wave-analysis')
+def api_wave_analysis():
+    """
+    Get Rossby wave numbers for latest forecast run.
+
+    Query params:
+        - location: Location name (default: "Fairfax, VA")
+
+    Returns:
+        {
+            "success": true,
+            "location": "Fairfax, VA",
+            "init_time": "2026-02-02T00:00:00",
+            "gfs_waves": {...},
+            "aifs_waves": {...},
+            "ifs_waves": {...}
+        }
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+
+    try:
+        db = load_forecasts_db()
+        if location_name not in db:
+            return jsonify({"success": False, "error": "Location not found"})
+
+        latest_run = db[location_name].get("latest_run")
+        if not latest_run:
+            return jsonify({"success": False, "error": "No forecast data"})
+
+        run_data = db[location_name]["runs"][latest_run]
+
+        return jsonify({
+            "success": True,
+            "location": location_name,
+            "init_time": latest_run,
+            "gfs_waves": run_data.get("gfs", {}).get("z500_waves"),
+            "aifs_waves": run_data.get("aifs", {}).get("z500_waves"),
+            "ifs_waves": run_data.get("ifs", {}).get("z500_waves")
+        })
+    except Exception as e:
+        logger.error(f"Error fetching wave analysis: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/wave-time-series')
+def api_wave_time_series():
+    """
+    Get historical time series of wave numbers from 00Z runs only.
+
+    Note: Only 00Z model runs are included in the historical time series
+    to maintain consistency in daily wave number tracking.
+
+    Query params:
+        - location: Location name (default: "Fairfax, VA")
+        - days_back: Number of days to look back (default: 30)
+
+    Returns:
+        {
+            "success": true,
+            "location": "Fairfax, VA",
+            "dates": ["2026-01-15T00:00:00", ...],
+            "gfs": [5.5, 6.0, 4.5, ...],
+            "aifs": [5.0, 5.5, 4.0, ...],
+            "ifs": [5.5, 6.0, 4.5, ...]
+        }
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+    days_back = int(request.args.get('days_back', 30))
+
+    try:
+        db = load_forecasts_db()
+        if location_name not in db:
+            return jsonify({"success": False, "error": "Location not found"})
+
+        runs = db[location_name].get("runs", {})
+        now = datetime.now(timezone.utc)
+        cutoff_date = now - timedelta(days=days_back)
+
+        # Collect wave numbers from all runs
+        dates = []
+        gfs_waves = []
+        aifs_waves = []
+        ifs_waves = []
+
+        for run_id, run_data in sorted(runs.items()):
+            try:
+                run_time = datetime.fromisoformat(run_id)
+                if run_time.tzinfo is None:
+                    run_time = run_time.replace(tzinfo=timezone.utc)
+
+                if run_time < cutoff_date:
+                    continue
+
+                # Only include 00Z runs in historical data
+                if run_time.hour != 0:
+                    continue
+
+                # Extract wave numbers (handle None case with 'or {}')
+                gfs_wave = (run_data.get("gfs", {}).get("z500_waves") or {}).get("wave_number")
+                aifs_wave = (run_data.get("aifs", {}).get("z500_waves") or {}).get("wave_number")
+                ifs_wave = (run_data.get("ifs", {}).get("z500_waves") or {}).get("wave_number")
+
+                # Only include if at least one model has data
+                if gfs_wave or aifs_wave or ifs_wave:
+                    dates.append(run_id)
+                    gfs_waves.append(gfs_wave)
+                    aifs_waves.append(aifs_wave)
+                    ifs_waves.append(ifs_wave)
+
+            except (ValueError, TypeError):
+                continue
+
+        return jsonify({
+            "success": True,
+            "location": location_name,
+            "dates": dates,
+            "gfs": gfs_waves,
+            "aifs": aifs_waves,
+            "ifs": ifs_waves
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching wave time series: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/wave-forecast')
+def api_wave_forecast():
+    """
+    Get wave number forecast for the latest run (15-day forecast of wave numbers).
+
+    Query params:
+        - location: Location name (default: "Fairfax, VA")
+
+    Returns:
+        {
+            "success": true,
+            "location": "Fairfax, VA",
+            "init_time": "2026-02-02T00:00:00",
+            "gfs_forecast": {
+                "times": [...],
+                "wave_numbers": [...]
+            },
+            "aifs_forecast": {...},
+            "ifs_forecast": {...}
+        }
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+
+    try:
+        db = load_forecasts_db()
+        if location_name not in db:
+            return jsonify({"success": False, "error": "Location not found"})
+
+        latest_run = db[location_name].get("latest_run")
+        if not latest_run:
+            return jsonify({"success": False, "error": "No forecast data"})
+
+        run_data = db[location_name]["runs"][latest_run]
+
+        return jsonify({
+            "success": True,
+            "location": location_name,
+            "init_time": latest_run,
+            "gfs_forecast": run_data.get("gfs", {}).get("z500_waves_forecast"),
+            "aifs_forecast": run_data.get("aifs", {}).get("z500_waves_forecast"),
+            "ifs_forecast": run_data.get("ifs", {}).get("z500_waves_forecast")
+        })
+    except Exception as e:
+        logger.error(f"Error fetching wave forecast: {e}")
         return jsonify({"success": False, "error": str(e)})
 
 

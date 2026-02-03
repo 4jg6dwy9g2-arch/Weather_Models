@@ -135,6 +135,26 @@ IFS_VARIABLES: Dict[str, Variable] = {
 
     ),
 
+    "z500": Variable(
+
+        name="z500",
+
+        display_name="500 hPa Geopotential Height",
+
+        units="dm",
+
+        ecmwf_param="gh",
+
+        category="upper_air",
+
+        colormap="viridis",
+
+        contour_levels=list(range(480, 600, 6)),
+
+        level="500"
+
+    ),
+
 }
 
 
@@ -480,6 +500,19 @@ class IFSModel(WeatherModel):
             elif units in ["kg m**-2", "kg/m^2", "kg/m²", "mm"]:
                 da = da / 25.4
                 da.attrs['units'] = 'in'
+
+        # Height conversions (m² s⁻² to dm, or m to dm for geopotential height)
+        elif variable.units == "dm":
+            if units in ["m**2 s**-2", "m^2 s^-2", "m**2/s**2"]:
+                # Geopotential to geopotential height: divide by g (9.80665 m/s²), then convert m to dm
+                da = da / 9.80665 / 10
+                da.attrs['units'] = 'dm'
+            elif units == "m":
+                da = da / 10
+                da.attrs['units'] = 'dm'
+            elif units == "gpm":
+                da = da / 10
+                da.attrs['units'] = 'dm'
 
         return da
 
