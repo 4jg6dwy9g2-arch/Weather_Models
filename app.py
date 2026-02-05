@@ -31,6 +31,18 @@ from gfs import GFSModel
 from ecmwf_aifs import AIFSModel, AIFS_VARIABLES
 from ecmwf_ifs import IFSModel, IFS_VARIABLES
 import weatherlink
+from nws_forecast import (
+    get_grid_point,
+    fetch_hourly_forecast,
+    fetch_aqi_forecast,
+    fetch_wind_gusts,
+    rate_running_conditions,
+    calculate_dew_point as nws_calculate_dew_point,
+    is_daylight as nws_is_daylight,
+    IDEAL_TEMP_RANGE
+)
+
+NWS_CACHE_PATH = Path(__file__).resolve().parent / "nws_forecast_cache.json"
 import asos
 import rossby_waves
 
@@ -87,6 +99,88 @@ def load_forecasts_db():
         except Exception as e:
             logger.warning(f"Error loading forecasts.json: {e}")
     return {}
+
+
+def load_nws_cache():
+    """Load cached NWS forecast data."""
+    if NWS_CACHE_PATH.exists():
+        try:
+            with open(NWS_CACHE_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading NWS cache: {e}")
+    return {}
+
+
+def save_nws_cache(payload: dict):
+    """Save NWS forecast data to cache."""
+    try:
+        with open(NWS_CACHE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Error saving NWS cache: {e}")
+
+
+def fetch_nws_forecast_cache(hours_ahead: int = 168):
+    """Fetch NWS forecast and cache it for dashboard overlays."""
+    grid_id, grid_x, grid_y, forecast_url = get_grid_point(DEFAULT_LAT, DEFAULT_LON)
+    forecast = fetch_hourly_forecast(forecast_url)
+    gusts_by_hour = fetch_wind_gusts(grid_id, grid_x, grid_y)
+    aqi_by_date = fetch_aqi_forecast(DEFAULT_LAT, DEFAULT_LON)
+
+    now = datetime.now().astimezone()
+    cutoff = now + timedelta(hours=hours_ahead)
+
+    result = []
+    for hour in forecast:
+        hour_time = datetime.fromisoformat(hour["datetime"])
+        if hour_time > cutoff:
+            break
+
+        aqi = None
+        if aqi_by_date:
+            date_str = hour_time.strftime("%Y-%m-%d")
+            aqi = aqi_by_date.get(date_str)
+
+        score, reasons = rate_running_conditions(hour, aqi=aqi, lat=DEFAULT_LAT, lon=DEFAULT_LON)
+
+        hour_utc = hour_time.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        hour_key = hour_utc.isoformat()
+        gust = gusts_by_hour.get(hour_key) if gusts_by_hour else None
+
+        humidity = hour.get("humidity") or 50
+        dew_point = nws_calculate_dew_point(hour["temperature"], humidity)
+
+        daylight = nws_is_daylight(hour_time.replace(tzinfo=None), DEFAULT_LAT, DEFAULT_LON)
+
+        result.append({
+            "datetime": hour["datetime"],
+            "datetime_local": hour["datetime_local"],
+            "temperature": hour["temperature"],
+            "wind_speed": hour["wind_speed_mph"],
+            "wind_gust": gust or hour["wind_speed_mph"],
+            "wind_direction": hour["wind_direction"],
+            "precipitation_chance": hour["precipitation_chance"],
+            "humidity": humidity,
+            "dew_point": dew_point,
+            "short_forecast": hour["short_forecast"],
+            "aqi": aqi,
+            "score": score,
+            "reasons": reasons,
+            "is_daylight": daylight
+        })
+
+    payload = {
+        "success": True,
+        "location": {"lat": DEFAULT_LAT, "lon": DEFAULT_LON, "grid": grid_id},
+        "fetched_at": datetime.now().isoformat(),
+        "hours_ahead": hours_ahead,
+        "forecast": result,
+        "best_times": sorted(result, key=lambda x: x["score"], reverse=True)[:10],
+        "ideal_temp_range": IDEAL_TEMP_RANGE
+    }
+    save_nws_cache(payload)
+    return payload
 
 
 def migrate_db_format(data: dict) -> dict:
@@ -1125,10 +1219,11 @@ def calculate_lead_time_verification(location_name: str) -> dict:
     now = datetime.now(timezone.utc)
 
     # Collect errors by lead time
-    # Key: lead_time_hours, Value: {"gfs_temp": [...], "aifs_temp": [...], "gfs_mslp": [...], "aifs_mslp": [...]}
+    # Key: lead_time_hours, Value: {"gfs_temp": [...], "aifs_temp": [...], "ifs_temp": [...], "nws_temp": [...], "gfs_mslp": [...], "aifs_mslp": [...], "ifs_mslp": [...]}
     errors_by_lead_time = {}
 
     runs_with_obs = 0
+    obs_by_time = {}
 
     for run_id, run_data in runs.items():
         observed = run_data.get("observed")
@@ -1179,9 +1274,15 @@ def calculate_lead_time_verification(location_name: str) -> dict:
 
             if lead_time_hours not in errors_by_lead_time:
                 errors_by_lead_time[lead_time_hours] = {
-                    "gfs_temp": [], "aifs_temp": [], "ifs_temp": [],
+                    "gfs_temp": [], "aifs_temp": [], "ifs_temp": [], "nws_temp": [],
                     "gfs_mslp": [], "aifs_mslp": [], "ifs_mslp": []
                 }
+
+            # Cache observed temperature by valid time (UTC) for NWS comparisons
+            if i < len(obs_temps):
+                obs_temp = obs_temps[i]
+                if obs_temp is not None:
+                    obs_by_time[valid_time.astimezone(timezone.utc).isoformat()] = obs_temp
 
             # Collect temperature errors
             if i < len(gfs_temps) and i < len(obs_temps):
@@ -1221,6 +1322,46 @@ def calculate_lead_time_verification(location_name: str) -> dict:
                 if ifs_mslp is not None and obs_mslp is not None:
                     errors_by_lead_time[lead_time_hours]["ifs_mslp"].append(ifs_mslp - obs_mslp)
 
+    # NWS verification (temperature only) using cached forecast + WeatherLink observations
+    nws_cache = load_nws_cache()
+    if nws_cache and nws_cache.get("forecast") and nws_cache.get("fetched_at"):
+        try:
+            nws_init = datetime.fromisoformat(nws_cache["fetched_at"])
+            if nws_init.tzinfo is None:
+                nws_init = nws_init.replace(tzinfo=timezone.utc)
+        except Exception:
+            nws_init = None
+
+        if nws_init:
+            for entry in nws_cache.get("forecast", []):
+                try:
+                    valid_time = datetime.fromisoformat(entry["datetime"])
+                    if valid_time.tzinfo is None:
+                        valid_time = valid_time.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+
+                if valid_time >= now:
+                    continue
+
+                # Only include 6-hourly verification times
+                if valid_time.hour % 6 != 0:
+                    continue
+
+                lead_time_hours = int((valid_time - nws_init).total_seconds() / 3600)
+                obs_temp = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
+                temp_val = entry.get("temperature")
+                if obs_temp is None or temp_val is None:
+                    continue
+
+                if lead_time_hours not in errors_by_lead_time:
+                    errors_by_lead_time[lead_time_hours] = {
+                        "gfs_temp": [], "aifs_temp": [], "ifs_temp": [], "nws_temp": [],
+                        "gfs_mslp": [], "aifs_mslp": [], "ifs_mslp": []
+                    }
+
+                errors_by_lead_time[lead_time_hours]["nws_temp"].append(temp_val - obs_temp)
+
     # Calculate statistics for each lead time
     lead_times = sorted(errors_by_lead_time.keys())
 
@@ -1233,6 +1374,8 @@ def calculate_lead_time_verification(location_name: str) -> dict:
         "aifs_temp_bias": [],
         "ifs_temp_mae": [],
         "ifs_temp_bias": [],
+        "nws_temp_mae": [],
+        "nws_temp_bias": [],
         "gfs_mslp_mae": [],
         "gfs_mslp_bias": [],
         "aifs_mslp_mae": [],
@@ -1273,7 +1416,15 @@ def calculate_lead_time_verification(location_name: str) -> dict:
             result["ifs_temp_mae"].append(None)
             result["ifs_temp_bias"].append(None)
 
-        result["temp_sample_counts"].append(max(len(gfs_temp_errors), len(aifs_temp_errors), len(ifs_temp_errors)))
+        nws_temp_errors = errors.get("nws_temp", [])
+        if nws_temp_errors:
+            result["nws_temp_mae"].append(round(sum(abs(e) for e in nws_temp_errors) / len(nws_temp_errors), 2))
+            result["nws_temp_bias"].append(round(sum(nws_temp_errors) / len(nws_temp_errors), 2))
+        else:
+            result["nws_temp_mae"].append(None)
+            result["nws_temp_bias"].append(None)
+
+        result["temp_sample_counts"].append(max(len(gfs_temp_errors), len(aifs_temp_errors), len(ifs_temp_errors), len(nws_temp_errors)))
 
         # MSLP
         gfs_mslp_errors = errors["gfs_mslp"]
@@ -1346,8 +1497,11 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
     fcst_key, obs_key = var_map[variable]
 
     # Collect errors grouped by date
-    # Key: date string (YYYY-MM-DD), Value: {"gfs": [errors], "aifs": [errors], "ifs": [errors]}
+    # Key: date string (YYYY-MM-DD), Value: {"gfs": [errors], "aifs": [errors], "ifs": [errors], "nws": [errors]}
     errors_by_date = {}
+
+    # Build observed lookup by valid time for NWS verification (temp only)
+    obs_by_time = {}
 
     for run_id, run_data in runs.items():
         observed = run_data.get("observed")
@@ -1398,11 +1552,17 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
             if lead_time != lead_time_hours:
                 continue
 
+            # Cache observed values by valid time (UTC) for NWS comparisons
+            if i < len(obs_values):
+                obs_val = obs_values[i]
+                if obs_val is not None:
+                    obs_by_time[valid_time.astimezone(timezone.utc).isoformat()] = obs_val
+
             # Use the date of the valid time for grouping
             date_key = valid_time.date().isoformat()
 
             if date_key not in errors_by_date:
-                errors_by_date[date_key] = {"gfs": [], "aifs": [], "ifs": []}
+                errors_by_date[date_key] = {"gfs": [], "aifs": [], "ifs": [], "nws": []}
 
             # Collect errors for each model
             if i < len(gfs_values) and i < len(obs_values):
@@ -1423,6 +1583,49 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
                 if ifs_val is not None and obs_val is not None:
                     errors_by_date[date_key]["ifs"].append(ifs_val - obs_val)
 
+    # NWS verification (temperature only) using cached forecast + WeatherLink observations
+    if variable == 'temp':
+        nws_cache = load_nws_cache()
+        if nws_cache and nws_cache.get("forecast") and nws_cache.get("fetched_at"):
+            try:
+                nws_init = datetime.fromisoformat(nws_cache["fetched_at"])
+                if nws_init.tzinfo is None:
+                    nws_init = nws_init.replace(tzinfo=timezone.utc)
+            except Exception:
+                nws_init = None
+
+            if nws_init:
+                for entry in nws_cache.get("forecast", []):
+                    try:
+                        valid_time = datetime.fromisoformat(entry["datetime"])
+                        if valid_time.tzinfo is None:
+                            valid_time = valid_time.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+
+                    # Only include past times
+                    if valid_time >= now:
+                        continue
+
+                    # Only include 6-hourly verification times
+                    if valid_time.hour % 6 != 0:
+                        continue
+
+                    # Calculate lead time in hours
+                    lead_time = int((valid_time - nws_init).total_seconds() / 3600)
+                    if lead_time != lead_time_hours:
+                        continue
+
+                    temp_val = entry.get("temperature")
+                    obs_val = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
+                    if temp_val is None or obs_val is None:
+                        continue
+
+                    date_key = valid_time.date().isoformat()
+                    if date_key not in errors_by_date:
+                        errors_by_date[date_key] = {"gfs": [], "aifs": [], "ifs": [], "nws": []}
+                    errors_by_date[date_key]["nws"].append(temp_val - obs_val)
+
     # Calculate daily MAE and Bias
     dates = sorted(errors_by_date.keys())
 
@@ -1432,6 +1635,8 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
         "aifs": {"mae": [], "bias": [], "counts": []},
         "ifs": {"mae": [], "bias": [], "counts": []}
     }
+    if variable == 'temp':
+        result["nws"] = {"mae": [], "bias": [], "counts": []}
 
     for date in dates:
         for model in ["gfs", "aifs", "ifs"]:
@@ -1446,6 +1651,19 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
                 result[model]["mae"].append(None)
                 result[model]["bias"].append(None)
                 result[model]["counts"].append(0)
+
+        if variable == 'temp' and "nws" in errors_by_date[date]:
+            errors = errors_by_date[date]["nws"]
+            if errors:
+                mae = sum(abs(e) for e in errors) / len(errors)
+                bias = sum(errors) / len(errors)
+                result["nws"]["mae"].append(round(mae, 2))
+                result["nws"]["bias"].append(round(bias, 2))
+                result["nws"]["counts"].append(len(errors))
+            else:
+                result["nws"]["mae"].append(None)
+                result["nws"]["bias"].append(None)
+                result["nws"]["counts"].append(0)
 
     return result
 
@@ -1597,6 +1815,12 @@ def sync():
 def current_conditions():
     """Current weather conditions page."""
     return render_template('current.html')
+
+
+@app.route('/forecast')
+def run_forecast_page():
+    """Run forecast page - best times to run based on weather."""
+    return render_template('forecast.html')
 
 
 @app.route('/api/forecast')
@@ -1847,12 +2071,12 @@ def calculate_temp_bias_history(location_name: str, lead_time_hours: int = 24, d
             if lead_time != lead_time_hours:
                 continue
 
-            # Only include 00Z and 12Z verification times (reduce clutter)
-            if valid_time.hour not in [0, 12]:
+            # Only include 6-hourly verification times to match model cycles
+            if valid_time.hour % 6 != 0:
                 continue
 
             # Use the valid time as the key
-            time_key = valid_time.isoformat()
+            time_key = valid_time.astimezone(timezone.utc).isoformat()
 
             # Only store one verification per valid time (latest forecast run)
             if i < len(obs_temps) and obs_temps[i] is not None:
@@ -1986,6 +2210,10 @@ def api_pangu_latest():
     if latest_ref:
         try:
             run_time = datetime.fromisoformat(f"{run.get('init_date')}T{run.get('init_time')}:00:00")
+            if run_time.tzinfo is None:
+                run_time = run_time.replace(tzinfo=timezone.utc)
+            if latest_ref.tzinfo is None:
+                latest_ref = latest_ref.replace(tzinfo=timezone.utc)
             if abs((run_time - latest_ref).total_seconds()) > 24 * 3600:
                 return jsonify({"success": False, "error": "Pangu run too old"}), 200
         except Exception:
@@ -3094,6 +3322,87 @@ def api_asos_verification_map():
         return jsonify({"success": False, "error": str(e)})
 
 
+@app.route("/api/run-forecast")
+def api_run_forecast():
+    """API endpoint for NWS forecast data with run scores."""
+    hours_ahead = request.args.get("hours", 72, type=int)
+    lat = request.args.get("lat", DEFAULT_LAT, type=float)
+    lon = request.args.get("lon", DEFAULT_LON, type=float)
+
+    try:
+        grid_id, grid_x, grid_y, forecast_url = get_grid_point(lat, lon)
+        forecast = fetch_hourly_forecast(forecast_url)
+        gusts_by_hour = fetch_wind_gusts(grid_id, grid_x, grid_y)
+        aqi_by_date = fetch_aqi_forecast(lat, lon)
+
+        now = datetime.now().astimezone()
+        cutoff = now + timedelta(hours=hours_ahead)
+
+        result = []
+        for hour in forecast:
+            hour_time = datetime.fromisoformat(hour["datetime"])
+            if hour_time > cutoff:
+                break
+
+            aqi = None
+            if aqi_by_date:
+                date_str = hour_time.strftime("%Y-%m-%d")
+                aqi = aqi_by_date.get(date_str)
+
+            score, reasons = rate_running_conditions(hour, aqi=aqi, lat=lat, lon=lon)
+
+            hour_utc = hour_time.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            hour_key = hour_utc.isoformat()
+            gust = gusts_by_hour.get(hour_key) if gusts_by_hour else None
+
+            humidity = hour.get("humidity") or 50
+            dew_point = nws_calculate_dew_point(hour["temperature"], humidity)
+
+            daylight = nws_is_daylight(hour_time.replace(tzinfo=None), lat, lon)
+
+            result.append({
+                "datetime": hour["datetime"],
+                "datetime_local": hour["datetime_local"],
+                "temperature": hour["temperature"],
+                "wind_speed": hour["wind_speed_mph"],
+                "wind_gust": gust or hour["wind_speed_mph"],
+                "wind_direction": hour["wind_direction"],
+                "precipitation_chance": hour["precipitation_chance"],
+                "humidity": humidity,
+                "dew_point": dew_point,
+                "short_forecast": hour["short_forecast"],
+                "aqi": aqi,
+                "score": score,
+                "reasons": reasons,
+                "is_daylight": daylight
+            })
+
+        best_times = sorted(result, key=lambda x: x["score"], reverse=True)[:10]
+
+        return jsonify({
+            "success": True,
+            "location": {"lat": lat, "lon": lon, "grid": grid_id},
+            "fetched_at": datetime.now().isoformat(),
+            "hours_ahead": hours_ahead,
+            "forecast": result,
+            "best_times": best_times,
+            "ideal_temp_range": IDEAL_TEMP_RANGE
+        })
+
+    except Exception as e:
+        logger.error(f"Run forecast failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/nws-forecast-cache")
+def api_nws_forecast_cache():
+    """Return cached NWS forecast data (refreshed during sync)."""
+    data = load_nws_cache()
+    if not data:
+        return jsonify({"success": False, "error": "No NWS cache available"}), 200
+    return jsonify(data)
+
+
 @app.route('/api/asos/station-verification')
 def api_asos_station_verification():
     """Get detailed verification for a single station across all lead times."""
@@ -3444,37 +3753,8 @@ def api_sync_logs():
     return Response(event_stream(), mimetype='text/event-stream')
 
 
-@app.route('/api/sync-all')
-def api_sync_all():
-    """
-    Master sync endpoint that syncs everything:
-    - Fairfax WeatherLink forecast data (GFS, AIFS, IFS)
-    - ASOS station forecasts
-    - ASOS observations
-
-    Query params:
-        force: If 'true', force refresh even if data exists
-        init_hour: Optional init hour (0, 6, 12, or 18). If not specified, uses latest available.
-    """
-    force = request.args.get('force', 'false').lower() == 'true'
-    init_hour_param = request.args.get('init_hour')
-
-    # Parse init_hour if provided
-    init_hour = None
-    if init_hour_param:
-        try:
-            init_hour = int(init_hour_param)
-            if init_hour not in [0, 6, 12, 18]:
-                return jsonify({
-                    'success': False,
-                    'error': f'Invalid init_hour {init_hour}. Must be 0, 6, 12, or 18.'
-                })
-        except ValueError:
-            return jsonify({
-                'success': False,
-                'error': f'Invalid init_hour parameter: {init_hour_param}'
-            })
-
+def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dict:
+    """Run the full master sync used by both API and launcher."""
     results = {
         'fairfax': {},
         'asos': {},
@@ -3506,9 +3786,6 @@ def api_sync_all():
             if already_fetched and not force:
                 broadcast_sync_log(f"Fairfax data already cached: {message}", 'info')
                 logger.info(f"Fairfax data already cached: {message}")
-                db = load_forecasts_db()
-                loc_data = db[location]
-                run_data = loc_data.get("runs", {}).get(gfs_init, {})
                 results['fairfax'] = {
                     'status': 'cached',
                     'message': message,
@@ -3554,6 +3831,15 @@ def api_sync_all():
             logger.error(f"Fairfax sync failed: {e}")
             results['fairfax'] = {'status': 'error', 'error': str(e)}
             results['errors'].append(f"Fairfax: {str(e)}")
+
+        # Refresh NWS forecast cache once per sync
+        try:
+            broadcast_sync_log("Refreshing NWS forecast cache...", 'info')
+            fetch_nws_forecast_cache(168)
+            broadcast_sync_log("NWS forecast cache refreshed", 'success')
+        except Exception as e:
+            broadcast_sync_log(f"NWS cache refresh failed: {e}", 'warning')
+            logger.warning(f"NWS cache refresh failed: {e}")
 
         # 2. Sync ASOS forecasts
         broadcast_sync_log("-" * 60, 'info')
@@ -3642,16 +3928,45 @@ def api_sync_all():
             broadcast_sync_log("SYNC COMPLETED SUCCESSFULLY", 'success')
             broadcast_sync_log("=" * 60, 'success')
 
-        return jsonify(results)
+        return results
 
     except Exception as e:
         logger.error(f"Master sync error: {e}")
-        return jsonify({
+        return {
             'success': False,
             'error': str(e),
             'fairfax': results.get('fairfax', {}),
             'asos': results.get('asos', {})
-        })
+        }
+
+
+@app.route('/api/sync-all')
+def api_sync_all():
+    """
+    Master sync endpoint that syncs everything:
+    - Fairfax WeatherLink forecast data (GFS, AIFS, IFS)
+    - ASOS station forecasts
+    - ASOS observations
+    """
+    force = request.args.get('force', 'false').lower() == 'true'
+    init_hour_param = request.args.get('init_hour')
+
+    init_hour = None
+    if init_hour_param:
+        try:
+            init_hour = int(init_hour_param)
+            if init_hour not in [0, 6, 12, 18]:
+                return jsonify({
+                    'success': False,
+                    'error': f'Invalid init_hour {init_hour}. Must be 0, 6, 12, or 18.'
+                })
+        except ValueError:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid init_hour parameter: {init_hour_param}'
+            })
+
+    return jsonify(run_master_sync(force=force, init_hour=init_hour))
 
 
 @app.route('/api/asos/status')

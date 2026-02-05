@@ -85,6 +85,7 @@
                                     <th colspan="2" class="text-center bg-danger bg-opacity-10">GFS Temperature</th>
                                     <th colspan="2" class="text-center bg-warning bg-opacity-10">AIFS Temperature</th>
                                     <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Temperature</th>
+                                    <th colspan="2" class="text-center bg-dark bg-opacity-10">NWS Temperature</th>
                                     <th>Winner</th>
                                     <th colspan="2" class="text-center bg-danger bg-opacity-10">GFS Pressure</th>
                                     <th colspan="2" class="text-center bg-warning bg-opacity-10">AIFS Pressure</th>
@@ -94,6 +95,8 @@
                                 <tr>
                                     <th></th>
                                     <th></th>
+                                    <th class="text-center">MAE</th>
+                                    <th class="text-center">Bias</th>
                                     <th class="text-center">MAE</th>
                                     <th class="text-center">Bias</th>
                                     <th class="text-center">MAE</th>
@@ -112,7 +115,7 @@
                             </thead>
                             <tbody id="verificationTableBody">
                                 <tr>
-                                    <td colspan="16" class="text-center text-muted">Loading...</td>
+                                    <td colspan="18" class="text-center text-muted">Loading...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -383,6 +386,7 @@
 let tempChart, precipChart, mslpChart;
 let currentData = null;
 let panguOverlay = null;
+let nwsOverlay = null;
 
 // Format time for display
 function formatTime(dateStr) {
@@ -425,12 +429,13 @@ async function loadForecast() {
 
     try {
         // Load from saved data, verification, and historical bias for both temp and MSLP
-        const [forecastResponse, verificationResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse, panguResponse] = await Promise.all([
+        const [forecastResponse, verificationResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse, panguResponse, nwsResponse] = await Promise.all([
             fetch(`/api/latest-forecast?location=${encodeURIComponent(location)}`),
             fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`),
             fetch(`/api/temp-bias-history?location=${encodeURIComponent(location)}&lead_time=${tempLeadTime}&days_back=${tempTimeFrame}`),
             fetch(`/api/mslp-bias-history?location=${encodeURIComponent(location)}&lead_time=${mslpLeadTime}&days_back=${mslpTimeFrame}`),
-            fetch(`/api/pangu-latest?location=${encodeURIComponent(location)}`)
+            fetch(`/api/pangu-latest?location=${encodeURIComponent(location)}`),
+            fetch(`/api/nws-forecast-cache`)
         ]);
 
         const data = await forecastResponse.json();
@@ -438,6 +443,7 @@ async function loadForecast() {
         const tempBiasHistoryData = await tempBiasHistoryResponse.json();
         const mslpBiasHistoryData = await mslpBiasHistoryResponse.json();
         const panguData = await panguResponse.json();
+        const nwsData = await nwsResponse.json();
 
         if (!data.success) {
             throw new Error(data.error || 'No saved data available');
@@ -451,7 +457,8 @@ async function loadForecast() {
         const tempHistoryData = tempBiasHistoryData.success ? tempBiasHistoryData.history : null;
         const mslpHistoryData = mslpBiasHistoryData.success ? mslpBiasHistoryData.history : null;
         panguOverlay = panguData && panguData.success ? panguData : null;
-        renderForecastCharts(data, tempHistoryData, mslpHistoryData, panguOverlay);
+        nwsOverlay = nwsData && nwsData.success ? nwsData : null;
+        renderForecastCharts(data, tempHistoryData, mslpHistoryData, panguOverlay, nwsOverlay);
 
         updateInitTimes(data);
         updateFetchedTime(data);
@@ -548,6 +555,8 @@ function renderVerificationTable(v) {
         const aifsTempBias = v.aifs_temp_bias[i];
         const ifsTempMaeVal = ifsTempMae[i];
         const ifsTempBias = v.ifs_temp_bias ? v.ifs_temp_bias[i] : null;
+        const nwsTempMae = v.nws_temp_mae ? v.nws_temp_mae[i] : null;
+        const nwsTempBias = v.nws_temp_bias ? v.nws_temp_bias[i] : null;
 
         // Pressure data
         const gfsMslpMae = v.gfs_mslp_mae[i];
@@ -565,7 +574,8 @@ function renderVerificationTable(v) {
         const tempMaes = [
             { name: 'GFS', mae: gfsTempMae, class: 'badge bg-danger' },
             { name: 'AIFS', mae: aifsTempMae, class: 'badge bg-warning text-dark' },
-            { name: 'IFS', mae: ifsTempMaeVal, class: 'badge bg-success' }
+            { name: 'IFS', mae: ifsTempMaeVal, class: 'badge bg-success' },
+            { name: 'NWS', mae: nwsTempMae, class: 'badge bg-dark' }
         ].filter(m => m.mae !== null && m.mae !== undefined);
 
         if (tempMaes.length > 0) {
@@ -590,6 +600,8 @@ function renderVerificationTable(v) {
             <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + '°F' : '--'}</td>
             <td class="text-center">${ifsTempMaeVal !== null && ifsTempMaeVal !== undefined ? ifsTempMaeVal.toFixed(1) + '°F' : '--'}</td>
             <td class="text-center">${ifsTempBias !== null && ifsTempBias !== undefined ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${nwsTempMae !== null && nwsTempMae !== undefined ? nwsTempMae.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${nwsTempBias !== null && nwsTempBias !== undefined ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) + '°F' : '--'}</td>
             <td><span class="${winnerClass}">${winner}</span></td>
             <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' : '--'}</td>
             <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + ' mb' : '--'}</td>
@@ -604,7 +616,7 @@ function renderVerificationTable(v) {
 }
 
 // Render temperature chart only
-function renderTempChart(data, tempHistoryData, panguData) {
+function renderTempChart(data, tempHistoryData, panguData, nwsData) {
     // Convert forecast data to {x, y} format
     const gfsData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.temps[i] }));
     const aifsData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.temps[i] }));
@@ -620,6 +632,9 @@ function renderTempChart(data, tempHistoryData, panguData) {
     }
     if (panguData && panguData.times) {
         allTimes.push(...panguData.times);
+    }
+    if (nwsData && nwsData.forecast) {
+        allTimes.push(...nwsData.forecast.map(f => f.datetime));
     }
 
     const allDates = allTimes
@@ -739,6 +754,7 @@ function renderTempChart(data, tempHistoryData, panguData) {
             barThickness: 6,
             order: 6
         });
+
     }
 
     // Add forecast lines
@@ -752,7 +768,7 @@ function renderTempChart(data, tempHistoryData, panguData) {
         tension: 0.3,
         pointRadius: 0,
         pointHoverRadius: 5,
-        borderWidth: 2,
+        borderWidth: 1.5,
         order: 1
     });
 
@@ -766,7 +782,7 @@ function renderTempChart(data, tempHistoryData, panguData) {
         tension: 0.3,
         pointRadius: 0,
         pointHoverRadius: 5,
-        borderWidth: 2,
+        borderWidth: 1.5,
         borderDash: [5, 5],
         order: 2
     });
@@ -782,7 +798,7 @@ function renderTempChart(data, tempHistoryData, panguData) {
             tension: 0.3,
             pointRadius: 0,
             pointHoverRadius: 5,
-            borderWidth: 2,
+            borderWidth: 1.5,
             borderDash: [2, 2],
             order: 3
         });
@@ -803,8 +819,29 @@ function renderTempChart(data, tempHistoryData, panguData) {
             tension: 0.3,
             pointRadius: 0,
             pointHoverRadius: 5,
-            borderWidth: 3,
+            borderWidth: 2,
             order: 2
+        });
+    }
+
+    if (nwsData && nwsData.forecast) {
+        const nwsSeries = nwsData.forecast.map(f => ({
+            x: new Date(f.datetime),
+            y: f.temperature
+        }));
+        tempDatasets.push({
+            label: 'NWS Forecast',
+            data: nwsSeries,
+            type: 'line',
+            borderColor: '#000000',
+            backgroundColor: 'rgba(0, 0, 0, 0.0)',
+            fill: false,
+            tension: 0.25,
+            pointRadius: 0,
+            pointHoverRadius: 5,
+            borderWidth: 4,
+            borderDash: [8, 6],
+            order: 0
         });
     }
 
@@ -1198,9 +1235,9 @@ function renderMslpChart(data, mslpHistoryData, panguData) {
 }
 
 // Render charts
-function renderForecastCharts(data, tempHistoryData, mslpHistoryData, panguData) {
+function renderForecastCharts(data, tempHistoryData, mslpHistoryData, panguData, nwsData) {
     // Render temperature and MSLP charts using dedicated functions
-    renderTempChart(data, tempHistoryData, panguData);
+    renderTempChart(data, tempHistoryData, panguData, nwsData);
     renderMslpChart(data, mslpHistoryData, panguData);
 
     // Prepare precipitation chart data
@@ -1562,6 +1599,7 @@ function renderFairfaxTimeSeriesChart(data, metric, variable) {
     const gfsData = metric === 'mae' ? data.gfs.mae : data.gfs.bias;
     const aifsData = metric === 'mae' ? data.aifs.mae : data.aifs.bias;
     const ifsData = metric === 'mae' ? data.ifs.mae : data.ifs.bias;
+    const nwsData = data.nws ? (metric === 'mae' ? data.nws.mae : data.nws.bias) : null;
 
     // Format dates for display
     const labels = data.dates.map(d => {
@@ -1618,7 +1656,18 @@ function renderFairfaxTimeSeriesChart(data, metric, variable) {
                     tension: 0.3,
                     pointRadius: 2,
                     pointHoverRadius: 5
-                }
+                },
+                ...(nwsData ? [{
+                    label: 'NWS',
+                    data: nwsData,
+                    borderColor: '#111111',
+                    backgroundColor: 'rgba(0, 0, 0, 0.05)',
+                    borderWidth: 3,
+                    borderDash: [6, 4],
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 5
+                }] : [])
             ]
         },
         options: {
@@ -1697,7 +1746,7 @@ async function updateTempChart() {
     const tempHistoryData = tempBiasHistoryData.success ? tempBiasHistoryData.history : null;
 
     // Re-render just the temperature chart
-    renderTempChart(currentData, tempHistoryData, panguOverlay);
+    renderTempChart(currentData, tempHistoryData, panguOverlay, nwsOverlay);
 }
 
 // Update just the MSLP chart without reloading everything
