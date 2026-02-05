@@ -796,13 +796,17 @@ def fetch_and_store_observations():
             if not obs_time_str:
                 continue
 
-            # Store observation data
-            db["observations"][station_id][obs_time_str] = {
+            # Store observation data (skip if all values are None)
+            obs_data = {
                 'temp': obs.get('temp'),
                 'mslp': obs.get('mslp'),
                 'precip': obs.get('precip')
             }
-            obs_count += 1
+
+            # Only store if at least one value is not None
+            if any(v is not None for v in obs_data.values()):
+                db["observations"][station_id][obs_time_str] = obs_data
+                obs_count += 1
 
     # Cleanup old data and save
     db = cleanup_old_runs(db)
@@ -1544,7 +1548,7 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
                     if valid_time >= now:
                         continue
 
-                    obs = get_stored_observation(db, station_id, valid_time)
+                    obs = get_cached_observation(station_id, valid_time)
                     if not obs:
                         continue
 
@@ -1661,6 +1665,61 @@ def precompute_verification_cache() -> dict:
         logger.warning("No lead times available for verification cache")
         return {}
 
+    # Build fast observation lookup cache (without 6hr precip pre-calculation)
+    logger.info("Building observation lookup cache...")
+    obs_cache = {}  # {station_id: {valid_time_str: obs_dict}}
+    observations_data = db.get("observations", {})
+
+    for station_id, station_obs in observations_data.items():
+        obs_cache[station_id] = station_obs
+
+    logger.info(f"Built observation cache for {len(obs_cache)} stations")
+
+    # Cache for 6hr precip calculations to avoid recomputing
+    precip_6hr_cache = {}  # {(station_id, time_str): value}
+
+    # Helper function for fast observation lookup
+    def get_cached_observation(station_id: str, target_time: datetime, max_delta_minutes: int = 30):
+        """Fast observation lookup using pre-built cache."""
+        station_cache = obs_cache.get(station_id, {})
+        if not station_cache:
+            return None
+
+        best_match = None
+        best_delta = timedelta(minutes=max_delta_minutes + 1)
+        target_time_str = target_time.isoformat()
+
+        # Quick check for exact match first
+        if target_time_str in station_cache:
+            best_match = station_cache[target_time_str].copy()
+        else:
+            # Find nearest within tolerance
+            for obs_time_str, obs_data in station_cache.items():
+                try:
+                    obs_time = datetime.fromisoformat(obs_time_str)
+                    delta = abs(obs_time - target_time)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_match = obs_data.copy()
+                except ValueError:
+                    continue
+
+        if best_match and best_delta <= timedelta(minutes=max_delta_minutes):
+            # Calculate 6hr precip on demand for synoptic times only
+            if target_time.hour % 6 == 0:
+                cache_key = (station_id, target_time_str)
+                if cache_key in precip_6hr_cache:
+                    best_match['precip_6hr'] = precip_6hr_cache[cache_key]
+                else:
+                    precip_6hr = calculate_6hr_precip_total(db, station_id, target_time)
+                    precip_6hr_cache[cache_key] = precip_6hr
+                    best_match['precip_6hr'] = precip_6hr
+            else:
+                best_match['precip_6hr'] = None
+            return best_match
+
+        return None
+
     # Initialize cache structure
     cache_data = {
         "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -1767,7 +1826,7 @@ def precompute_verification_cache() -> dict:
                     if valid_time >= now:
                         continue
 
-                    obs = get_stored_observation(db, station_id, valid_time)
+                    obs = get_cached_observation(station_id, valid_time)
                     if not obs:
                         continue
 
@@ -1798,9 +1857,9 @@ def precompute_verification_cache() -> dict:
 
     logger.info("Finalizing cache data...")
 
-    # Precompute time series data (all historical data)
-    logger.info("Computing verification time series...")
-    time_series_data = precompute_verification_time_series(db, lead_times)
+    # Precompute time series data (all historical data) using cached observations
+    logger.info("Computing verification time series with cached observations...")
+    time_series_data = precompute_verification_time_series(db, lead_times, obs_cache=obs_cache, get_cached_obs_fn=get_cached_observation)
 
     # Convert to final cache format - by_station
     for station_id in stations:
@@ -1879,7 +1938,7 @@ def load_verification_cache() -> Optional[dict]:
         return None
 
 
-def precompute_verification_time_series(db: dict, lead_times: list, days_back: int = None) -> dict:
+def precompute_verification_time_series(db: dict, lead_times: list, days_back: int = None, obs_cache: dict = None, get_cached_obs_fn=None) -> dict:
     """
     Precompute verification time series data for all models, variables, and lead times.
 
@@ -1890,6 +1949,8 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
         db: Loaded ASOS database
         lead_times: List of lead times to compute for
         days_back: How many days back to compute from current runs (None = all available)
+        obs_cache: Prebuilt observation cache (optional, for performance)
+        get_cached_obs_fn: Function to get cached observations (optional, for performance)
 
     Returns:
         Dict with time series data: {model: {variable: {lead_time: {dates, mae, bias, counts}}}}
@@ -1973,7 +2034,12 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
                     if station_id not in stations:
                         continue
 
-                    obs = get_stored_observation(db, station_id, valid_time)
+                    # Use cached observation lookup if available, otherwise fall back to regular
+                    if get_cached_obs_fn:
+                        obs = get_cached_obs_fn(station_id, valid_time)
+                    else:
+                        obs = get_stored_observation(db, station_id, valid_time)
+
                     if not obs:
                         continue
 

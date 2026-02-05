@@ -837,8 +837,11 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
     mslps = []
     times = []
 
-    # IFS only goes to 240 hours via open data
-    max_ifs_hour = 240
+    # IFS range depends on init time: 00Z/12Z go to 240h, 06Z/18Z go to 144h
+    if init_time.hour in [0, 12]:
+        max_ifs_hour = 240  # 10 days for main synoptic runs
+    else:
+        max_ifs_hour = 144  # 6 days for intermediate runs
     ifs_hours = [h for h in forecast_hours if h <= max_ifs_hour]
 
     for hour in ifs_hours:
@@ -899,8 +902,9 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
         "variance_explained": []
     }
 
-    # Calculate at 24-hour intervals up to 240 hours (10 days for IFS)
-    wave_forecast_hours = list(range(0, 241, 24))
+    # Calculate at 24-hour intervals (range depends on init time)
+    wave_max_hour = 240 if init_time.hour in [0, 12] else 144
+    wave_forecast_hours = list(range(0, wave_max_hour + 1, 24))
     global_region = Region("Global", (-180, 180, 20, 70))
     z500_var = IFS_VARIABLES["z500"]
 
@@ -2899,9 +2903,10 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
     else:
         init_time = model.get_latest_init_time()
 
-    # For IFS, limit to available hours
+    # For IFS, limit to available hours (depends on init time)
     if model_name.lower() == 'ifs':
-        max_ifs_hour = 240
+        # 00Z/12Z go to 240h, 06Z/18Z go to 144h
+        max_ifs_hour = 240 if init_time.hour in [0, 12] else 144
         model_hours = [h for h in forecast_hours if h <= max_ifs_hour]
     else:
         model_hours = forecast_hours
@@ -3203,35 +3208,57 @@ def api_asos_mean_verification():
         if "error" in ifs_results:
             return jsonify({"success": False, "error": ifs_results["error"]}), 404
 
-        # Combine results
+        # Combine results and filter to only lead times with data
         # Assuming lead_times are the same for all models
-        lead_times = gfs_results["lead_times"]
+        all_lead_times = gfs_results["lead_times"]
+
+        # Filter to only include lead times where at least one model has non-null temp data
+        filtered_indices = []
+        for i, lt in enumerate(all_lead_times):
+            has_data = (
+                (gfs_results["temp_mae"][i] is not None) or
+                (aifs_results["temp_mae"][i] is not None) or
+                (ifs_results["temp_mae"][i] is not None)
+            )
+            if has_data:
+                filtered_indices.append(i)
+
+        # Helper to filter array by indices
+        def filter_array(arr, indices):
+            return [arr[i] for i in indices if i < len(arr)]
+
+        lead_times = filter_array(all_lead_times, filtered_indices)
 
         combined_verification = {
             "lead_times": lead_times,
-            "gfs_temp_mae": gfs_results["temp_mae"],
-            "gfs_temp_bias": gfs_results["temp_bias"],
-            "aifs_temp_mae": aifs_results["temp_mae"],
-            "aifs_temp_bias": aifs_results["temp_bias"],
-            "ifs_temp_mae": ifs_results["temp_mae"],
-            "ifs_temp_bias": ifs_results["temp_bias"],
-            "gfs_mslp_mae": gfs_results["mslp_mae"],
-            "gfs_mslp_bias": gfs_results["mslp_bias"],
-            "aifs_mslp_mae": aifs_results["mslp_mae"],
-            "aifs_mslp_bias": aifs_results["mslp_bias"],
-            "ifs_mslp_mae": ifs_results["mslp_mae"],
-            "ifs_mslp_bias": ifs_results["mslp_bias"],
-            "gfs_precip_mae": gfs_results["precip_mae"],
-            "gfs_precip_bias": gfs_results["precip_bias"],
-            "aifs_precip_mae": aifs_results["precip_mae"],
-            "aifs_precip_bias": aifs_results["precip_bias"],
-            "ifs_precip_mae": ifs_results["precip_mae"],
-            "ifs_precip_bias": ifs_results["precip_bias"],
+            "gfs_temp_mae": filter_array(gfs_results["temp_mae"], filtered_indices),
+            "gfs_temp_bias": filter_array(gfs_results["temp_bias"], filtered_indices),
+            "aifs_temp_mae": filter_array(aifs_results["temp_mae"], filtered_indices),
+            "aifs_temp_bias": filter_array(aifs_results["temp_bias"], filtered_indices),
+            "ifs_temp_mae": filter_array(ifs_results["temp_mae"], filtered_indices),
+            "ifs_temp_bias": filter_array(ifs_results["temp_bias"], filtered_indices),
+            "gfs_mslp_mae": filter_array(gfs_results["mslp_mae"], filtered_indices),
+            "gfs_mslp_bias": filter_array(gfs_results["mslp_bias"], filtered_indices),
+            "aifs_mslp_mae": filter_array(aifs_results["mslp_mae"], filtered_indices),
+            "aifs_mslp_bias": filter_array(aifs_results["mslp_bias"], filtered_indices),
+            "ifs_mslp_mae": filter_array(ifs_results["mslp_mae"], filtered_indices),
+            "ifs_mslp_bias": filter_array(ifs_results["mslp_bias"], filtered_indices),
+            "gfs_precip_mae": filter_array(gfs_results["precip_mae"], filtered_indices),
+            "gfs_precip_bias": filter_array(gfs_results["precip_bias"], filtered_indices),
+            "aifs_precip_mae": filter_array(aifs_results["precip_mae"], filtered_indices),
+            "aifs_precip_bias": filter_array(aifs_results["precip_bias"], filtered_indices),
+            "ifs_precip_mae": filter_array(ifs_results["precip_mae"], filtered_indices),
+            "ifs_precip_bias": filter_array(ifs_results["precip_bias"], filtered_indices),
         }
+
+        # Get cache timestamp
+        cache = asos.load_verification_cache()
+        cache_timestamp = cache.get("last_updated") if cache else None
 
         return jsonify({
             "success": True,
-            "verification": combined_verification
+            "verification": combined_verification,
+            "cache_timestamp": cache_timestamp
         })
 
     except Exception as e:
@@ -3300,8 +3327,8 @@ def api_asos_sync():
 
         logger.info(f"Syncing ASOS forecasts for {len(stations)} stations...")
 
-        # Define forecast hours (6-hourly out to 15 days)
-        forecast_hours = list(range(0, 361, 6))
+        # Define forecast hours (6-hourly up to 24h, then 24-hourly to 15 days)
+        forecast_hours = list(range(6, 25, 6)) + list(range(48, 361, 24))
 
         results = {}
 
@@ -3535,7 +3562,8 @@ def api_sync_all():
             ]
             broadcast_sync_log(f"Found {len(stations)} ASOS stations across CONUS", 'info')
 
-            forecast_hours = list(range(0, 361, 6))
+            # Define forecast hours (6-hourly up to 24h, then 24-hourly to 15 days)
+            forecast_hours = list(range(6, 25, 6)) + list(range(48, 361, 24))
             asos_results = {}
 
             # Fetch GFS
