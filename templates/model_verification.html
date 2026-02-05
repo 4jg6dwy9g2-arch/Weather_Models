@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Model Verification - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .verification-tabs {
+        margin-bottom: 1rem;
+    }
+
+    .verification-frame {
+        width: 100%;
+        border: none;
+        min-height: 80vh;
+        height: 1200px;
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+
+    .nav-tabs .nav-link {
+        font-weight: 600;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="forecast-header">
+    <div class="row align-items-center">
+        <div class="col-12">
+            <h1 class="mb-1"><i class="bi bi-clipboard-check"></i> Model Verification</h1>
+            <p class="mb-0 opacity-75">Compare model skill for the Fairfax station and the ASOS network</p>
+        </div>
+    </div>
+</div>
+
+<ul class="nav nav-tabs verification-tabs" id="modelVerificationTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="nav-link active" id="fairfax-tab" data-bs-toggle="tab" data-bs-target="#fairfaxPane" type="button" role="tab" aria-controls="fairfaxPane" aria-selected="true">
+            Fairfax Site
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="asos-tab" data-bs-toggle="tab" data-bs-target="#asosPane" type="button" role="tab" aria-controls="asosPane" aria-selected="false">
+            ASOS Network
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="rossby-tab" data-bs-toggle="tab" data-bs-target="#rossbyPane" type="button" role="tab" aria-controls="rossbyPane" aria-selected="false">
+            Rossby Waves
+        </button>
+    </li>
+</ul>
+
+<div class="tab-content" id="modelVerificationContent">
+    <div class="tab-pane fade show active" id="fairfaxPane" role="tabpanel" aria-labelledby="fairfax-tab">
+        <iframe class="verification-frame" src="/dashboard?embed=1" title="Fairfax Verification"></iframe>
+    </div>
+    <div class="tab-pane fade" id="asosPane" role="tabpanel" aria-labelledby="asos-tab">
+        <iframe class="verification-frame" src="/asos-verification?embed=1" title="ASOS Verification"></iframe>
+    </div>
+    <div class="tab-pane fade" id="rossbyPane" role="tabpanel" aria-labelledby="rossby-tab">
+        <iframe class="verification-frame" src="/rossby?embed=1" title="Rossby Waves"></iframe>
+    </div>
+</div>
+{% endblock %}
