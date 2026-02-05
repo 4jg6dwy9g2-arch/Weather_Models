@@ -32,3 +32,22 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Environment variables
+.env
+
+# Model files (large - don't commit)
+*.onnx
+*.ckpt
+*.npz
+*.npy
+*.nc
+
+# Forecast data files (can be large)
+*.grib
+*.idx
+*.download
+
+# Specific pangu files to ignore
+pangu/test_*.grib
+pangu/pangu_assets/*.download

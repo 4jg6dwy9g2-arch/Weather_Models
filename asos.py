@@ -2211,3 +2211,98 @@ def get_verification_time_series_from_cache(
             "bias": all_bias,
             "counts": all_counts
         }
+
+
+def _calculate_asos_mean_mae(
+    db: dict,
+    run_time_str: str,
+    model: str,
+    variable: str,
+    lead_time_hours: int
+) -> Optional[float]:
+    """
+    Calculate mean MAE across all ASOS stations for a specific run, model, variable, and lead time.
+
+    Args:
+        db: ASOS forecasts database
+        run_time_str: Run time as ISO string (e.g., "2026-02-04T00:00:00")
+        model: Model name ('gfs', 'aifs', 'ifs')
+        variable: Variable name ('temp', 'mslp', 'precip')
+        lead_time_hours: Lead time in hours
+
+    Returns:
+        Mean MAE across all stations, or None if insufficient data
+    """
+    try:
+        run_data = db.get("runs", {}).get(run_time_str)
+        if not run_data:
+            return None
+
+        forecast_hours = run_data.get("forecast_hours", [])
+        if lead_time_hours not in forecast_hours:
+            return None
+
+        fcst_idx = forecast_hours.index(lead_time_hours)
+
+        # Map variable to keys
+        var_map = {
+            'temp': ('temps', 'temp'),
+            'mslp': ('mslps', 'mslp'),
+            'precip': ('precips', 'precip_6hr')
+        }
+
+        if variable not in var_map:
+            return None
+
+        fcst_key, obs_key = var_map[variable]
+
+        # Calculate valid time for this forecast
+        init_time = datetime.fromisoformat(run_time_str)
+        if init_time.tzinfo is None:
+            init_time = init_time.replace(tzinfo=timezone.utc)
+
+        valid_time = init_time + timedelta(hours=lead_time_hours)
+
+        # Skip if valid time is in the future
+        now = datetime.now(timezone.utc)
+        if valid_time >= now:
+            return None
+
+        # Collect errors from all stations
+        errors = []
+        stations = db.get("stations", {})
+        model_data = run_data.get(model.lower())
+
+        if not model_data:
+            return None
+
+        for station_id, fcst_data in model_data.items():
+            if station_id not in stations:
+                continue
+
+            fcst_values = fcst_data.get(fcst_key, [])
+            if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                continue
+
+            fcst_val = fcst_values[fcst_idx]
+
+            # Get observation
+            obs = get_stored_observation(db, station_id, valid_time)
+            if obs is None or obs.get(obs_key) is None:
+                continue
+
+            obs_val = obs[obs_key]
+
+            # Calculate error
+            error = abs(fcst_val - obs_val)
+            errors.append(error)
+
+        # Return mean MAE if we have at least 10 stations
+        if len(errors) >= 10:
+            return sum(errors) / len(errors)
+        else:
+            return None
+
+    except Exception as e:
+        logger.error(f"Error calculating ASOS mean MAE: {e}")
+        return None

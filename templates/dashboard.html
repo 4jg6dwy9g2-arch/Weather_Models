@@ -64,6 +64,10 @@
             <span class="model-dot model-dot-ifs"></span>
             <span>IFS (ECMWF NWP)</span>
         </div>
+        <div class="model-legend-item">
+            <span class="model-dot" style="background-color: #7c3aed;"></span>
+            <span>Pangu (when available)</span>
+        </div>
         <div class="model-legend-item" id="observedLegend" style="display: none;">
             <span class="model-dot" style="background-color: #28a745;"></span>
             <span>Observed (WeatherLink)</span>
@@ -165,65 +169,6 @@
                 <div class="card-body">
                     <div class="chart-container" style="position: relative; height: 400px;">
                         <canvas id="fairfaxTimeSeriesChart"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Rossby Wave Analysis Card -->
-    <div class="row mb-4">
-        <div class="col-12">
-            <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-wind"></i> Rossby Wave Analysis (500 hPa, 55°N)
-                </div>
-                <div class="card-body">
-                    <div class="row text-center">
-                        <div class="col-md-4">
-                            <h5>GFS</h5>
-                            <div class="display-4 text-primary" id="gfs-wave-number">-</div>
-                            <small class="text-muted">waves</small>
-                            <div class="mt-2">
-                                <small id="gfs-wave-detail" class="text-muted"></small>
-                            </div>
-                        </div>
-                        <div class="col-md-4">
-                            <h5>AIFS</h5>
-                            <div class="display-4 text-warning" id="aifs-wave-number">-</div>
-                            <small class="text-muted">waves</small>
-                            <div class="mt-2">
-                                <small id="aifs-wave-detail" class="text-muted"></small>
-                            </div>
-                        </div>
-                        <div class="col-md-4">
-                            <h5>IFS</h5>
-                            <div class="display-4 text-success" id="ifs-wave-number">-</div>
-                            <small class="text-muted">waves</small>
-                            <div class="mt-2">
-                                <small id="ifs-wave-detail" class="text-muted"></small>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="alert alert-info mt-3">
-                        <strong>Interpretation:</strong> Lower wave numbers (2-4) indicate larger, more persistent patterns with better forecast reliability. Higher wave numbers (5-8+) suggest faster-evolving, more chaotic patterns with reduced predictability.
-                    </div>
-
-                    <!-- Combined Forecast & History Chart -->
-                    <div class="mt-4">
-                        <div class="d-flex justify-content-between align-items-center mb-3">
-                            <h6 class="mb-0">Wave Number Forecast & History</h6>
-                            <select class="form-select form-select-sm" id="waveHistoryDays" style="width: auto;">
-                                <option value="7">1 week history</option>
-                                <option value="14">2 weeks history</option>
-                                <option value="30" selected>1 month history</option>
-                                <option value="60">2 months history</option>
-                                <option value="90">3 months history</option>
-                            </select>
-                        </div>
-                        <div class="chart-container" style="position: relative; height: 400px;">
-                            <canvas id="waveChart"></canvas>
-                        </div>
                     </div>
                 </div>
             </div>
@@ -443,6 +388,7 @@
 <script>
 let tempChart, precipChart, mslpChart;
 let currentData = null;
+let panguOverlay = null;
 
 // Format time for display
 function formatTime(dateStr) {
@@ -485,17 +431,19 @@ async function loadForecast() {
 
     try {
         // Load from saved data, verification, and historical bias for both temp and MSLP
-        const [forecastResponse, verificationResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse] = await Promise.all([
+        const [forecastResponse, verificationResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse, panguResponse] = await Promise.all([
             fetch(`/api/latest-forecast?location=${encodeURIComponent(location)}`),
             fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`),
             fetch(`/api/temp-bias-history?location=${encodeURIComponent(location)}&lead_time=${tempLeadTime}&days_back=${tempTimeFrame}`),
-            fetch(`/api/mslp-bias-history?location=${encodeURIComponent(location)}&lead_time=${mslpLeadTime}&days_back=${mslpTimeFrame}`)
+            fetch(`/api/mslp-bias-history?location=${encodeURIComponent(location)}&lead_time=${mslpLeadTime}&days_back=${mslpTimeFrame}`),
+            fetch(`/api/pangu-latest?location=${encodeURIComponent(location)}`)
         ]);
 
         const data = await forecastResponse.json();
         const verificationData = await verificationResponse.json();
         const tempBiasHistoryData = await tempBiasHistoryResponse.json();
         const mslpBiasHistoryData = await mslpBiasHistoryResponse.json();
+        const panguData = await panguResponse.json();
 
         if (!data.success) {
             throw new Error(data.error || 'No saved data available');
@@ -508,7 +456,8 @@ async function loadForecast() {
         // Render combined forecast + historical bias charts
         const tempHistoryData = tempBiasHistoryData.success ? tempBiasHistoryData.history : null;
         const mslpHistoryData = mslpBiasHistoryData.success ? mslpBiasHistoryData.history : null;
-        renderForecastCharts(data, tempHistoryData, mslpHistoryData);
+        panguOverlay = panguData && panguData.success ? panguData : null;
+        renderForecastCharts(data, tempHistoryData, mslpHistoryData, panguOverlay);
 
         updateInitTimes(data);
         updateFetchedTime(data);
@@ -661,7 +610,7 @@ function renderVerificationTable(v) {
 }
 
 // Render temperature chart only
-function renderTempChart(data, tempHistoryData) {
+function renderTempChart(data, tempHistoryData, panguData) {
     // Convert forecast data to {x, y} format
     const gfsData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.temps[i] }));
     const aifsData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.temps[i] }));
@@ -674,6 +623,9 @@ function renderTempChart(data, tempHistoryData) {
     }
     if (tempHistoryData && tempHistoryData.dates) {
         allTimes.push(...tempHistoryData.dates);
+    }
+    if (panguData && panguData.times) {
+        allTimes.push(...panguData.times);
     }
 
     const allDates = allTimes
@@ -842,6 +794,26 @@ function renderTempChart(data, tempHistoryData) {
         });
     }
 
+    if (panguData && panguData.times && panguData.temp_surface) {
+        const panguSeries = panguData.times.map((t, i) => ({
+            x: new Date(t),
+            y: panguData.temp_surface[i]
+        }));
+        tempDatasets.push({
+            label: 'Pangu Forecast',
+            data: panguSeries,
+            type: 'line',
+            borderColor: '#7c3aed',
+            backgroundColor: 'rgba(124, 58, 237, 0.08)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 0,
+            pointHoverRadius: 5,
+            borderWidth: 3,
+            order: 2
+        });
+    }
+
     // Calculate y-axis range
     let tempMin = Infinity;
     let tempMax = -Infinity;
@@ -935,7 +907,7 @@ function renderTempChart(data, tempHistoryData) {
 }
 
 // Render MSLP chart only
-function renderMslpChart(data, mslpHistoryData) {
+function renderMslpChart(data, mslpHistoryData, panguData) {
     // Convert forecast data to {x, y} format
     const gfsMslpData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.mslps[i] }));
     const aifsMslpData = data.aifs.times.map((t, i) => ({ x: new Date(t), y: data.aifs.mslps[i] }));
@@ -948,6 +920,9 @@ function renderMslpChart(data, mslpHistoryData) {
     }
     if (mslpHistoryData && mslpHistoryData.dates) {
         allTimes.push(...mslpHistoryData.dates);
+    }
+    if (panguData && panguData.times) {
+        allTimes.push(...panguData.times);
     }
 
     const allDates = allTimes
@@ -1116,6 +1091,26 @@ function renderMslpChart(data, mslpHistoryData) {
         });
     }
 
+    if (panguData && panguData.times && panguData.pressure_msl) {
+        const panguSeries = panguData.times.map((t, i) => ({
+            x: new Date(t),
+            y: panguData.pressure_msl[i]
+        }));
+        mslpDatasets.push({
+            label: 'Pangu Forecast',
+            data: panguSeries,
+            type: 'line',
+            borderColor: '#7c3aed',
+            backgroundColor: 'rgba(124, 58, 237, 0.08)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 0,
+            pointHoverRadius: 5,
+            borderWidth: 3,
+            order: 2
+        });
+    }
+
     // Calculate y-axis range
     let mslpMin = Infinity;
     let mslpMax = -Infinity;
@@ -1209,10 +1204,10 @@ function renderMslpChart(data, mslpHistoryData) {
 }
 
 // Render charts
-function renderForecastCharts(data, tempHistoryData, mslpHistoryData) {
+function renderForecastCharts(data, tempHistoryData, mslpHistoryData, panguData) {
     // Render temperature and MSLP charts using dedicated functions
-    renderTempChart(data, tempHistoryData);
-    renderMslpChart(data, mslpHistoryData);
+    renderTempChart(data, tempHistoryData, panguData);
+    renderMslpChart(data, mslpHistoryData, panguData);
 
     // Prepare precipitation chart data
     const gfsPrecipData = data.gfs.times.map((t, i) => ({ x: new Date(t), y: data.gfs.precips[i] }));
@@ -1691,8 +1686,6 @@ document.getElementById('locationSelect').addEventListener('change', function() 
     loadForecast();
     loadLeadTimeVerification();
     loadFairfaxTimeSeriesChart();
-    loadWaveAnalysis();
-    loadWaveChart();
 });
 
 // Event listeners for Fairfax time series controls
@@ -1700,9 +1693,6 @@ document.getElementById('fairfaxTsVariable').addEventListener('change', loadFair
 document.getElementById('fairfaxTsMetric').addEventListener('change', loadFairfaxTimeSeriesChart);
 document.getElementById('fairfaxTsLeadTime').addEventListener('change', loadFairfaxTimeSeriesChart);
 document.getElementById('fairfaxTsTimeFrame').addEventListener('change', loadFairfaxTimeSeriesChart);
-
-// Event listener for wave history dropdown
-document.getElementById('waveHistoryDays').addEventListener('change', loadWaveChart);
 
 // Update just the temperature chart without reloading everything
 async function updateTempChart() {
@@ -1719,7 +1709,7 @@ async function updateTempChart() {
     const tempHistoryData = tempBiasHistoryData.success ? tempBiasHistoryData.history : null;
 
     // Re-render just the temperature chart
-    renderTempChart(currentData, tempHistoryData);
+    renderTempChart(currentData, tempHistoryData, panguOverlay);
 }
 
 // Update just the MSLP chart without reloading everything
@@ -1737,7 +1727,7 @@ async function updateMslpChart() {
     const mslpHistoryData = mslpBiasHistoryData.success ? mslpBiasHistoryData.history : null;
 
     // Re-render just the MSLP chart
-    renderMslpChart(currentData, mslpHistoryData);
+    renderMslpChart(currentData, mslpHistoryData, panguOverlay);
 }
 
 // Event listeners for temperature bias history controls
@@ -1748,272 +1738,11 @@ document.getElementById('tempBiasTimeFrame').addEventListener('change', updateTe
 document.getElementById('mslpBiasLeadTime').addEventListener('change', updateMslpChart);
 document.getElementById('mslpBiasTimeFrame').addEventListener('change', updateMslpChart);
 
-// ============================================================================
-// Rossby Wave Analysis
-// ============================================================================
-
-let waveChart = null;
-
-// Load and display current wave analysis
-async function loadWaveAnalysis() {
-    const location = document.getElementById('locationSelect').value;
-
-    try {
-        const response = await fetch(`/api/wave-analysis?location=${encodeURIComponent(location)}`);
-        const data = await response.json();
-
-        if (!data.success) {
-            console.error('Error loading wave analysis:', data.error);
-            return;
-        }
-
-        // Update GFS
-        if (data.gfs_waves && data.gfs_waves.wave_number !== null) {
-            document.getElementById('gfs-wave-number').textContent = data.gfs_waves.wave_number;
-            document.getElementById('gfs-wave-detail').textContent =
-                `${data.gfs_waves.ridges} ridges, ${data.gfs_waves.troughs} troughs`;
-        } else {
-            document.getElementById('gfs-wave-number').textContent = '-';
-            document.getElementById('gfs-wave-detail').textContent = '';
-        }
-
-        // Update AIFS
-        if (data.aifs_waves && data.aifs_waves.wave_number !== null) {
-            document.getElementById('aifs-wave-number').textContent = data.aifs_waves.wave_number;
-            document.getElementById('aifs-wave-detail').textContent =
-                `${data.aifs_waves.ridges} ridges, ${data.aifs_waves.troughs} troughs`;
-        } else {
-            document.getElementById('aifs-wave-number').textContent = '-';
-            document.getElementById('aifs-wave-detail').textContent = '';
-        }
-
-        // Update IFS
-        if (data.ifs_waves && data.ifs_waves.wave_number !== null) {
-            document.getElementById('ifs-wave-number').textContent = data.ifs_waves.wave_number;
-            document.getElementById('ifs-wave-detail').textContent =
-                `${data.ifs_waves.ridges} ridges, ${data.ifs_waves.troughs} troughs`;
-        } else {
-            document.getElementById('ifs-wave-number').textContent = '-';
-            document.getElementById('ifs-wave-detail').textContent = '';
-        }
-    } catch (error) {
-        console.error('Error loading wave analysis:', error);
-    }
-}
-
-// Load and display combined wave chart (history + forecast)
-async function loadWaveChart() {
-    const location = document.getElementById('locationSelect').value;
-    const daysBack = document.getElementById('waveHistoryDays').value;
-
-    try {
-        // Fetch both historical and forecast data in parallel
-        const [historyResponse, forecastResponse] = await Promise.all([
-            fetch(`/api/wave-time-series?location=${encodeURIComponent(location)}&days_back=${daysBack}`),
-            fetch(`/api/wave-forecast?location=${encodeURIComponent(location)}`)
-        ]);
-
-        const historyData = await historyResponse.json();
-        const forecastData = await forecastResponse.json();
-
-        renderWaveChart(historyData, forecastData);
-    } catch (error) {
-        console.error('Error loading wave chart:', error);
-    }
-}
-
-// Render combined wave chart
-function renderWaveChart(historyData, forecastData) {
-    const ctx = document.getElementById('waveChart');
-
-    // Destroy existing chart
-    if (waveChart) {
-        waveChart.destroy();
-    }
-
-    // Prepare datasets array
-    const datasets = [];
-
-    // Add historical data as a single black line (if available)
-    if (historyData.success && historyData.dates && historyData.dates.length > 0) {
-        // Use the average of all three models for history, or just use one model
-        // For simplicity, let's use GFS historical data as the "history" line
-        const historyLabels = historyData.dates.map(d => {
-            const date = new Date(d);
-            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        });
-
-        datasets.push({
-            label: 'History',
-            data: historyData.gfs,  // Using GFS as representative history
-            borderColor: '#000000',
-            backgroundColor: 'rgba(0, 0, 0, 0.05)',
-            borderWidth: 2.5,
-            tension: 0.3,
-            pointRadius: 2,
-            pointHoverRadius: 5,
-            spanGaps: true
-        });
-    }
-
-    // Add forecast data for each model (if available)
-    if (forecastData.success) {
-        const gfsForecast = forecastData.gfs_forecast || {};
-        const aifsForecast = forecastData.aifs_forecast || {};
-        const ifsForecast = forecastData.ifs_forecast || {};
-
-        if (gfsForecast.times && gfsForecast.times.length > 0) {
-            datasets.push({
-                label: 'GFS Forecast',
-                data: gfsForecast.wave_numbers || [],
-                borderColor: '#0d6efd',
-                backgroundColor: 'rgba(13, 110, 253, 0.1)',
-                borderWidth: 2,
-                tension: 0.3,
-                pointRadius: 3,
-                pointHoverRadius: 6,
-                spanGaps: true
-            });
-        }
-
-        if (aifsForecast.wave_numbers && aifsForecast.wave_numbers.length > 0) {
-            datasets.push({
-                label: 'AIFS Forecast',
-                data: aifsForecast.wave_numbers || [],
-                borderColor: '#0dcaf0',
-                backgroundColor: 'rgba(13, 202, 240, 0.1)',
-                borderWidth: 2,
-                tension: 0.3,
-                pointRadius: 3,
-                pointHoverRadius: 6,
-                spanGaps: true
-            });
-        }
-
-        if (ifsForecast.wave_numbers && ifsForecast.wave_numbers.length > 0) {
-            datasets.push({
-                label: 'IFS Forecast',
-                data: ifsForecast.wave_numbers || [],
-                borderColor: '#20c997',
-                backgroundColor: 'rgba(32, 201, 151, 0.1)',
-                borderWidth: 2,
-                tension: 0.3,
-                pointRadius: 3,
-                pointHoverRadius: 6,
-                spanGaps: true
-            });
-        }
-    }
-
-    // Combine all labels (history + forecast)
-    let allLabels = [];
-    if (historyData.success && historyData.dates) {
-        allLabels = historyData.dates.map(d => {
-            const date = new Date(d);
-            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        });
-    }
-    if (forecastData.success && forecastData.gfs_forecast && forecastData.gfs_forecast.times) {
-        const forecastLabels = forecastData.gfs_forecast.times.map(t => {
-            const date = new Date(t);
-            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        });
-        allLabels = allLabels.concat(forecastLabels);
-    }
-
-    // Pad datasets to match label length
-    datasets.forEach(dataset => {
-        const currentLength = dataset.data.length;
-        if (currentLength < allLabels.length) {
-            // Pad with nulls at the end
-            dataset.data = dataset.data.concat(Array(allLabels.length - currentLength).fill(null));
-        }
-    });
-
-    // For forecast datasets, pad with nulls at the beginning to align with history
-    const historyLength = historyData.success && historyData.dates ? historyData.dates.length : 0;
-    datasets.forEach(dataset => {
-        if (dataset.label !== 'History') {
-            // This is a forecast dataset - shift it to the right
-            const forecastData = dataset.data.filter(d => d !== null);
-            dataset.data = Array(historyLength).fill(null).concat(forecastData);
-        }
-    });
-
-    // Create new chart
-    waveChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: allLabels,
-            datasets: datasets
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: {
-                mode: 'index',
-                intersect: false
-            },
-            plugins: {
-                legend: {
-                    position: 'top',
-                    labels: {
-                        usePointStyle: true,
-                        padding: 15
-                    }
-                },
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            let label = context.dataset.label || '';
-                            if (label) {
-                                label += ': ';
-                            }
-                            if (context.parsed.y !== null) {
-                                label += context.parsed.y.toFixed(1) + ' waves';
-                            }
-                            return label;
-                        }
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    grid: { color: '#e0e0e0' },
-                    title: {
-                        display: true,
-                        text: 'Wave Number'
-                    },
-                    min: 2,
-                    max: 9,
-                    ticks: {
-                        stepSize: 1
-                    }
-                },
-                x: {
-                    grid: { display: false },
-                    title: {
-                        display: true,
-                        text: 'Date'
-                    },
-                    ticks: {
-                        maxRotation: 45,
-                        minRotation: 45,
-                        maxTicksLimit: 20  // Limit number of x-axis labels
-                    }
-                }
-            }
-        }
-    });
-}
-
 // Initial load
 document.addEventListener('DOMContentLoaded', function() {
     loadForecast();
     loadLeadTimeVerification();
     loadFairfaxTimeSeriesChart();
-    loadWaveAnalysis();
-    loadWaveChart();
 });
 
 </script>

@@ -1,0 +1,675 @@
+{% extends "pangu_base.html" %}
+
+{% block title %}PanguWeather - Map Viewer{% endblock %}
+
+{% block pangu_content %}
+<div class="row">
+    <div class="col-12">
+        <h2 class="mb-4">
+            <i class="bi bi-map"></i> Spatial Map Viewer
+        </h2>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Controls -->
+    <div class="col-md-3">
+        <div class="card mb-3">
+            <div class="card-header">
+                <h6 class="mb-0"><i class="bi bi-sliders"></i> Comparison Mode</h6>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="viewMode" id="singleView" value="single" checked onchange="toggleViewMode()">
+                        <label class="form-check-label" for="singleView">
+                            Single Map
+                        </label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="viewMode" id="compareView" value="compare" onchange="toggleViewMode()">
+                        <label class="form-check-label" for="compareView">
+                            Side-by-Side Compare
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card mb-3">
+            <div class="card-header">
+                <h6 class="mb-0"><i class="bi bi-sliders"></i> Forecast Runs</h6>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label for="run-select-1" class="form-label">Run 1</label>
+                    <select class="form-select" id="run-select-1">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+                <div class="mb-3" id="run-2-selector" style="display: none;">
+                    <label for="run-select-2" class="form-label">Run 2 (Compare)</label>
+                    <select class="form-select" id="run-select-2">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label for="time-slider" class="form-label">
+                        Time Step: <span id="time-label">0</span> / <span id="time-max">0</span>
+                    </label>
+                    <div class="btn-group w-100 mb-2" role="group">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="goToFirstStep()" title="First">
+                            <i class="bi bi-skip-start-fill"></i>
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="previousStep()" title="Previous">
+                            <i class="bi bi-caret-left-fill"></i>
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="nextStep()" title="Next">
+                            <i class="bi bi-caret-right-fill"></i>
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="goToLastStep()" title="Last">
+                            <i class="bi bi-skip-end-fill"></i>
+                        </button>
+                    </div>
+                    <input type="range" class="form-range" id="time-slider" min="0" max="0" value="0">
+                    <small class="text-muted" id="valid-time"></small>
+                </div>
+            </div>
+        </div>
+
+        <div class="card mb-3">
+            <div class="card-header">
+                <h6 class="mb-0"><i class="bi bi-layers"></i> Variable & Level</h6>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label for="variable-select" class="form-label">Variable</label>
+                    <select class="form-select" id="variable-select">
+                        <option value="t2m">Surface Temperature (t2m)</option>
+                        <option value="msl">Sea Level Pressure (msl)</option>
+                        <option value="t">Temperature (t)</option>
+                        <option value="u">U-Wind (u)</option>
+                        <option value="v">V-Wind (v)</option>
+                        <option value="z">Geopotential (z)</option>
+                        <option value="q">Humidity (q)</option>
+                        <option value="custom_q850_mslp">Custom: 850mb Humidity + MSLP</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label for="level-select" class="form-label">Pressure Level</label>
+                    <select class="form-select" id="level-select">
+                        <option value="surface">Surface</option>
+                        <option value="1000">1000 hPa</option>
+                        <option value="925">925 hPa</option>
+                        <option value="850" selected>850 hPa</option>
+                        <option value="700">700 hPa</option>
+                        <option value="600">600 hPa</option>
+                        <option value="500">500 hPa</option>
+                        <option value="400">400 hPa</option>
+                        <option value="300">300 hPa</option>
+                        <option value="250">250 hPa</option>
+                        <option value="200">200 hPa</option>
+                        <option value="150">150 hPa</option>
+                        <option value="100">100 hPa</option>
+                        <option value="50">50 hPa</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="card mb-3">
+            <div class="card-header">
+                <h6 class="mb-0"><i class="bi bi-globe"></i> Region</h6>
+            </div>
+            <div class="card-body">
+                <select class="form-select" id="region-select">
+                    {% for region in regions.keys() %}
+                    <option value="{{ region }}" {% if region == 'Global' %}selected{% endif %}>{{ region }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+
+        <div class="d-grid gap-2">
+            <button class="btn btn-primary" onclick="loadMap()">
+                <i class="bi bi-arrow-clockwise"></i> Update Map
+            </button>
+        </div>
+
+        <!-- Stats Card -->
+        <div class="card mt-3" id="stats-card" style="display: none;">
+            <div class="card-header">
+                <h6 class="mb-0"><i class="bi bi-graph-up"></i> Statistics</h6>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm mb-0">
+                    <tr>
+                        <td>Min:</td>
+                        <td class="text-end" id="stat-min">-</td>
+                    </tr>
+                    <tr>
+                        <td>Max:</td>
+                        <td class="text-end" id="stat-max">-</td>
+                    </tr>
+                    <tr>
+                        <td>Mean:</td>
+                        <td class="text-end" id="stat-mean">-</td>
+                    </tr>
+                    <tr>
+                        <td>Std Dev:</td>
+                        <td class="text-end" id="stat-std">-</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Map Display -->
+    <div class="col-md-9">
+        <!-- Single Map View -->
+        <div class="card" id="single-map-view">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="bi bi-image"></i> Forecast Map
+                    <span class="float-end">
+                        <button class="btn btn-sm btn-outline-secondary" onclick="downloadMap(1)">
+                            <i class="bi bi-download"></i> Download
+                        </button>
+                        <!-- New Animation Button -->
+                        <button class="btn btn-sm btn-outline-primary ms-2" onclick="animateTimesteps()">
+                            <i class="bi bi-film"></i> Animate
+                        </button>
+                    </span>
+                </h5>
+            </div>
+            <div class="card-body">
+                <div id="map-container-1" style="min-height: 600px; text-align: center; display: flex; align-items: center; justify-content: center;">
+                    <div class="text-muted">
+                        <i class="bi bi-map" style="font-size: 4rem; opacity: 0.3;"></i>
+                        <p class="mt-3">Select a forecast run and click "Update Map" to view spatial data</p>
+                    </div>
+                </div>
+                <div id="loading-spinner-1" style="display: none; text-align: center; padding: 3rem;">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="mt-3 text-muted">Generating map...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Comparison View -->
+        <div id="compare-map-view" style="display: none;">
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6 class="mb-0">
+                                <i class="bi bi-image"></i> <span id="map-title-1">Run 1</span>
+                                <button class="btn btn-sm btn-outline-secondary float-end" onclick="downloadMap(1)">
+                                    <i class="bi bi-download"></i>
+                                </button>
+                            </h6>
+                        </div>
+                        <div class="card-body">
+                            <div id="map-container-compare-1" style="min-height: 500px; text-align: center;">
+                                <div class="text-muted">
+                                    <i class="bi bi-map" style="font-size: 3rem; opacity: 0.3;"></i>
+                                    <p class="mt-2">Map 1</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6 class="mb-0">
+                                <i class="bi bi-image"></i> <span id="map-title-2">Run 2</span>
+                                <button class="btn btn-sm btn-outline-secondary float-end" onclick="downloadMap(2)">
+                                    <i class="bi bi-download"></i>
+                                </button>
+                            </h6>
+                        </div>
+                        <div class="card-body">
+                            <div id="map-container-compare-2" style="min-height: 500px; text-align: center;">
+                                <div class="text-muted">
+                                    <i class="bi bi-map" style="font-size: 3rem; opacity: 0.3;"></i>
+                                    <p class="mt-2">Map 2</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="loading-spinner-2" style="display: none; text-align: center; padding: 3rem;">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+                <p class="mt-3 text-muted">Generating maps...</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let currentMapData = [null, null];
+let viewMode = 'single';
+
+function toggleViewMode() {
+    viewMode = document.querySelector('input[name="viewMode"]:checked').value;
+
+    if (viewMode === 'single') {
+        document.getElementById('single-map-view').style.display = 'block';
+        document.getElementById('compare-map-view').style.display = 'none';
+        document.getElementById('run-2-selector').style.display = 'none';
+    } else {
+        document.getElementById('single-map-view').style.display = 'none';
+        document.getElementById('compare-map-view').style.display = 'block';
+        document.getElementById('run-2-selector').style.display = 'block';
+    }
+}
+
+let allRuns = [];
+
+function getRunById(runId) {
+    return allRuns.find(r => r.run_id === runId);
+}
+
+function loadRuns() {
+    fetch('/pangu/api/runs')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success && data.runs.length > 0) {
+                allRuns = data.runs;
+                const select1 = document.getElementById('run-select-1');
+                const select2 = document.getElementById('run-select-2');
+
+                select1.innerHTML = '';
+                select2.innerHTML = '';
+
+                data.runs.forEach((run, index) => {
+                    // Create label with climate info
+                    let label = `${run.init_date} ${run.init_time}Z - F${run.lead_time}`;
+                    if (run.climate_scenario) {
+                        label += ` (Climate +${run.temp_offset}°C)`;
+                    } else if (run.ensemble) {
+                        label += ` (Ensemble x${(run.members || []).length})`;
+                    }
+
+                    const option1 = document.createElement('option');
+                    option1.value = run.run_id;
+                    option1.textContent = label;
+                    option1.dataset.leadTime = run.lead_time;
+                    option1.dataset.ensemble = run.ensemble ? '1' : '0';
+                    option1.dataset.members = (run.members || []).length;
+                    select1.appendChild(option1);
+
+                    const option2 = document.createElement('option');
+                    option2.value = run.run_id;
+                    option2.textContent = label;
+                    option2.dataset.leadTime = run.lead_time;
+                    option2.dataset.ensemble = run.ensemble ? '1' : '0';
+                    option2.dataset.members = (run.members || []).length;
+                    select2.appendChild(option2);
+
+                    // Select second run for comparison if available
+                    if (index === 1) {
+                        option2.selected = true;
+                    }
+                });
+
+                // Update time slider for selected run
+                updateTimeSlider();
+
+                // Load map for first run automatically
+                loadMap();
+            } else {
+                document.getElementById('run-select-1').innerHTML = '<option value="">No runs available</option>';
+                document.getElementById('run-select-2').innerHTML = '<option value="">No runs available</option>';
+            }
+        })
+        .catch(err => {
+            console.error('Error loading runs:', err);
+        });
+}
+
+function updateTimeSlider() {
+    const select1 = document.getElementById('run-select-1');
+    const selectedOption1 = select1.options[select1.selectedIndex];
+
+    if (!selectedOption1 || !selectedOption1.dataset.leadTime) {
+        return;
+    }
+
+    let leadTime1 = parseInt(selectedOption1.dataset.leadTime);
+    let finalLeadTime = leadTime1;
+
+    if (viewMode === 'compare') {
+        const select2 = document.getElementById('run-select-2');
+        const selectedOption2 = select2.options[select2.selectedIndex];
+        if (selectedOption2 && selectedOption2.dataset.leadTime) {
+            let leadTime2 = parseInt(selectedOption2.dataset.leadTime);
+            finalLeadTime = Math.min(leadTime1, leadTime2);
+        }
+    }
+
+    // PanguWeather outputs every 6 hours, so number of steps = lead_time / 6
+    const numSteps = Math.floor(finalLeadTime / 6);
+
+    const slider = document.getElementById('time-slider');
+    slider.max = numSteps;
+    slider.value = Math.min(slider.value, numSteps);
+
+    document.getElementById('time-max').textContent = numSteps;
+    document.getElementById('time-label').textContent = slider.value;
+}
+
+function loadMap() {
+    if (viewMode === 'single') {
+        loadSingleMap();
+    } else {
+        loadComparisonMaps();
+    }
+}
+
+function loadSingleMap() {
+    const runId = document.getElementById('run-select-1').value;
+    const variable = document.getElementById('variable-select').value;
+    const level = document.getElementById('level-select').value;
+    const timeIndex = document.getElementById('time-slider').value;
+    const region = document.getElementById('region-select').value;
+
+    if (!runId) {
+        alert('Please select a forecast run');
+        return;
+    }
+
+    const run = getRunById(runId);
+    if (run && run.ensemble) {
+        loadEnsembleMaps(run, variable, level, timeIndex, region);
+        return;
+    }
+
+    // Show loading spinner
+    document.getElementById('map-container-1').style.display = 'none';
+    document.getElementById('loading-spinner-1').style.display = 'block';
+    document.getElementById('stats-card').style.display = 'none';
+
+    const url = `/pangu/api/spatial-data?run_id=${encodeURIComponent(runId)}&variable=${variable}&level=${level}&time_index=${timeIndex}&region=${encodeURIComponent(region)}`;
+
+    fetch(url)
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                currentMapData[0] = data;
+                displayMapInContainer(data, 'map-container-1');
+                displayStats(data.stats);
+                document.getElementById('valid-time').textContent = data.valid_time;
+            } else {
+                alert(`Error: ${data.error}`);
+            }
+        })
+        .catch(err => {
+            console.error('Error loading map:', err);
+            alert('Error loading map');
+        })
+        .finally(() => {
+            document.getElementById('loading-spinner-1').style.display = 'none';
+            document.getElementById('map-container-1').style.display = 'block';
+        });
+}
+
+function loadEnsembleMaps(run, variable, level, timeIndex, region) {
+    const container = document.getElementById('map-container-1');
+    container.style.display = 'none';
+    document.getElementById('loading-spinner-1').style.display = 'block';
+    document.getElementById('stats-card').style.display = 'none';
+
+    const members = run.members || [];
+    if (members.length === 0) {
+        alert('Ensemble run has no members to display');
+        document.getElementById('loading-spinner-1').style.display = 'none';
+        return;
+    }
+
+    const requests = members.map(member => {
+        const memberId = member.member_id;
+        const url = `/pangu/api/spatial-data?run_id=${encodeURIComponent(run.run_id)}&member_id=${memberId}` +
+            `&variable=${variable}&level=${level}&time_index=${timeIndex}&region=${encodeURIComponent(region)}`;
+        return fetch(url).then(res => res.json());
+    });
+
+    Promise.all(requests)
+        .then(results => {
+            const successful = results.filter(r => r.success);
+            if (successful.length === 0) {
+                alert('Error loading ensemble maps');
+                return;
+            }
+
+            const cols = 3;
+            let html = '<div class="row g-3">';
+            successful.forEach((data, idx) => {
+                const memberLabel = members[idx] && members[idx].member_id !== undefined
+                    ? `M${String(members[idx].member_id).padStart(3, '0')}`
+                    : `M${String(idx).padStart(3, '0')}`;
+                html += `
+                    <div class="col-md-4">
+                        <div class="card">
+                            <div class="card-header">
+                                <strong>${memberLabel}</strong>
+                            </div>
+                            <div class="card-body">
+                                <img src="${data.map_image}" alt="Forecast Map ${memberLabel}" style="max-width: 100%; height: auto; border-radius: 8px;">
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            container.innerHTML = html;
+            document.getElementById('valid-time').textContent = successful[0].valid_time || '';
+        })
+        .catch(err => {
+            console.error('Error loading ensemble maps:', err);
+            alert('Error loading ensemble maps');
+        })
+        .finally(() => {
+            document.getElementById('loading-spinner-1').style.display = 'none';
+            container.style.display = 'block';
+        });
+}
+
+function loadComparisonMaps() {
+    const runId1 = document.getElementById('run-select-1').value;
+    const runId2 = document.getElementById('run-select-2').value;
+    const variable = document.getElementById('variable-select').value;
+    const level = document.getElementById('level-select').value;
+    const timeIndex = document.getElementById('time-slider').value;
+    const region = document.getElementById('region-select').value;
+
+    if (!runId1 || !runId2) {
+        alert('Please select both forecast runs');
+        return;
+    }
+
+    const run1 = getRunById(runId1);
+    const run2 = getRunById(runId2);
+    if ((run1 && run1.ensemble) || (run2 && run2.ensemble)) {
+        alert('Compare mode does not support ensemble runs yet. Please switch to Single view.');
+        return;
+    }
+
+    document.getElementById('loading-spinner-2').style.display = 'block';
+
+    // Load both maps
+    Promise.all([
+        fetch(`/pangu/api/spatial-data?run_id=${encodeURIComponent(runId1)}&variable=${variable}&level=${level}&time_index=${timeIndex}&region=${encodeURIComponent(region)}`).then(res => res.json()),
+        fetch(`/pangu/api/spatial-data?run_id=${encodeURIComponent(runId2)}&variable=${variable}&level=${level}&time_index=${timeIndex}&region=${encodeURIComponent(region)}`).then(res => res.json())
+    ])
+    .then(([data1, data2]) => {
+        if (data1.success && data2.success) {
+            currentMapData[0] = data1;
+            currentMapData[1] = data2;
+
+            displayMapInContainer(data1, 'map-container-compare-1');
+            displayMapInContainer(data2, 'map-container-compare-2');
+
+            // Update titles
+            const select1 = document.getElementById('run-select-1');
+            const select2 = document.getElementById('run-select-2');
+            document.getElementById('map-title-1').textContent = select1.options[select1.selectedIndex].text;
+            document.getElementById('map-title-2').textContent = select2.options[select2.selectedIndex].text;
+
+            document.getElementById('valid-time').textContent = data1.valid_time;
+        } else {
+            alert(`Error loading maps`);
+        }
+    })
+    .catch(err => {
+        console.error('Error loading maps:', err);
+        alert('Error loading maps');
+    })
+    .finally(() => {
+        document.getElementById('loading-spinner-2').style.display = 'none';
+    });
+}
+
+function displayMapInContainer(data, containerId) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = `<img src="${data.map_image}" alt="Forecast Map" style="max-width: 100%; height: auto; border-radius: 8px;">`;
+}
+
+function displayStats(stats) {
+    document.getElementById('stat-min').textContent = stats.min.toFixed(2);
+    document.getElementById('stat-max').textContent = stats.max.toFixed(2);
+    document.getElementById('stat-mean').textContent = stats.mean.toFixed(2);
+    document.getElementById('stat-std').textContent = stats.std.toFixed(2);
+    document.getElementById('stats-card').style.display = 'block';
+}
+
+function downloadMap(mapIndex = 1) {
+    const data = currentMapData[mapIndex - 1];
+    if (!data || !data.map_image) {
+        alert('No map to download');
+        return;
+    }
+
+    // Create download link
+    const link = document.createElement('a');
+    link.href = data.map_image;
+    link.download = `pangu_${data.variable}_${data.level}_${data.region}_map${mapIndex}.png`;
+    link.click();
+}
+
+function animateTimesteps() {
+    const runId = document.getElementById('run-select-1').value;
+    const variable = document.getElementById('variable-select').value;
+    const level = document.getElementById('level-select').value;
+    const region = document.getElementById('region-select').value;
+
+    if (!runId) {
+        alert('Please select a forecast run first.');
+        return;
+    }
+
+    // Show loading spinner for animation
+    const animateButton = document.querySelector('button[onclick="animateTimesteps()"]');
+    animateButton.disabled = true;
+    animateButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Generating GIF...';
+
+    const url = `/pangu/api/animate-spatial-data?run_id=${encodeURIComponent(runId)}&variable=${variable}&level=${level}&region=${encodeURIComponent(region)}`;
+
+    fetch(url)
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(errorData => {
+                    throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+                });
+            }
+            return response.blob();
+        })
+        .then(blob => {
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = `pangu_animation_${variable}_${level}_${region}.gif`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            alert('GIF animation generated and download started!');
+        })
+        .catch(e => {
+            console.error('Error generating GIF:', e);
+            alert(`Error generating GIF: ${e.message}`);
+        })
+        .finally(() => {
+            animateButton.disabled = false;
+            animateButton.innerHTML = '<i class="bi bi-film"></i> Animate';
+        });
+}
+
+// Time step navigation functions
+function goToFirstStep() {
+    const slider = document.getElementById('time-slider');
+    slider.value = 0;
+    document.getElementById('time-label').textContent = 0;
+    loadMap();
+}
+
+function previousStep() {
+    const slider = document.getElementById('time-slider');
+    const currentValue = parseInt(slider.value);
+    if (currentValue > 0) {
+        slider.value = currentValue - 1;
+        document.getElementById('time-label').textContent = slider.value;
+        loadMap();
+    }
+}
+
+function nextStep() {
+    const slider = document.getElementById('time-slider');
+    const currentValue = parseInt(slider.value);
+    const maxValue = parseInt(slider.max);
+    if (currentValue < maxValue) {
+        slider.value = currentValue + 1;
+        document.getElementById('time-label').textContent = slider.value;
+        loadMap();
+    }
+}
+
+function goToLastStep() {
+    const slider = document.getElementById('time-slider');
+    slider.value = slider.max;
+    document.getElementById('time-label').textContent = slider.max;
+    loadMap();
+}
+
+// Update time label when slider changes
+document.getElementById('time-slider').addEventListener('input', (e) => {
+    document.getElementById('time-label').textContent = e.target.value;
+});
+
+// Auto-load on control changes
+document.getElementById('variable-select').addEventListener('change', loadMap);
+document.getElementById('level-select').addEventListener('change', loadMap);
+document.getElementById('region-select').addEventListener('change', loadMap);
+document.getElementById('time-slider').addEventListener('change', loadMap);
+
+// Update time slider when run selection changes
+document.getElementById('run-select-1').addEventListener('change', () => {
+    updateTimeSlider();
+    loadMap();
+});
+document.getElementById('run-select-2').addEventListener('change', loadMap);
+
+// Load runs on page load
+document.addEventListener('DOMContentLoaded', () => {
+    loadRuns();
+});
+</script>
+{% endblock %}
