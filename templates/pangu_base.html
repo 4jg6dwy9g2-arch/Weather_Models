@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+
+{% block title %}Pangu AI Modeling{% endblock %}
+
+{% block extra_css %}
+<style>
+    .pangu-page-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 12px;
+    }
+
+    .pangu-subnav {
+        background: #ffffff;
+        border: 1px solid #e0e0e0;
+        border-radius: 12px;
+        padding: 10px 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        margin-bottom: 20px;
+    }
+
+    .pangu-subnav .nav-link {
+        color: #444444;
+        font-weight: 600;
+    }
+
+    .pangu-subnav .nav-link.active {
+        background-color: var(--accent-blue);
+        color: #ffffff !important;
+    }
+
+    .pangu-stat-card {
+        text-align: center;
+        padding: 1.5rem;
+    }
+
+    .pangu-stat-value {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #7c3aed;
+    }
+
+    .pangu-stat-label {
+        color: #666666;
+        font-size: 0.85rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-top: 0.5rem;
+    }
+
+    .log-container {
+        background-color: #1e1e1e;
+        color: #d4d4d4;
+        font-family: 'Courier New', monospace;
+        padding: 1rem;
+        border-radius: 8px;
+        max-height: 400px;
+        overflow-y: auto;
+        font-size: 0.9rem;
+    }
+
+    .log-info { color: #4fc3f7; }
+    .log-success { color: #66bb6a; }
+    .log-warning { color: #ffa726; }
+    .log-error { color: #ef5350; }
+
+    .run-item {
+        padding: 1rem;
+        border-bottom: 1px solid #e8e8e8;
+        transition: background-color 0.2s;
+    }
+
+    .run-item:hover {
+        background-color: #f8f8f8;
+        cursor: pointer;
+    }
+
+    .run-item:last-child {
+        border-bottom: none;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="pangu-page-title">
+    <h2 class="mb-0"><i class="bi bi-cloud-rain"></i> Pangu AI Modeling</h2>
+    <span class="text-muted">PanguWeather dashboard, run manager, and map viewer</span>
+</div>
+
+<div class="pangu-subnav">
+    <ul class="nav nav-pills">
+        <li class="nav-item">
+            <a class="nav-link {% if request.path == '/pangu' or request.path == '/pangu/' %}active{% endif %}" href="/pangu">Dashboard</a>
+        </li>
+        <li class="nav-item">
+            <a class="nav-link {% if request.path == '/pangu/map' %}active{% endif %}" href="/pangu/map">Map Viewer</a>
+        </li>
+        <li class="nav-item">
+            <a class="nav-link {% if request.path == '/pangu/run' %}active{% endif %}" href="/pangu/run">Run Forecast</a>
+        </li>
+    </ul>
+</div>
+
+{% block pangu_content %}{% endblock %}
+{% endblock %}

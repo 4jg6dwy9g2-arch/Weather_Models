@@ -1,0 +1,524 @@
+{% extends "pangu_base.html" %}
+
+{% block title %}AI Weather Models - Dashboard{% endblock %}
+
+{% block pangu_content %}
+<div class="row">
+    <div class="col-12">
+        <h2 class="mb-4">
+            <i class="bi bi-grid"></i> Forecast Dashboard
+        </h2>
+    </div>
+</div>
+
+<!-- Stats Row -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body stat-card">
+                <div class="stat-value" id="total-runs">-</div>
+                <div class="stat-label">Total Runs</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body stat-card">
+                <div class="stat-value" id="latest-init">-</div>
+                <div class="stat-label">Latest Init Time</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body stat-card">
+                <div class="stat-value" id="max-lead-time">-</div>
+                <div class="stat-label">Max Lead Time (hrs)</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body stat-card">
+                <div class="stat-value text-success" id="model-status">Ready</div>
+                <div class="stat-label">Model Status</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Latest Forecast Chart -->
+<div class="row mb-4" id="latest-forecast-section" style="display: none;">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <div class="row align-items-center">
+                    <div class="col-md-3">
+                        <h5 class="mb-0">
+                            <i class="bi bi-graph-up"></i> Fairfax, VA Forecast
+                        </h5>
+                    </div>
+                    <div class="col-md-3">
+                        <select class="form-select form-select-sm" id="variable-selector" onchange="updateChart()">
+                            <option value="temp_surface">Temperature @ Surface (2m)</option>
+                            <option value="pressure_msl">Sea Level Pressure</option>
+                            <option value="temp_850">Temperature @ 850hPa</option>
+                            <option value="temp_700">Temperature @ 700hPa</option>
+                            <option value="temp_500">Temperature @ 500hPa</option>
+                            <option value="temp_250">Temperature @ 250hPa</option>
+                            <option value="wind_speed_850">Wind Speed @ 850hPa</option>
+                            <option value="wind_speed_500">Wind Speed @ 500hPa</option>
+                            <option value="geopotential_850">Geopotential @ 850hPa</option>
+                            <option value="geopotential_500">Geopotential @ 500hPa</option>
+                            <option value="humidity_850">Humidity @ 850hPa</option>
+                            <option value="humidity_700">Humidity @ 700hPa</option>
+                        </select>
+                    </div>
+                    <div class="col-md-3">
+                        <button class="btn btn-sm btn-primary" onclick="compareSelected()">
+                            <i class="bi bi-layers"></i> Compare Selected
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="clearSelection()">
+                            Clear
+                        </button>
+                    </div>
+                    <div class="col-md-3">
+                        <span class="float-end text-muted" style="font-size: 0.9rem;" id="runs-count"></span>
+                    </div>
+                </div>
+            </div>
+            <div class="card-body">
+                <canvas id="forecast-chart" style="max-height: 400px;"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Saved Runs List -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="bi bi-clock-history"></i> Saved Forecast Runs
+                    <button class="btn btn-sm btn-outline-primary float-end" onclick="loadRuns()">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </h5>
+            </div>
+            <div class="card-body p-0">
+                <div id="runs-list">
+                    <div class="text-center p-4">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let forecastChart = null;
+let currentRun = null;
+let selectedRuns = [];
+let allRuns = [];
+
+// Chart colors for multiple runs
+const CHART_COLORS = [
+    { color: '#e74c3c', fill: 'rgba(231, 76, 60, 0.1)' },  // Red
+    { color: '#3498db', fill: 'rgba(52, 152, 219, 0.1)' }, // Blue
+    { color: '#2ecc71', fill: 'rgba(46, 204, 113, 0.1)' }, // Green
+    { color: '#f39c12', fill: 'rgba(243, 156, 18, 0.1)' }, // Orange
+    { color: '#9b59b6', fill: 'rgba(155, 89, 182, 0.1)' }, // Purple
+    { color: '#1abc9c', fill: 'rgba(26, 188, 156, 0.1)' }, // Turquoise
+    { color: '#e67e22', fill: 'rgba(230, 126, 34, 0.1)' }, // Dark Orange
+    { color: '#34495e', fill: 'rgba(52, 73, 94, 0.1)' }   // Dark Gray
+];
+
+// Variable configurations
+const VARIABLE_CONFIG = {
+    'temp_surface': { label: 'Temperature @ Surface (2m)', unit: '°F', color: '#e74c3c', fill: 'rgba(231, 76, 60, 0.1)' },
+    'pressure_msl': { label: 'Sea Level Pressure', unit: 'mb', color: '#9b59b6', fill: 'rgba(155, 89, 182, 0.1)' },
+    'temp_850': { label: 'Temperature @ 850hPa', unit: '°F', color: '#dc3545', fill: 'rgba(220, 53, 69, 0.1)' },
+    'temp_700': { label: 'Temperature @ 700hPa', unit: '°F', color: '#ff6b6b', fill: 'rgba(255, 107, 107, 0.1)' },
+    'temp_500': { label: 'Temperature @ 500hPa', unit: '°F', color: '#ff9500', fill: 'rgba(255, 149, 0, 0.1)' },
+    'temp_250': { label: 'Temperature @ 250hPa', unit: '°F', color: '#ffd93d', fill: 'rgba(255, 217, 61, 0.1)' },
+    'wind_speed_850': { label: 'Wind Speed @ 850hPa', unit: 'mph', color: '#0088cc', fill: 'rgba(0, 136, 204, 0.1)' },
+    'wind_speed_500': { label: 'Wind Speed @ 500hPa', unit: 'mph', color: '#4dabf7', fill: 'rgba(77, 171, 247, 0.1)' },
+    'geopotential_850': { label: 'Geopotential @ 850hPa', unit: 'm', color: '#7c3aed', fill: 'rgba(124, 58, 237, 0.1)' },
+    'geopotential_500': { label: 'Geopotential @ 500hPa', unit: 'm', color: '#a78bfa', fill: 'rgba(167, 139, 250, 0.1)' },
+    'humidity_850': { label: 'Humidity @ 850hPa', unit: 'g/kg', color: '#00a86b', fill: 'rgba(0, 168, 107, 0.1)' },
+    'humidity_700': { label: 'Humidity @ 700hPa', unit: 'g/kg', color: '#51cf66', fill: 'rgba(81, 207, 102, 0.1)' }
+};
+
+function loadRuns() {
+    fetch('/pangu/api/runs')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                allRuns = data.runs;
+                displayRuns(data.runs);
+                updateStats(data.runs);
+                if (data.runs.length > 0 && selectedRuns.length === 0) {
+                    selectedRuns = [data.runs[0]];
+                    updateChart();
+                }
+            }
+        })
+        .catch(err => {
+            console.error('Error loading runs:', err);
+            document.getElementById('runs-list').innerHTML =
+                '<div class="alert alert-danger m-3">Error loading runs</div>';
+        });
+}
+
+function updateStats(runs) {
+    document.getElementById('total-runs').textContent = runs.length;
+
+    if (runs.length > 0) {
+        const latest = runs[0];
+        document.getElementById('latest-init').textContent =
+            `${latest.init_date} ${latest.init_time}Z`;
+
+        const maxLead = Math.max(...runs.map(r => r.lead_time));
+        document.getElementById('max-lead-time').textContent = maxLead;
+    }
+}
+
+function compareSelected() {
+    const checkboxes = document.querySelectorAll('.run-checkbox:checked');
+    selectedRuns = Array.from(checkboxes).map(cb => {
+        return allRuns.find(r => r.run_id === cb.value);
+    });
+
+    if (selectedRuns.length === 0) {
+        alert('Please select at least one run to compare');
+        return;
+    }
+
+    updateChart();
+}
+
+function clearSelection() {
+    document.querySelectorAll('.run-checkbox').forEach(cb => cb.checked = false);
+    selectedRuns = [];
+    document.getElementById('latest-forecast-section').style.display = 'none';
+}
+
+function toggleRunSelection(runId) {
+    const run = allRuns.find(r => r.run_id === runId);
+    const index = selectedRuns.findIndex(r => r.run_id === runId);
+
+    if (index >= 0) {
+        selectedRuns.splice(index, 1);
+    } else {
+        selectedRuns.push(run);
+    }
+
+    updateChart();
+}
+
+function updateChart() {
+    if (selectedRuns.length === 0) {
+        document.getElementById('latest-forecast-section').style.display = 'none';
+        return;
+    }
+
+    document.getElementById('latest-forecast-section').style.display = 'block';
+    document.getElementById('runs-count').textContent =
+        `Comparing ${selectedRuns.length} run${selectedRuns.length > 1 ? 's' : ''}`;
+
+    const variable = document.getElementById('variable-selector').value;
+    const config = VARIABLE_CONFIG[variable];
+
+    function getRunTimeSeries(run) {
+        if (run.data && run.data.time_series) {
+            return run.data.time_series;
+        }
+        return null;
+    }
+
+    // Build datasets for each selected run
+    const datasets = [];
+    selectedRuns.forEach((run, index) => {
+        const baseSeries = getRunTimeSeries(run);
+        const colorPair = CHART_COLORS[index % CHART_COLORS.length];
+
+        // Create label prefix with run details
+        let labelPrefix = '';
+        if (run.climate_scenario) {
+            labelPrefix = `Climate +${run.temp_offset}°C - ${run.init_date} ${run.init_time}Z`;
+        } else if (run.ensemble) {
+            labelPrefix = `Ensemble - ${run.init_date} ${run.init_time}Z`;
+        } else {
+            labelPrefix = `Control - ${run.init_date} ${run.init_time}Z`;
+        }
+
+        if (run.ensemble && Array.isArray(run.members) && run.members.length > 0) {
+            const memberSeries = run.members
+                .map(m => m.data && m.data.time_series ? m.data.time_series : null)
+                .filter(Boolean);
+            const memberMeans = {};
+            let meanTimes = [];
+            if (memberSeries.length > 0) {
+                const base = memberSeries[0];
+                meanTimes = base.times;
+                Object.keys(base).forEach(key => {
+                    if (key === 'times') {
+                        return;
+                    }
+                    const length = base[key].length;
+                    const sums = new Array(length).fill(0);
+                    let count = 0;
+                    memberSeries.forEach(series => {
+                        if (series[key] && series[key].length === length) {
+                            for (let i = 0; i < length; i++) {
+                                sums[i] += series[key][i];
+                            }
+                            count += 1;
+                        }
+                    });
+                    memberMeans[key] = count > 0 ? sums.map(v => v / count) : base[key];
+                });
+            }
+
+            run.members.forEach((member, memberIndex) => {
+                if (!member.data || !member.data.time_series) {
+                    return;
+                }
+                const series = member.data.time_series;
+                datasets.push({
+                    label: `${labelPrefix} Member`,
+                    isEnsembleMember: true,
+                    data: series[variable],
+                    borderColor: colorPair.color,
+                    backgroundColor: colorPair.fill,
+                    borderWidth: 2,
+                    pointRadius: 1,
+                    pointHoverRadius: 3,
+                    tension: 0.3,
+                    fill: false
+                });
+            });
+
+            if (memberSeries.length > 0) {
+                datasets.push({
+                    label: 'Ensemble Mean',
+                    isEnsembleMean: true,
+                    data: memberMeans[variable],
+                    borderColor: '#000000',
+                    backgroundColor: 'rgba(0, 0, 0, 0.08)',
+                    borderWidth: 4,
+                    pointRadius: 0,
+                    pointHoverRadius: 0,
+                    tension: 0.3,
+                    fill: false
+                });
+            }
+            return;
+        }
+
+        if (!baseSeries) {
+            return;
+        }
+
+        datasets.push({
+            label: labelPrefix,
+            data: baseSeries[variable],
+            borderColor: colorPair.color,
+            backgroundColor: colorPair.fill,
+            borderWidth: 3,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            tension: 0.3,
+            fill: false
+        });
+    });
+
+    if (datasets.length === 0) {
+        document.getElementById('latest-forecast-section').style.display = 'none';
+        return;
+    }
+
+    let times = [];
+    const firstRun = selectedRuns[0];
+    const firstSeries = getRunTimeSeries(firstRun);
+    if (firstSeries) {
+        times = firstSeries.times;
+    } else if (firstRun && firstRun.ensemble && Array.isArray(firstRun.members) && firstRun.members.length > 0) {
+        const memberSeries = firstRun.members.find(m => m.data && m.data.time_series);
+        if (memberSeries) {
+            times = memberSeries.data.time_series.times;
+        }
+    }
+
+    // Create chart
+    const ctx = document.getElementById('forecast-chart').getContext('2d');
+
+    if (forecastChart) {
+        forecastChart.destroy();
+    }
+
+    forecastChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: times,
+            datasets: datasets
+        },
+        options: {
+            responsive: true,
+            interaction: {
+                mode: 'index',
+                intersect: false,
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        font: {
+                            size: 14,
+                            weight: 'bold'
+                        },
+                        filter: function(legendItem, data) {
+                            const ds = data.datasets[legendItem.datasetIndex];
+                            return !ds.isEnsembleMember;
+                        }
+                    }
+                },
+                title: {
+                    display: true,
+                    text: 'Fairfax, VA (38.85°N, 77.31°W)',
+                    font: {
+                        size: 12,
+                        weight: 'normal'
+                    },
+                    color: '#666'
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            let label = context.dataset.label || '';
+                            if (label) {
+                                label += ': ';
+                            }
+                            if (context.parsed.y !== null) {
+                                label += context.parsed.y.toFixed(1) + ' ' + config.unit;
+                            }
+                            return label;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    type: 'time',
+                    time: {
+                        unit: 'hour',
+                        displayFormats: {
+                            hour: 'MMM dd HH:mm'
+                        }
+                    },
+                    title: {
+                        display: true,
+                        text: 'Valid Time (UTC)',
+                        font: {
+                            size: 13,
+                            weight: 'bold'
+                        }
+                    },
+                    grid: {
+                        color: 'rgba(0, 0, 0, 0.05)'
+                    }
+                },
+                y: {
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
+                    title: {
+                        display: true,
+                        text: `${config.label} (${config.unit})`,
+                        font: {
+                            size: 13,
+                            weight: 'bold'
+                        }
+                    },
+                    grid: {
+                        color: 'rgba(0, 0, 0, 0.05)'
+                    }
+                }
+            }
+        }
+    });
+}
+
+function displayRuns(runs) {
+    const container = document.getElementById('runs-list');
+
+    if (runs.length === 0) {
+        container.innerHTML = '<div class="alert alert-info m-3">No forecast runs yet. <a href="/pangu/run">Run your first forecast</a></div>';
+        return;
+    }
+
+    let html = '';
+    runs.forEach((run, index) => {
+        const runDate = run.run_time ? new Date(run.run_time) : null;
+        const modelName = run.model_name || 'PanguWeather';
+        const modelBadge = run.model === 'graphcast'
+            ? '<span class="badge bg-success ms-2">GraphCast</span>'
+            : '<span class="badge bg-primary ms-2">PanguWeather</span>';
+
+        // Add climate scenario badge if applicable
+        let scenarioBadge = '';
+        if (run.climate_scenario) {
+            scenarioBadge = `<span class="badge bg-danger ms-2">Climate +${run.temp_offset}°C</span>`;
+        } else if (run.ensemble) {
+            scenarioBadge = `<span class="badge bg-warning text-dark ms-2">Ensemble</span>`;
+        }
+
+        const isChecked = selectedRuns.some(r => r.run_id === run.run_id);
+
+        const elapsed = (run.elapsed_seconds !== undefined && run.elapsed_seconds !== null && !isNaN(run.elapsed_seconds))
+            ? Number(run.elapsed_seconds).toFixed(1)
+            : '--';
+        const runTimeLabel = runDate && !isNaN(runDate) ? runDate.toLocaleString() : 'Unknown';
+
+        html += `
+            <div class="run-item">
+                <div class="row align-items-center">
+                    <div class="col-md-1">
+                        <input type="checkbox" class="form-check-input run-checkbox"
+                               value="${run.run_id}" ${isChecked ? 'checked' : ''}
+                               onchange="toggleRunSelection('${run.run_id}')">
+                    </div>
+                    <div class="col-md-3">
+                        <strong>${run.init_date} ${run.init_time}:00 UTC</strong>
+                        ${modelBadge}
+                        ${scenarioBadge}
+                    </div>
+                    <div class="col-md-2">
+                        <span class="badge badge-info">F${run.lead_time} hrs</span>
+                    </div>
+                    <div class="col-md-3">
+                        <small class="text-muted">Run: ${runTimeLabel}</small>
+                    </div>
+                    <div class="col-md-2">
+                        <small class="text-muted">${elapsed}s</small>
+                    </div>
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+// Load runs on page load
+document.addEventListener('DOMContentLoaded', () => {
+    loadRuns();
+});
+</script>
+{% endblock %}

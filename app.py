@@ -34,6 +34,17 @@ import weatherlink
 import asos
 import rossby_waves
 
+try:
+    from astral import LocationInfo, moon
+    from astral.sun import sun
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - optional dependency
+    LocationInfo = None
+    moon = None
+    sun = None
+    ZoneInfo = None
+from pangu_integration import pangu_bp, cleanup_database, load_runs_db
+
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = Path(__file__).parent / "forecasts.json"
 
@@ -142,11 +153,41 @@ def save_forecasts_db(data):
         json.dump(data, f, indent=2)
     logger.info(f"Saved forecasts to {FORECASTS_FILE}")
 
+
+def _mean_series(series_list):
+    if not series_list:
+        return None
+    base = series_list[0]
+    mean = {"times": base.get("times", [])}
+    for key, values in base.items():
+        if key == "times":
+            continue
+        if not isinstance(values, list):
+            continue
+        length = len(values)
+        sums = [0.0] * length
+        count = 0
+        for series in series_list:
+            vals = series.get(key)
+            if isinstance(vals, list) and len(vals) == length:
+                for i in range(length):
+                    v = vals[i]
+                    if v is None:
+                        continue
+                    sums[i] += v
+                count += 1
+        if count > 0:
+            mean[key] = [v / count for v in sums]
+    return mean
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 app = Flask(__name__)
+app.register_blueprint(pangu_bp, url_prefix="/pangu")
+cleanup_database()
 
 # Queue for streaming sync logs to clients
 sync_log_queues = []
@@ -590,8 +631,8 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
     z500_waves_forecast = {
         "times": [],
         "wave_numbers": [],
-        "ridges": [],
-        "troughs": []
+        "amplitudes": [],
+        "variance_explained": []
     }
 
     # Calculate at 24-hour intervals up to 360 hours (15 days)
@@ -608,13 +649,18 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
             valid_time = (init_time + timedelta(hours=fhr)).isoformat()
             z500_waves_forecast["times"].append(valid_time)
             z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
-            z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
-            z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+            # Get amplitude and variance of dominant wave
+            amplitudes = wave_metrics.get('top_3_amplitudes', [])
+            variance = wave_metrics.get('top_3_variance', [])
+            z500_waves_forecast["amplitudes"].append(amplitudes[0] if amplitudes else None)
+            z500_waves_forecast["variance_explained"].append(variance[0] if variance else None)
 
             # Store F000 as current wave number
             if fhr == 0:
                 z500_waves = wave_metrics
-                logger.info(f"GFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+                amp_str = f"{amplitudes[0]:.1f}m" if amplitudes else "N/A"
+                var_str = f"{variance[0]:.1f}%" if variance else "N/A"
+                logger.info(f"GFS wave number: {wave_metrics.get('wave_number')} (amplitude: {amp_str}, variance: {var_str})")
 
         except Exception as e:
             logger.warning(f"Wave analysis failed for GFS F{fhr:03d}: {e}")
@@ -622,8 +668,8 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
             valid_time = (init_time + timedelta(hours=fhr)).isoformat()
             z500_waves_forecast["times"].append(valid_time)
             z500_waves_forecast["wave_numbers"].append(None)
-            z500_waves_forecast["ridges"].append(None)
-            z500_waves_forecast["troughs"].append(None)
+            z500_waves_forecast["amplitudes"].append(None)
+            z500_waves_forecast["variance_explained"].append(None)
 
     return {
         "temps": temps,
@@ -712,8 +758,8 @@ def fetch_aifs_data(region, forecast_hours, init_hour: Optional[int] = None):
     z500_waves_forecast = {
         "times": [],
         "wave_numbers": [],
-        "ridges": [],
-        "troughs": []
+        "amplitudes": [],
+        "variance_explained": []
     }
 
     # Calculate at 24-hour intervals up to 360 hours (15 days)
@@ -731,13 +777,18 @@ def fetch_aifs_data(region, forecast_hours, init_hour: Optional[int] = None):
             valid_time = (init_time + timedelta(hours=fhr)).isoformat()
             z500_waves_forecast["times"].append(valid_time)
             z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
-            z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
-            z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+            # Get amplitude and variance of dominant wave
+            amplitudes = wave_metrics.get('top_3_amplitudes', [])
+            variance = wave_metrics.get('top_3_variance', [])
+            z500_waves_forecast["amplitudes"].append(amplitudes[0] if amplitudes else None)
+            z500_waves_forecast["variance_explained"].append(variance[0] if variance else None)
 
             # Store F000 as current wave number
             if fhr == 0:
                 z500_waves = wave_metrics
-                logger.info(f"AIFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+                amp_str = f"{amplitudes[0]:.1f}m" if amplitudes else "N/A"
+                var_str = f"{variance[0]:.1f}%" if variance else "N/A"
+                logger.info(f"AIFS wave number: {wave_metrics.get('wave_number')} (amplitude: {amp_str}, variance: {var_str})")
 
         except Exception as e:
             logger.warning(f"Wave analysis failed for AIFS F{fhr:03d}: {e}")
@@ -745,8 +796,8 @@ def fetch_aifs_data(region, forecast_hours, init_hour: Optional[int] = None):
             valid_time = (init_time + timedelta(hours=fhr)).isoformat()
             z500_waves_forecast["times"].append(valid_time)
             z500_waves_forecast["wave_numbers"].append(None)
-            z500_waves_forecast["ridges"].append(None)
-            z500_waves_forecast["troughs"].append(None)
+            z500_waves_forecast["amplitudes"].append(None)
+            z500_waves_forecast["variance_explained"].append(None)
 
     return {
         "temps": temps,
@@ -844,8 +895,8 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
     z500_waves_forecast = {
         "times": [],
         "wave_numbers": [],
-        "ridges": [],
-        "troughs": []
+        "amplitudes": [],
+        "variance_explained": []
     }
 
     # Calculate at 24-hour intervals up to 240 hours (10 days for IFS)
@@ -863,13 +914,18 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
             valid_time = (init_time + timedelta(hours=fhr)).isoformat()
             z500_waves_forecast["times"].append(valid_time)
             z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
-            z500_waves_forecast["ridges"].append(wave_metrics.get('ridges'))
-            z500_waves_forecast["troughs"].append(wave_metrics.get('troughs'))
+            # Get amplitude and variance of dominant wave
+            amplitudes = wave_metrics.get('top_3_amplitudes', [])
+            variance = wave_metrics.get('top_3_variance', [])
+            z500_waves_forecast["amplitudes"].append(amplitudes[0] if amplitudes else None)
+            z500_waves_forecast["variance_explained"].append(variance[0] if variance else None)
 
             # Store F000 as current wave number
             if fhr == 0:
                 z500_waves = wave_metrics
-                logger.info(f"IFS wave number: {wave_metrics.get('wave_number')} ({wave_metrics.get('ridges')} ridges, {wave_metrics.get('troughs')} troughs)")
+                amp_str = f"{amplitudes[0]:.1f}m" if amplitudes else "N/A"
+                var_str = f"{variance[0]:.1f}%" if variance else "N/A"
+                logger.info(f"IFS wave number: {wave_metrics.get('wave_number')} (amplitude: {amp_str}, variance: {var_str})")
 
         except Exception as e:
             logger.warning(f"Wave analysis failed for IFS F{fhr:03d}: {e}")
@@ -877,8 +933,8 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
             valid_time = (init_time + timedelta(hours=fhr)).isoformat()
             z500_waves_forecast["times"].append(valid_time)
             z500_waves_forecast["wave_numbers"].append(None)
-            z500_waves_forecast["ridges"].append(None)
-            z500_waves_forecast["troughs"].append(None)
+            z500_waves_forecast["amplitudes"].append(None)
+            z500_waves_forecast["variance_explained"].append(None)
 
     return {
         "temps": temps,
@@ -1865,6 +1921,95 @@ def api_verification_time_series():
         return jsonify({"success": False, "error": str(e)})
 
 
+@app.route("/api/pangu-latest")
+def api_pangu_latest():
+    """
+    Return the latest Pangu run time series for Fairfax, VA (temp_surface and pressure_msl).
+    If the latest run is an ensemble, return the mean across members.
+    """
+    location = request.args.get("location", "Fairfax, VA")
+    if location.lower() not in {"fairfax, va", "fairfax"}:
+        return jsonify({"success": False, "error": "Pangu overlay available only for Fairfax, VA"}), 200
+
+    db = load_runs_db()
+    runs = db.get("runs", [])
+    if not runs:
+        return jsonify({"success": False, "error": "No Pangu runs available"}), 200
+
+    selected = None
+    latest_ref = None
+    try:
+        forecast_db = load_forecasts_db()
+        loc_data = forecast_db.get("Fairfax, VA", {})
+        latest_key = loc_data.get("latest_run")
+        if latest_key:
+            latest_ref = datetime.fromisoformat(latest_key)
+    except Exception:
+        latest_ref = None
+    for run in runs:
+        if run.get("ensemble"):
+            members = run.get("members", [])
+            member_series = []
+            for m in members:
+                data = m.get("data", {})
+                ts = data.get("time_series")
+                if ts and ts.get("temp_surface") and ts.get("pressure_msl"):
+                    member_series.append(ts)
+            if member_series:
+                selected = {
+                    "run": run,
+                    "time_series": _mean_series(member_series),
+                    "ensemble": True,
+                    "member_count": len(member_series),
+                }
+                break
+        else:
+            ts = run.get("data", {}).get("time_series")
+            if ts and ts.get("temp_surface") and ts.get("pressure_msl"):
+                selected = {
+                    "run": run,
+                    "time_series": ts,
+                    "ensemble": False,
+                    "member_count": 1,
+                }
+                break
+
+    if not selected or not selected.get("time_series"):
+        return jsonify({"success": False, "error": "No usable Pangu run data"}), 200
+
+    run = selected["run"]
+    # Filter out stale runs if too far from latest main-model init time
+    if latest_ref:
+        try:
+            run_time = datetime.fromisoformat(f"{run.get('init_date')}T{run.get('init_time')}:00:00")
+            if abs((run_time - latest_ref).total_seconds()) > 24 * 3600:
+                return jsonify({"success": False, "error": "Pangu run too old"}), 200
+        except Exception:
+            pass
+    ts = selected["time_series"]
+    raw_times = ts.get("times", [])
+    normalized_times = []
+    for t in raw_times:
+        if isinstance(t, str) and (t.endswith("Z") or "+" in t):
+            normalized_times.append(t)
+        elif isinstance(t, str) and "T" in t:
+            normalized_times.append(f"{t}Z")
+        else:
+            normalized_times.append(t)
+
+    return jsonify({
+        "success": True,
+        "init_date": run.get("init_date"),
+        "init_time": run.get("init_time"),
+        "run_id": run.get("run_id"),
+        "ensemble": selected["ensemble"],
+        "member_count": selected["member_count"],
+        "times": normalized_times,
+        "temp_surface": ts.get("temp_surface", []),
+        "pressure_msl": ts.get("pressure_msl", [])
+    })
+
+
 @app.route('/api/temp-bias-history')
 def api_temp_bias_history():
     """
@@ -2224,6 +2369,172 @@ def api_wave_forecast():
         return jsonify({"success": False, "error": str(e)})
 
 
+@app.route('/api/wave-skill-correlation')
+def api_wave_skill_correlation():
+    """
+    Analyze correlation between Rossby wave patterns and forecast errors.
+
+    This endpoint calculates the relationship between wave characteristics
+    (wave number, amplitude) and temperature forecast errors at different
+    lead times using ASOS network mean verification.
+
+    Query params:
+        - location: Location name (default: "Fairfax, VA")
+        - days_back: Number of days to analyze (default: 90)
+
+    Returns:
+        {
+            "success": true,
+            "current_wave_number": 5,
+            "predictability_status": "MEDIUM",
+            "confidence": "High",
+            "expected_error_72h": 2.8,
+            "expected_error_120h": 4.2,
+            "wave_error_correlation": {
+                "points_72h": [{x: 3, y: 2.1}, ...],
+                "points_120h": [{x: 3, y: 3.5}, ...]
+            },
+            "amplitude_error_correlation": {
+                "points_72h": [{x: 245, y: 2.1}, ...],
+                "points_120h": [{x: 245, y: 3.5}, ...]
+            }
+        }
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+    days_back = int(request.args.get('days_back', 90))
+
+    try:
+        # Import ASOS module
+        import asos
+
+        # Load Fairfax forecast database (for wave data)
+        fairfax_db = load_forecasts_db()
+        if location_name not in fairfax_db:
+            return jsonify({"success": False, "error": "Location not found"})
+
+        # Load ASOS forecast database (for verification data)
+        asos_db = asos.load_asos_forecasts_db()
+        if not asos_db or "runs" not in asos_db:
+            return jsonify({"success": False, "error": "ASOS verification data not available"})
+
+        # Get cutoff date
+        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+
+        # Collect wave-error pairs
+        wave_error_data_72h = []
+        wave_error_data_120h = []
+        amplitude_error_data_72h = []
+        amplitude_error_data_120h = []
+
+        # Loop through ASOS runs to get verification data
+        for run_time_str, asos_run in asos_db["runs"].items():
+            try:
+                run_time = datetime.fromisoformat(run_time_str)
+                if run_time.tzinfo is None:
+                    run_time = run_time.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+            # Skip runs outside the time window
+            if run_time < cutoff_date:
+                continue
+
+            # Get wave data from Fairfax database for this same init time
+            fairfax_runs = fairfax_db[location_name].get("runs", {})
+            if run_time_str not in fairfax_runs:
+                continue
+
+            fairfax_run = fairfax_runs[run_time_str]
+            gfs_waves = fairfax_run.get("gfs", {}).get("z500_waves")
+            if not gfs_waves or gfs_waves.get("wave_number") is None:
+                continue
+
+            wave_number = gfs_waves.get("wave_number")
+            amplitude = gfs_waves.get("top_3_amplitudes", [None])[0]
+
+            # Calculate ASOS mean MAE for this run at 72h and 120h
+            forecast_hours = asos_run.get("forecast_hours", [])
+
+            # Calculate 72h error
+            if 72 in forecast_hours:
+                mae_72h = asos._calculate_asos_mean_mae(asos_db, run_time_str, 'gfs', 'temp', 72)
+                if mae_72h is not None and mae_72h > 0:
+                    wave_error_data_72h.append({"x": wave_number, "y": mae_72h})
+                    if amplitude is not None:
+                        amplitude_error_data_72h.append({"x": amplitude, "y": mae_72h})
+
+            # Calculate 120h error
+            if 120 in forecast_hours:
+                mae_120h = asos._calculate_asos_mean_mae(asos_db, run_time_str, 'gfs', 'temp', 120)
+                if mae_120h is not None and mae_120h > 0:
+                    wave_error_data_120h.append({"x": wave_number, "y": mae_120h})
+                    if amplitude is not None:
+                        amplitude_error_data_120h.append({"x": amplitude, "y": mae_120h})
+
+        # Calculate expected errors based on current wave pattern
+        latest_run = db[location_name].get("latest_run")
+        current_wave_number = None
+        expected_error_72h = None
+        expected_error_120h = None
+        predictability_status = "UNKNOWN"
+        confidence = "Low"
+
+        if latest_run and latest_run in db[location_name]["runs"]:
+            current_run = db[location_name]["runs"][latest_run]
+            current_waves = current_run.get("gfs", {}).get("z500_waves", {})
+            current_wave_number = current_waves.get("wave_number")
+
+            if current_wave_number is not None and wave_error_data_72h:
+                # Calculate average error for this wave number (±1 wave number tolerance)
+                errors_72h_for_wave = [
+                    d["y"] for d in wave_error_data_72h
+                    if abs(d["x"] - current_wave_number) <= 1
+                ]
+                errors_120h_for_wave = [
+                    d["y"] for d in wave_error_data_120h
+                    if abs(d["x"] - current_wave_number) <= 1
+                ]
+
+                if errors_72h_for_wave:
+                    expected_error_72h = sum(errors_72h_for_wave) / len(errors_72h_for_wave)
+                    confidence = "High" if len(errors_72h_for_wave) >= 10 else "Medium" if len(errors_72h_for_wave) >= 5 else "Low"
+
+                if errors_120h_for_wave:
+                    expected_error_120h = sum(errors_120h_for_wave) / len(errors_120h_for_wave)
+
+                # Determine predictability status based on wave number
+                if current_wave_number <= 4:
+                    predictability_status = "HIGH"
+                elif current_wave_number <= 6:
+                    predictability_status = "MEDIUM"
+                else:
+                    predictability_status = "LOW"
+
+        return jsonify({
+            "success": True,
+            "location": location_name,
+            "days_analyzed": days_back,
+            "sample_size": len(wave_error_data_72h),
+            "current_wave_number": current_wave_number,
+            "predictability_status": predictability_status,
+            "confidence": confidence,
+            "expected_error_72h": round(expected_error_72h, 1) if expected_error_72h else None,
+            "expected_error_120h": round(expected_error_120h, 1) if expected_error_120h else None,
+            "wave_error_correlation": {
+                "points_72h": wave_error_data_72h,
+                "points_120h": wave_error_data_120h
+            },
+            "amplitude_error_correlation": {
+                "points_72h": amplitude_error_data_72h,
+                "points_120h": amplitude_error_data_120h
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Error calculating wave-skill correlation: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
 @app.route('/api/runs')
 def api_runs():
     """List all runs for a location with summary info."""
@@ -2266,6 +2577,12 @@ def verification_page():
         locations=list(LOCATIONS.keys()),
         selected_location="Fairfax, VA"
     )
+
+
+@app.route('/rossby')
+def rossby_page():
+    """Rossby Wave Analysis page - shows wave patterns and predictability."""
+    return render_template('rossby.html')
 
 
 @app.route('/api/observations')
@@ -2325,6 +2642,17 @@ def api_current_weather():
                 weather.update(percentiles)
             except Exception as e:
                 logger.warning(f"Soil moisture percentile error: {e}")
+            try:
+                today = datetime.now()
+                summaries = local_weather_data.get_daily_summaries(
+                    today.replace(hour=0, minute=0, second=0, microsecond=0),
+                    today.replace(hour=23, minute=59, second=59, microsecond=0)
+                )
+                if summaries:
+                    weather["temp_high_f"] = summaries[-1].get("temp_high")
+                    weather["temp_low_f"] = summaries[-1].get("temp_low")
+            except Exception as e:
+                logger.warning(f"Daily high/low error: {e}")
 
         aqi = weather.get("aqi")
         aqi_category = get_aqi_category(int(aqi)) if aqi is not None else None
@@ -2340,6 +2668,77 @@ def api_current_weather():
             weather["timestamp_iso"] = None
 
         is_day = is_daylight(datetime.now(), DEFAULT_LAT, DEFAULT_LON)
+        today = datetime.now()
+        sunrise, sunset = calculate_sunrise_sunset(DEFAULT_LAT, DEFAULT_LON, today)
+        almanac = {
+            "sunrise": sunrise.strftime("%I:%M %p"),
+            "sunset": sunset.strftime("%I:%M %p"),
+            "normal_high": None,
+            "normal_low": None,
+            "solar_historical_avg": None,
+            "moonrise": None,
+            "moonset": None,
+            "moon_phase": None,
+        }
+        if LocationInfo and sun and moon and ZoneInfo:
+            try:
+                location = LocationInfo(
+                    name="Fairfax, VA",
+                    region="US",
+                    timezone="America/New_York",
+                    latitude=DEFAULT_LAT,
+                    longitude=DEFAULT_LON,
+                )
+                tz = ZoneInfo(location.timezone)
+                sun_times = sun(location.observer, date=today.date(), tzinfo=tz)
+                almanac["sunrise"] = sun_times["sunrise"].strftime("%I:%M %p")
+                almanac["sunset"] = sun_times["sunset"].strftime("%I:%M %p")
+
+                mr = moon.moonrise(location.observer, date=today.date(), tzinfo=tz)
+                ms = moon.moonset(location.observer, date=today.date(), tzinfo=tz)
+                if mr:
+                    almanac["moonrise"] = mr.strftime("%I:%M %p")
+                if ms:
+                    almanac["moonset"] = ms.strftime("%I:%M %p")
+
+                phase_value = moon.phase(today.date())
+                # Map phase to name
+                if phase_value is not None:
+                    if phase_value < 1.84566:
+                        phase_name = "New Moon"
+                    elif phase_value < 5.53699:
+                        phase_name = "Waxing Crescent"
+                    elif phase_value < 9.22831:
+                        phase_name = "First Quarter"
+                    elif phase_value < 12.91963:
+                        phase_name = "Waxing Gibbous"
+                    elif phase_value < 16.61096:
+                        phase_name = "Full Moon"
+                    elif phase_value < 20.30228:
+                        phase_name = "Waning Gibbous"
+                    elif phase_value < 23.99361:
+                        phase_name = "Last Quarter"
+                    elif phase_value < 27.68493:
+                        phase_name = "Waning Crescent"
+                    else:
+                        phase_name = "New Moon"
+                    almanac["moon_phase"] = phase_name
+            except Exception as e:
+                logger.warning(f"Astral almanac error: {e}")
+        if local_weather_data:
+            try:
+                climo = local_weather_data.get_climatology_for_date(today)
+                if climo:
+                    almanac["normal_high"] = climo.get("high_median")
+                    almanac["normal_low"] = climo.get("low_median")
+                summary = local_weather_data.get_period_summary(
+                    today.replace(hour=0, minute=0, second=0, microsecond=0),
+                    today.replace(hour=23, minute=59, second=59, microsecond=0)
+                )
+                if summary:
+                    almanac["solar_historical_avg"] = summary.get("solar_rad_historical")
+            except Exception as e:
+                logger.warning(f"Climatology lookup error: {e}")
 
         return jsonify({
             "success": True,
@@ -2347,6 +2746,7 @@ def api_current_weather():
             "aqi_category": aqi_category,
             "aqi_color": aqi_color,
             "is_daylight": is_day,
+            "almanac": almanac,
             "location": {
                 "name": "Fairfax, VA",
                 "lat": DEFAULT_LAT,

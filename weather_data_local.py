@@ -353,6 +353,7 @@ def get_daily_summaries(start_date: datetime, end_date: datetime) -> list[dict]:
             "temp_avg": safe_agg(temp_series, np.mean),
             "dew_point_avg": safe_agg(dew_series, np.mean),
             "wind_speed_avg": safe_agg(wind_series, np.mean),
+            "wind_gust_avg": safe_agg(gust_series, np.mean),
             "wind_gust_max": safe_agg(gust_series, np.max),
             "rain_total": daily_rain,
             "solar_rad_avg": safe_agg(daylight_solar, np.mean) if len(daylight_solar) > 0 else None,
@@ -386,7 +387,8 @@ def get_period_summary(start_date: datetime, end_date: datetime) -> dict:
     solar_rad_historical = _get_historical_solar_rad_avg(start_date, end_date)
 
     wind_speed_avg = safe_stat(df["wind_speed_avg"], lambda x: x.mean()) if "wind_speed_avg" in df else None
-    wind_gust_avg = safe_stat(df["wind_gust_max"], lambda x: x.mean()) if "wind_gust_max" in df else None
+    wind_gust_avg = safe_stat(df["wind_gust_avg"], lambda x: x.mean()) if "wind_gust_avg" in df else None
+    wind_gust_max = safe_stat(df["wind_gust_max"], max) if "wind_gust_max" in df else None
     wind_historical = _get_historical_wind_avg(start_date, end_date)
 
     return {
@@ -400,6 +402,7 @@ def get_period_summary(start_date: datetime, end_date: datetime) -> dict:
         "solar_rad_historical": solar_rad_historical,
         "wind_speed_avg": wind_speed_avg,
         "wind_gust_avg": wind_gust_avg,
+        "wind_gust_max": wind_gust_max,
         "wind_speed_historical": wind_historical.get("speed") if wind_historical else None,
         "wind_gust_historical": wind_historical.get("gust") if wind_historical else None,
     }

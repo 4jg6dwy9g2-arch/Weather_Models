@@ -1,0 +1,453 @@
+{% extends "pangu_base.html" %}
+
+{% block title %}AI Weather Models - Run Forecast{% endblock %}
+
+{% block pangu_content %}
+<div class="row">
+    <div class="col-12">
+        <h2 class="mb-4">
+            <i class="bi bi-play-circle"></i> Run New Forecast
+        </h2>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Configuration Form -->
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="bi bi-gear"></i> Forecast Configuration
+                </h5>
+            </div>
+            <div class="card-body">
+                <form id="forecast-form">
+                    <div class="mb-3">
+                        <label for="init-date" class="form-label">Initial Date</label>
+                        <input type="date" class="form-control" id="init-date" required>
+                        <small class="form-text text-muted">
+                            ECMWF data typically available with 1-2 day lag
+                        </small>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="init-time" class="form-label">Initial Time (UTC)</label>
+                        <select class="form-select" id="init-time" required>
+                            <option value="00">00:00 UTC</option>
+                            <option value="06">06:00 UTC</option>
+                            <option value="12" selected>12:00 UTC</option>
+                            <option value="18">18:00 UTC</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="model-select" class="form-label">AI Model</label>
+                        <select class="form-select" id="model-select" required onchange="updateModelInfo()">
+                            <option value="panguweather" selected>PanguWeather (Huawei)</option>
+                            <option value="graphcast">GraphCast (DeepMind)</option>
+                            <option value="fourcastnet">FourCastNet (NVIDIA)</option>
+                        </select>
+                        <small class="form-text text-muted" id="model-description">
+                            Fast, accurate global forecasting with 0.25° resolution
+                        </small>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="lead-time" class="form-label">Lead Time (hours)</label>
+                        <input type="number" class="form-control" id="lead-time" value="24" min="6" max="168" step="6" required>
+                        <small class="form-text text-muted">
+                            Must be a multiple of 6. Max: 168 hours (7 days)
+                        </small>
+                    </div>
+
+                    <div class="card bg-light mb-3">
+                        <div class="card-body">
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="enable-perturbations" onchange="togglePerturbations()">
+                                <label class="form-check-label" for="enable-perturbations">
+                                    <strong>Enable Initial Condition Perturbations</strong>
+                                </label>
+                            </div>
+                            <div id="perturbation-options" style="display: none;">
+                                <hr>
+                                <div class="mb-3">
+                                    <label class="form-label"><strong>Perturbation Type</strong></label>
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="radio" name="perturbation-type" id="type-ensemble" value="ensemble" checked onchange="updatePerturbationType()">
+                                        <label class="form-check-label" for="type-ensemble">
+                                            Random Gaussian (Ensemble)
+                                        </label>
+                                    </div>
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="radio" name="perturbation-type" id="type-climate" value="climate" onchange="updatePerturbationType()">
+                                        <label class="form-check-label" for="type-climate">
+                                            Climate Change Scenario
+                                        </label>
+                                    </div>
+                                </div>
+
+                                <!-- Ensemble options -->
+                                <div id="ensemble-options">
+                                    <div class="mb-2">
+                                        <label for="ensemble-members" class="form-label">Ensemble Members</label>
+                                        <input type="number" class="form-control form-control-sm" id="ensemble-members" value="5" min="1" max="50">
+                                        <small class="form-text text-muted">Number of perturbed forecasts to run</small>
+                                    </div>
+                                    <div class="mb-2">
+                                        <label for="perturbation-scale" class="form-label">Perturbation Magnitude</label>
+                                        <select class="form-select form-select-sm" id="perturbation-scale">
+                                            <option value="small">Small (±0.5 K temp, ±0.5 m/s wind)</option>
+                                            <option value="medium" selected>Medium (±1.0 K temp, ±1.0 m/s wind)</option>
+                                            <option value="large">Large (±2.0 K temp, ±2.0 m/s wind)</option>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                <!-- Climate scenario options -->
+                                <div id="climate-options" style="display: none;">
+                                    <div class="mb-2">
+                                        <label for="temp-offset" class="form-label">Global Temperature Offset</label>
+                                        <div class="input-group input-group-sm">
+                                            <input type="number" class="form-control" id="temp-offset" value="2.0" min="-5" max="10" step="0.5">
+                                            <span class="input-group-text">°C</span>
+                                        </div>
+                                        <small class="form-text text-muted">+2.0°C = Paris Agreement limit</small>
+                                    </div>
+                                    <div class="form-check form-check-sm mb-2">
+                                        <input class="form-check-input" type="checkbox" id="adjust-humidity" checked>
+                                        <label class="form-check-label" for="adjust-humidity">
+                                            Adjust humidity (maintain RH)
+                                        </label>
+                                        <small class="form-text text-muted d-block">~7%/°C moisture increase (Clausius-Clapeyron)</small>
+                                    </div>
+                                    <div class="form-check form-check-sm mb-2">
+                                        <input class="form-check-input" type="checkbox" id="adjust-pressure" checked>
+                                        <label class="form-check-label" for="adjust-pressure">
+                                            Adjust surface pressure
+                                        </label>
+                                        <small class="form-text text-muted d-block">Hydrostatic adjustment for thermal expansion</small>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="d-grid gap-2">
+                        <button type="submit" class="btn btn-success btn-lg" id="run-btn">
+                            <i class="bi bi-play-fill"></i> Run Forecast
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary" onclick="setYesterday()">
+                            <i class="bi bi-calendar-minus"></i> Use Yesterday
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Info Card -->
+        <div class="card mt-3">
+            <div class="card-header">
+                <h6 class="mb-0">
+                    <i class="bi bi-info-circle"></i> <span id="model-info-title">About PanguWeather</span>
+                </h6>
+            </div>
+            <div class="card-body">
+                <ul class="mb-0" id="model-info-content">
+                    <li><strong>Developer:</strong> Huawei</li>
+                    <li><strong>Resolution:</strong> 0.25° (~25km)</li>
+                    <li><strong>Levels:</strong> 13 pressure levels (1000-50 hPa)</li>
+                    <li><strong>Time steps:</strong> 6-hour increments</li>
+                    <li><strong>Max forecast:</strong> 7 days (168 hours)</li>
+                    <li><strong>Variables:</strong> Temperature, wind, humidity, geopotential</li>
+                    <li><strong>Data source:</strong> ECMWF Open Data</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- Log Output -->
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="bi bi-terminal"></i> Run Log
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="log-container" id="log-output">
+                    <div class="text-muted">Ready to run forecast...</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card mt-3" id="success-card" style="display: none;">
+            <div class="card-body text-center">
+                <i class="bi bi-check-circle-fill text-success" style="font-size: 3rem;"></i>
+                <h5 class="mt-3">Forecast Complete!</h5>
+                <p class="text-muted">Your forecast has been generated and saved.</p>
+                <a href="/pangu" class="btn btn-primary">
+                    <i class="bi bi-grid"></i> View Dashboard
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let eventSource = null;
+
+function setYesterday() {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const dateStr = yesterday.toISOString().split('T')[0];
+    document.getElementById('init-date').value = dateStr;
+}
+
+function togglePerturbations() {
+    const checkbox = document.getElementById('enable-perturbations');
+    const options = document.getElementById('perturbation-options');
+    options.style.display = checkbox.checked ? 'block' : 'none';
+    if (checkbox.checked) {
+        updatePerturbationType();
+    }
+}
+
+function updatePerturbationType() {
+    const isEnsemble = document.getElementById('type-ensemble').checked;
+    const isClimate = document.getElementById('type-climate').checked;
+
+    document.getElementById('ensemble-options').style.display = isEnsemble ? 'block' : 'none';
+    document.getElementById('climate-options').style.display = isClimate ? 'block' : 'none';
+}
+
+function updateModelInfo() {
+    const model = document.getElementById('model-select').value;
+    const title = document.getElementById('model-info-title');
+    const description = document.getElementById('model-description');
+    const content = document.getElementById('model-info-content');
+
+    if (model === 'panguweather') {
+        title.textContent = 'About PanguWeather';
+        description.textContent = 'Fast, accurate global forecasting with 0.25° resolution';
+        content.innerHTML = `
+            <li><strong>Developer:</strong> Huawei</li>
+            <li><strong>Resolution:</strong> 0.25° (~25km)</li>
+            <li><strong>Levels:</strong> 13 pressure levels (1000-50 hPa)</li>
+            <li><strong>Time steps:</strong> 6-hour increments</li>
+            <li><strong>Max forecast:</strong> 7 days (168 hours)</li>
+            <li><strong>Variables:</strong> Temperature, wind, humidity, geopotential</li>
+            <li><strong>Data source:</strong> ECMWF Open Data</li>
+        `;
+    } else if (model === 'graphcast') {
+        title.textContent = 'About GraphCast';
+        description.textContent = 'DeepMind\'s graph neural network model with high accuracy';
+        content.innerHTML = `
+            <li><strong>Developer:</strong> Google DeepMind</li>
+            <li><strong>Resolution:</strong> 0.25° (~25km)</li>
+            <li><strong>Architecture:</strong> Graph Neural Network (GNN)</li>
+            <li><strong>Time steps:</strong> 6-hour increments</li>
+            <li><strong>Max forecast:</strong> 10+ days</li>
+            <li><strong>Variables:</strong> Comprehensive atmospheric state</li>
+            <li><strong>Data source:</strong> ECMWF Open Data</li>
+        `;
+    } else if (model === 'fourcastnet') {
+        title.textContent = 'About FourCastNet';
+        description.textContent = 'NVIDIA\'s deep learning model for rapid and accurate global weather predictions.';
+        content.innerHTML = `
+            <li><strong>Developer:</strong> NVIDIA</li>
+            <li><strong>Resolution:</strong> 0.25° (~25km)</li>
+            <li><strong>Architecture:</strong> Deep Learning (Transformer-based)</li>
+            <li><strong>Time steps:</strong> 6-hour increments</li>
+            <li><strong>Max forecast:</strong> Up to 15 days</li>
+            <li><strong>Variables:</strong> Comprehensive atmospheric state</li>
+            <li><strong>Data source:</strong> ERA5 (via ECMWF Open Data)</li>
+        `;
+    }
+}
+
+function connectLogStream() {
+    if (eventSource) {
+        eventSource.close();
+    }
+
+    eventSource = new EventSource('/pangu/api/logs');
+
+    eventSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        appendLog(data.message, data.type);
+    };
+
+    eventSource.onerror = function(err) {
+        console.error('EventSource error:', err);
+    };
+}
+
+function appendLog(message, type = 'info') {
+    const logContainer = document.getElementById('log-output');
+    const logClass = `log-${type}`;
+    const timestamp = new Date().toLocaleTimeString();
+
+    const logLine = document.createElement('div');
+    logLine.className = logClass;
+    logLine.textContent = `[${timestamp}] ${message}`;
+
+    logContainer.appendChild(logLine);
+    logContainer.scrollTop = logContainer.scrollHeight;
+}
+
+function clearLog() {
+    document.getElementById('log-output').innerHTML = '';
+}
+
+document.getElementById('forecast-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const date = document.getElementById('init-date').value;
+    const time = document.getElementById('init-time').value;
+    const leadTime = parseInt(document.getElementById('lead-time').value);
+    const model = document.getElementById('model-select').value;
+
+    // Get perturbation settings
+    const enablePerturbations = document.getElementById('enable-perturbations').checked;
+    const perturbationType = enablePerturbations ?
+        (document.getElementById('type-ensemble').checked ? 'ensemble' : 'climate') : 'none';
+
+    // Ensemble parameters
+    const ensembleMembers = enablePerturbations && perturbationType === 'ensemble' ?
+        parseInt(document.getElementById('ensemble-members').value) : 1;
+    const perturbationScale = enablePerturbations && perturbationType === 'ensemble' ?
+        document.getElementById('perturbation-scale').value : null;
+
+    // Climate scenario parameters
+    const tempOffset = enablePerturbations && perturbationType === 'climate' ?
+        parseFloat(document.getElementById('temp-offset').value) : 0;
+    const adjustHumidity = enablePerturbations && perturbationType === 'climate' ?
+        document.getElementById('adjust-humidity').checked : false;
+    const adjustPressure = enablePerturbations && perturbationType === 'climate' ?
+        document.getElementById('adjust-pressure').checked : false;
+
+    // Validate
+    if (!date) {
+        alert('Please select a date');
+        return;
+    }
+
+    if (leadTime % 6 !== 0) {
+        alert('Lead time must be a multiple of 6');
+        return;
+    }
+
+    if (enablePerturbations && ensembleMembers > 20) {
+        if (!confirm(`You're about to run ${ensembleMembers} ensemble members. This will take a while. Continue?`)) {
+            return;
+        }
+    }
+
+    // Disable form
+    const runBtn = document.getElementById('run-btn');
+    const form = document.getElementById('forecast-form');
+    runBtn.disabled = true;
+    form.querySelectorAll('input, select').forEach(el => el.disabled = true);
+
+    // Clear log and hide success card
+    clearLog();
+    document.getElementById('success-card').style.display = 'none';
+
+    // Connect to log stream
+    connectLogStream();
+
+    const modelName = model === 'panguweather' ? 'PanguWeather' : 'GraphCast';
+    if (enablePerturbations && perturbationType === 'ensemble') {
+        appendLog(`Starting ${modelName} ensemble forecast (${ensembleMembers} members)...`, 'info');
+    } else if (enablePerturbations && perturbationType === 'climate') {
+        appendLog(`Starting ${modelName} climate scenario (+${tempOffset}°C)...`, 'info');
+    } else {
+        appendLog(`Starting ${modelName} forecast run...`, 'info');
+    }
+
+    // Submit forecast
+    try {
+        const response = await fetch('/pangu/api/forecast/run', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                date: date,
+                time: time,
+                lead_time: leadTime,
+                model: model,
+                perturbation_type: perturbationType,
+                ensemble_members: ensembleMembers,
+                perturbation_scale: perturbationScale,
+                temp_offset: tempOffset,
+                adjust_humidity: adjustHumidity,
+                adjust_pressure: adjustPressure
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            appendLog('Forecast request submitted', 'success');
+
+            // Poll for completion
+            setTimeout(() => {
+                checkCompletion();
+            }, 5000);
+        } else {
+            appendLog(`Error: ${result.error}`, 'error');
+            enableForm();
+        }
+    } catch (err) {
+        appendLog(`Error: ${err.message}`, 'error');
+        enableForm();
+    }
+});
+
+function checkCompletion() {
+    fetch('/pangu/api/runs')
+        .then(res => res.json())
+        .then(data => {
+            if (data.success && data.runs.length > 0) {
+                const latestRun = data.runs[0];
+                const now = new Date();
+                const runTime = new Date(latestRun.run_time);
+
+                // Check if run is recent (within last 2 minutes)
+                if ((now - runTime) < 120000) {
+                    // Show success
+                    document.getElementById('success-card').style.display = 'block';
+                    enableForm();
+
+                    if (eventSource) {
+                        eventSource.close();
+                    }
+                    return;
+                }
+            }
+
+            // Check again in 3 seconds
+            setTimeout(checkCompletion, 3000);
+        })
+        .catch(err => {
+            console.error('Error checking completion:', err);
+            setTimeout(checkCompletion, 3000);
+        });
+}
+
+function enableForm() {
+    const runBtn = document.getElementById('run-btn');
+    const form = document.getElementById('forecast-form');
+    runBtn.disabled = false;
+    form.querySelectorAll('input, select').forEach(el => el.disabled = false);
+}
+
+// Set yesterday's date by default on page load
+document.addEventListener('DOMContentLoaded', () => {
+    setYesterday();
+});
+</script>
+{% endblock %}

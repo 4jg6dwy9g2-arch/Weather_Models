@@ -78,12 +78,12 @@
     <div class="col-md-3 col-6 mb-3">
         <div class="card h-100">
             <div class="stat-card">
-                <div class="stat-label">Avg Wind / Gust</div>
+                <div class="stat-label">Avg Gust / Max Gust</div>
                 <div class="stat-value" id="wind-avg">
-                    {{ summary.wind_speed_avg if summary.wind_speed_avg else '--' }}<span class="stat-unit"> / </span><span id="wind-gust-avg">{{ summary.wind_gust_avg if summary.wind_gust_avg else '--' }}</span><span class="stat-unit"> mph</span>
+                    {{ summary.wind_gust_avg if summary.wind_gust_avg else '--' }}<span class="stat-unit"> / </span><span id="wind-gust-max">{{ summary.wind_gust_max if summary.wind_gust_max else '--' }}</span><span class="stat-unit"> mph</span>
                 </div>
                 <div class="text-muted small">
-                    Normal: <span id="wind-historical">{{ summary.wind_speed_historical if summary.wind_speed_historical else '--' }}</span> / <span id="wind-gust-historical">{{ summary.wind_gust_historical if summary.wind_gust_historical else '--' }}</span> mph
+                    Normal avg gust: <span id="wind-gust-historical">{{ summary.wind_gust_historical if summary.wind_gust_historical else '--' }}</span> mph
                 </div>
                 <div class="text-muted small">
                     <span id="days-count">{{ summary.days if summary.days else '0' }}</span> days of data
@@ -610,7 +610,7 @@ function initCharts() {
         data: {
             labels: [],
             datasets: [{
-                label: 'Avg Wind',
+                label: 'Avg Gust',
                 data: [],
                 borderColor: '#607d8b',
                 fill: false,
@@ -702,7 +702,7 @@ function updateCharts(data) {
     solarChart.update();
 
     windChart.data.labels = labels;
-    windChart.data.datasets[0].data = daily.map(d => d.wind_speed_avg);
+    windChart.data.datasets[0].data = daily.map(d => d.wind_gust_avg);
     windChart.data.datasets[1].data = daily.map(d => d.wind_gust_max);
     windChart.update();
 }
@@ -718,8 +718,7 @@ function updateSummary(summary) {
     document.getElementById('rainy-days').textContent = summary.rainy_days || 0;
     document.getElementById('solar-avg').innerHTML = fmtInt(summary.solar_rad_avg) + '<span class="stat-unit"> W/m2</span>';
     document.getElementById('solar-historical').textContent = fmtInt(summary.solar_rad_historical);
-    document.getElementById('wind-avg').innerHTML = fmt(summary.wind_speed_avg) + '<span class="stat-unit"> / </span><span id="wind-gust-avg">' + fmt(summary.wind_gust_avg) + '</span><span class="stat-unit"> mph</span>';
-    document.getElementById('wind-historical').textContent = fmt(summary.wind_speed_historical);
+    document.getElementById('wind-avg').innerHTML = fmt(summary.wind_gust_avg) + '<span class="stat-unit"> / </span><span id="wind-gust-max">' + fmt(summary.wind_gust_max) + '</span><span class="stat-unit"> mph</span>';
     document.getElementById('wind-gust-historical').textContent = fmt(summary.wind_gust_historical);
     document.getElementById('days-count').textContent = summary.days || 0;
 }
