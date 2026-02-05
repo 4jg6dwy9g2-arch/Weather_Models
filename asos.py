@@ -210,13 +210,13 @@ def fetch_observations(
         station_ids: List of station IDs to fetch
         start_time: Start of time range (UTC)
         end_time: End of time range (UTC)
-        variables: List of variables to fetch (default: tmpf, mslp, p01i)
+        variables: List of variables to fetch (default: tmpf, alti, p01i)
 
     Returns:
         Dict mapping station_id to list of observation dicts
     """
     if variables is None:
-        variables = ['tmpf', 'mslp', 'p01i']
+        variables = ['tmpf', 'alti', 'p01i']  # Use 'alti' (altimeter) instead of 'mslp'
 
     # IEM request parameters
     params = {
@@ -291,7 +291,7 @@ def fetch_observations(
         col_station = header.index('station') if 'station' in header else 0
         col_valid = header.index('valid') if 'valid' in header else 1
         col_tmpf = header.index('tmpf') if 'tmpf' in header else -1
-        col_mslp = header.index('mslp') if 'mslp' in header else -1
+        col_alti = header.index('alti') if 'alti' in header else -1
         col_p01i = header.index('p01i') if 'p01i' in header else -1
 
         for line in lines[data_start_idx:]:
@@ -322,10 +322,18 @@ def fetch_observations(
                     val = fields[col_tmpf].strip()
                     obs['temp'] = float(val) if val not in ['M', 'T', ''] else None
 
-                # Parse pressure (mb/hPa)
-                if col_mslp >= 0 and col_mslp < len(fields):
-                    val = fields[col_mslp].strip()
-                    obs['mslp'] = float(val) if val not in ['M', 'T', ''] else None
+                # Parse altimeter setting (inches Hg) and convert to mb/hPa
+                # Note: Altimeter setting differs slightly from true MSLP (models provide MSLP),
+                # but altimeter is much more widely reported by ASOS stations (~95% vs ~20%).
+                # The difference is typically 1-3 mb due to temperature corrections, but this
+                # systematic bias can be measured and is acceptable for verification purposes.
+                if col_alti >= 0 and col_alti < len(fields):
+                    val = fields[col_alti].strip()
+                    if val not in ['M', 'T', '']:
+                        # Convert inches of mercury to millibars (1 inHg = 33.8639 mb)
+                        obs['mslp'] = round(float(val) * 33.8639, 1)
+                    else:
+                        obs['mslp'] = None
 
                 # Parse 1-hour precipitation (inches)
                 if col_p01i >= 0 and col_p01i < len(fields):
@@ -773,7 +781,7 @@ def fetch_and_store_observations():
                 chunk_ids,
                 min_time,
                 max_time,
-                variables=['tmpf', 'mslp', 'p01i']
+                variables=['tmpf', 'alti', 'p01i']  # Use 'alti' (altimeter) instead of 'mslp'
             )
             futures.append(future)
         
