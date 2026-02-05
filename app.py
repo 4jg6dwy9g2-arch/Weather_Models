@@ -2575,7 +2575,13 @@ def api_runs():
 
 @app.route('/verification')
 def verification_page():
-    """Verification dashboard page - shows forecast skill by lead time."""
+    """Model verification page with Fairfax + ASOS tabs."""
+    return render_template('model_verification.html')
+
+
+@app.route('/asos-verification')
+def asos_verification_page():
+    """ASOS verification dashboard page - shows forecast skill by lead time."""
     return render_template(
         'verification.html',
         locations=list(LOCATIONS.keys()),

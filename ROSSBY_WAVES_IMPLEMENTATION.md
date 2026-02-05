@@ -21,7 +21,7 @@ Implemented a comprehensive Rossby wave analysis system with:
   - Variance explained (%)
   - Top 3 wave numbers with metrics
 
-**Validation:** All tests passing in `test_spectral_method.py`
+**Validation:** Debug validation script removed after verification.
 - ✓ Correct wave number detection
 - ✓ Accurate amplitude calculation
 - ✓ Variance conservation (sums to 100%)
@@ -257,7 +257,7 @@ Result: Dashboard is now focused on Fairfax verification only
 
 ### Created
 - `templates/rossby.html` - New dedicated Rossby Waves page
-- `test_spectral_method.py` - Validation test suite
+- Validation test suite removed after verification.
 - `SPECTRAL_METHOD_IMPLEMENTATION.md` - Technical documentation
 - `ROSSBY_WAVES_IMPLEMENTATION.md` - This file
 

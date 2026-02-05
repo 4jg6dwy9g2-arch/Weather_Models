@@ -250,6 +250,8 @@
     {% block extra_css %}{% endblock %}
 </head>
 <body>
+    {% set is_embed = request.args.get('embed') %}
+    {% if not is_embed %}
     <nav class="navbar navbar-expand-lg navbar-light">
         <div class="container">
             <a class="navbar-brand" href="/">
@@ -271,18 +273,8 @@
                         </a>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link {% if request.path == '/dashboard' %}active{% endif %}" href="/dashboard">
-                            <i class="bi bi-speedometer2"></i> Fairfax Verification
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link {% if request.path == '/verification' %}active{% endif %}" href="/verification">
-                            <i class="bi bi-graph-up"></i> ASOS Verification
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link {% if request.path == '/rossby' %}active{% endif %}" href="/rossby">
-                            <i class="bi bi-wind"></i> Rossby Waves
+                        <a class="nav-link {% if request.path in ['/verification', '/dashboard', '/asos-verification'] %}active{% endif %}" href="/verification">
+                            <i class="bi bi-clipboard-check"></i> Model Verification
                         </a>
                     </li>
                     <li class="nav-item">
@@ -299,8 +291,9 @@
             </div>
         </div>
     </nav>
+    {% endif %}
 
-    <main class="container py-4">
+    <main class="{% if is_embed %}container-fluid p-0{% else %}container py-4{% endif %}">
         {% block content %}{% endblock %}
     </main>
 

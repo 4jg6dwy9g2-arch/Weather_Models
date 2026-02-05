@@ -28,7 +28,7 @@ echo "Sync completed at: $(date)" >> "$LOG_FILE"
 echo "======================================" >> "$LOG_FILE"
 echo "" >> "$LOG_FILE"
 
-# Keep only last 30 days of logs
-find "$LOG_DIR" -name "sync_*.log" -mtime +30 -delete
+# Keep only last 48 hours of logs
+find "$LOG_DIR" -name "sync_*.log" -mtime +2 -delete
 
 exit 0
