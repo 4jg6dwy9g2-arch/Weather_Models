@@ -39,7 +39,12 @@
     <div class="row align-items-center">
         <div class="col-12">
             <h1 class="mb-1"><i class="bi bi-graph-up"></i> ASOS Verification</h1>
-            <p class="mb-0 opacity-75">Model accuracy by lead time across all ASOS stations</p>
+            <p class="mb-0 opacity-75">
+                Model accuracy by lead time across all ASOS stations
+                <span id="cacheTimestamp" class="badge bg-secondary ms-2" style="font-size: 0.7em; vertical-align: middle;">
+                    <i class="bi bi-clock"></i> Cache: Loading...
+                </span>
+            </p>
         </div>
     </div>
 </div>
@@ -662,6 +667,27 @@ async function loadMeanAsosVerification() {
         }
 
         renderAsosVerificationTable(data.verification);
+
+        // Update cache timestamp
+        if (data.cache_timestamp) {
+            const timestamp = new Date(data.cache_timestamp);
+            const now = new Date();
+            const ageMinutes = Math.round((now - timestamp) / 60000);
+
+            let ageText;
+            if (ageMinutes < 60) {
+                ageText = `${ageMinutes}m ago`;
+            } else if (ageMinutes < 1440) {
+                const hours = Math.floor(ageMinutes / 60);
+                ageText = `${hours}h ago`;
+            } else {
+                const days = Math.floor(ageMinutes / 1440);
+                ageText = `${days}d ago`;
+            }
+
+            document.getElementById('cacheTimestamp').innerHTML =
+                `<i class="bi bi-clock"></i> Cache: ${ageText}`;
+        }
 
     } catch (error) {
         console.error('Error loading mean ASOS verification:', error);
