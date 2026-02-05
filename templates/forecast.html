@@ -1,0 +1,677 @@
+{% extends "base.html" %}
+
+{% block title %}Forecast - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .score-excellent { background-color: #22c55e; color: white; }
+    .score-good { background-color: #eab308; color: white; }
+    .score-fair { background-color: #f97316; color: white; }
+    .score-poor { background-color: #ef4444; color: white; }
+
+    .best-time-card {
+        border-left: 4px solid #22c55e;
+        transition: transform 0.2s;
+    }
+    .best-time-card:hover {
+        transform: translateX(4px);
+    }
+    .best-time-card.rank-1 { border-left-color: #22c55e; }
+    .best-time-card.rank-2 { border-left-color: #84cc16; }
+    .best-time-card.rank-3 { border-left-color: #eab308; }
+
+    .chart-container {
+        position: relative;
+        height: 250px;
+    }
+    .chart-container-large {
+        height: 300px;
+    }
+
+    .loading-spinner {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 200px;
+    }
+
+    .reason-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        margin: 2px;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        background-color: #f0f0f0;
+        color: #555;
+    }
+    .reason-badge.good { background-color: #dcfce7; color: #166534; }
+    .reason-badge.warning { background-color: #fef3c7; color: #92400e; }
+    .reason-badge.bad { background-color: #fee2e2; color: #991b1b; }
+
+    .aqi-good { background-color: #00e400; }
+    .aqi-moderate { background-color: #ffff00; }
+    .aqi-usg { background-color: #ff7e00; }
+    .aqi-unhealthy { background-color: #ff0000; color: white; }
+
+    .night-indicator {
+        background-color: #374151;
+        color: #9ca3af;
+        font-size: 0.75rem;
+        padding: 2px 6px;
+        border-radius: 4px;
+    }
+
+    .forecast-header {
+        background: linear-gradient(135deg, #0088cc 0%, #00a86b 100%);
+        color: white;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+    }
+
+    .time-selector {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+    .time-selector .btn {
+        min-width: 60px;
+    }
+    .time-selector .btn.active {
+        background-color: var(--accent-cyan);
+        border-color: var(--accent-cyan);
+        color: white;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="forecast-header">
+    <div class="row align-items-center">
+        <div class="col-md-8">
+            <h1 class="mb-1"><i class="bi bi-sun"></i> Run Forecast</h1>
+            <p class="mb-0 opacity-75">Best times to run based on weather conditions</p>
+        </div>
+        <div class="col-md-4 text-md-end">
+            <div class="time-selector" id="hourSelector">
+                <button class="btn btn-outline-light btn-sm" data-hours="24">24h</button>
+                <button class="btn btn-outline-light btn-sm active" data-hours="48">48h</button>
+                <button class="btn btn-outline-light btn-sm" data-hours="72">72h</button>
+                <button class="btn btn-outline-light btn-sm" data-hours="120">5 days</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="loadingState" class="loading-spinner">
+    <div class="text-center">
+        <div class="spinner-border text-primary" role="status"></div>
+        <p class="mt-2 text-muted">Loading forecast data...</p>
+    </div>
+</div>
+
+<div id="errorState" class="alert alert-danger d-none">
+    <i class="bi bi-exclamation-triangle"></i>
+    <span id="errorMessage">Failed to load forecast data.</span>
+</div>
+
+<div id="forecastContent" class="d-none">
+    <!-- Best Times to Run -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-trophy"></i> Best Times to Run</span>
+                    <small class="text-muted" id="fetchedAt"></small>
+                </div>
+                <div class="card-body">
+                    <div class="row" id="bestTimesContainer">
+                        <!-- Populated by JavaScript -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Run Score Chart -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-bar-chart"></i> Run Score Timeline
+                    <small class="text-muted ms-2">Higher is better (0-100)</small>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container chart-container-large">
+                        <canvas id="scoreChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Temperature & Precipitation -->
+    <div class="row mb-4">
+        <div class="col-lg-6">
+            <div class="card h-100">
+                <div class="card-header">
+                    <i class="bi bi-thermometer-half"></i> Temperature
+                </div>
+                <div class="card-body">
+                    <div class="chart-container">
+                        <canvas id="tempChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="card h-100">
+                <div class="card-header">
+                    <i class="bi bi-cloud-rain"></i> Precipitation Chance
+                </div>
+                <div class="card-body">
+                    <div class="chart-container">
+                        <canvas id="precipChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- AQI & Wind -->
+    <div class="row mb-4">
+        <div class="col-lg-6">
+            <div class="card h-100">
+                <div class="card-header">
+                    <i class="bi bi-wind"></i> Wind Speed & Gusts
+                </div>
+                <div class="card-body">
+                    <div class="chart-container">
+                        <canvas id="windChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="card h-100">
+                <div class="card-header">
+                    <i class="bi bi-lungs"></i> Air Quality Index (AQI)
+                </div>
+                <div class="card-body">
+                    <div class="chart-container">
+                        <canvas id="aqiChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detailed Forecast Table -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-table"></i> Detailed Hourly Forecast
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Score</th>
+                                    <th>Temp</th>
+                                    <th>Wind</th>
+                                    <th>Precip</th>
+                                    <th>AQI</th>
+                                    <th>Conditions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="forecastTable">
+                                <!-- Populated by JavaScript -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// Chart instances
+let scoreChart, tempChart, precipChart, windChart, aqiChart;
+let currentHours = 48;
+
+// Color utilities
+function getScoreColor(score) {
+    if (score >= 80) return '#22c55e';
+    if (score >= 60) return '#eab308';
+    if (score >= 40) return '#f97316';
+    return '#ef4444';
+}
+
+function getScoreClass(score) {
+    if (score >= 80) return 'score-excellent';
+    if (score >= 60) return 'score-good';
+    if (score >= 40) return 'score-fair';
+    return 'score-poor';
+}
+
+function getAqiColor(aqi) {
+    if (aqi === null) return '#cccccc';
+    if (aqi <= 50) return '#00e400';
+    if (aqi <= 100) return '#ffff00';
+    if (aqi <= 150) return '#ff7e00';
+    if (aqi <= 200) return '#ff0000';
+    return '#8f3f97';
+}
+
+function getReasonClass(reason) {
+    const goodPatterns = ['Ideal temp', 'Good'];
+    const badPatterns = ['Dark', 'rain', 'Hot', 'Cold', 'Windy', 'Very windy', 'Unhealthy', 'Oppressive'];
+
+    for (const pattern of goodPatterns) {
+        if (reason.includes(pattern)) return 'good';
+    }
+    for (const pattern of badPatterns) {
+        if (reason.includes(pattern)) return 'bad';
+    }
+    return 'warning';
+}
+
+// Format time for display
+function formatTime(dateStr) {
+    const date = new Date(dateStr);
+    return date.toLocaleString('en-US', {
+        weekday: 'short',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+    });
+}
+
+function formatShortTime(dateStr) {
+    const date = new Date(dateStr);
+    return date.toLocaleString('en-US', {
+        weekday: 'short',
+        hour: 'numeric',
+        hour12: true
+    });
+}
+
+// Load forecast data
+async function loadForecast(hours = 48) {
+    document.getElementById('loadingState').classList.remove('d-none');
+    document.getElementById('forecastContent').classList.add('d-none');
+    document.getElementById('errorState').classList.add('d-none');
+
+    try {
+        const response = await fetch(`/api/run-forecast?hours=${hours}`);
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'Failed to load forecast');
+        }
+
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('forecastContent').classList.remove('d-none');
+
+        renderBestTimes(data.best_times);
+        renderCharts(data.forecast, data.ideal_temp_range);
+        renderTable(data.forecast);
+
+        // Update fetched time
+        const fetchedAt = new Date(data.fetched_at);
+        document.getElementById('fetchedAt').textContent =
+            `Updated: ${fetchedAt.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`;
+
+    } catch (error) {
+        console.error('Error loading forecast:', error);
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('errorState').classList.remove('d-none');
+        document.getElementById('errorMessage').textContent = error.message;
+    }
+}
+
+// Render best times cards
+function renderBestTimes(bestTimes) {
+    const container = document.getElementById('bestTimesContainer');
+    container.innerHTML = '';
+
+    bestTimes.slice(0, 6).forEach((time, index) => {
+        const rankClass = index < 3 ? `rank-${index + 1}` : '';
+        const card = document.createElement('div');
+        card.className = 'col-md-4 col-lg-2 mb-3';
+        card.innerHTML = `
+            <div class="card best-time-card ${rankClass} h-100">
+                <div class="card-body p-2 text-center">
+                    <div class="fw-bold">${formatTime(time.datetime)}</div>
+                    <div class="my-2">
+                        <span class="badge ${getScoreClass(time.score)} fs-6">${time.score}</span>
+                    </div>
+                    <div class="small text-muted">
+                        ${time.temperature}°F
+                        ${!time.is_daylight ? '<span class="night-indicator ms-1">Night</span>' : ''}
+                    </div>
+                </div>
+            </div>
+        `;
+        container.appendChild(card);
+    });
+}
+
+// Render all charts
+function renderCharts(forecast, idealTempRange) {
+    const labels = forecast.map(f => formatShortTime(f.datetime));
+    const scores = forecast.map(f => f.score);
+    const temps = forecast.map(f => f.temperature);
+    const precip = forecast.map(f => f.precipitation_chance);
+    const wind = forecast.map(f => f.wind_speed);
+    const gusts = forecast.map(f => f.wind_gust);
+    const aqi = forecast.map(f => f.aqi);
+    const isDaylight = forecast.map(f => f.is_daylight);
+
+    // Score chart
+    if (scoreChart) scoreChart.destroy();
+    scoreChart = new Chart(document.getElementById('scoreChart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Run Score',
+                data: scores,
+                backgroundColor: scores.map(s => getScoreColor(s)),
+                borderWidth: 0,
+                borderRadius: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        afterLabel: function(context) {
+                            const idx = context.dataIndex;
+                            const f = forecast[idx];
+                            return f.reasons.join(', ');
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    grid: { color: '#e0e0e0' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            return index % 3 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Temperature chart with ideal zone
+    if (tempChart) tempChart.destroy();
+    tempChart = new Chart(document.getElementById('tempChart'), {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Temperature (°F)',
+                data: temps,
+                borderColor: '#ef4444',
+                backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                fill: true,
+                tension: 0.3,
+                pointRadius: 0,
+                pointHoverRadius: 4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                annotation: {
+                    annotations: {
+                        idealZone: {
+                            type: 'box',
+                            yMin: idealTempRange[0],
+                            yMax: idealTempRange[1],
+                            backgroundColor: 'rgba(34, 197, 94, 0.15)',
+                            borderWidth: 0
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: '°F' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            return index % 3 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Precipitation chart
+    if (precipChart) precipChart.destroy();
+    precipChart = new Chart(document.getElementById('precipChart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Precipitation %',
+                data: precip,
+                backgroundColor: precip.map(p => p > 50 ? '#3b82f6' : p > 20 ? '#93c5fd' : '#dbeafe'),
+                borderWidth: 0,
+                borderRadius: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: '%' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            return index % 3 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Wind chart
+    if (windChart) windChart.destroy();
+    windChart = new Chart(document.getElementById('windChart'), {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'Wind Gusts',
+                    data: gusts,
+                    borderColor: '#8b5cf6',
+                    backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                },
+                {
+                    label: 'Wind Speed',
+                    data: wind,
+                    borderColor: '#a78bfa',
+                    borderDash: [5, 5],
+                    fill: false,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { position: 'top' }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'mph' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            return index % 3 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // AQI chart
+    if (aqiChart) aqiChart.destroy();
+    const aqiFiltered = aqi.map(a => a !== null ? a : 0);
+    aqiChart = new Chart(document.getElementById('aqiChart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'AQI',
+                data: aqiFiltered,
+                backgroundColor: aqi.map(a => getAqiColor(a)),
+                borderWidth: 0,
+                borderRadius: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const val = aqi[context.dataIndex];
+                            if (val === null) return 'No AQI data';
+                            let category = 'Good';
+                            if (val > 150) category = 'Unhealthy';
+                            else if (val > 100) category = 'USG';
+                            else if (val > 50) category = 'Moderate';
+                            return `AQI: ${val} (${category})`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 160,
+                    grid: { color: '#e0e0e0' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: {
+                        maxRotation: 45,
+                        minRotation: 45,
+                        callback: function(value, index) {
+                            return index % 3 === 0 ? this.getLabelForValue(value) : '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Render forecast table
+function renderTable(forecast) {
+    const tbody = document.getElementById('forecastTable');
+    tbody.innerHTML = '';
+
+    // Show every 2nd hour for readability
+    forecast.filter((_, i) => i % 2 === 0).forEach(f => {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>
+                <strong>${formatTime(f.datetime)}</strong>
+                ${!f.is_daylight ? '<span class="night-indicator ms-1">Night</span>' : ''}
+            </td>
+            <td><span class="badge ${getScoreClass(f.score)}">${f.score}</span></td>
+            <td>${f.temperature}°F</td>
+            <td>${f.wind_speed} mph ${f.wind_direction}</td>
+            <td>${f.precipitation_chance}%</td>
+            <td>
+                ${f.aqi !== null ?
+                    `<span class="badge" style="background-color: ${getAqiColor(f.aqi)}; color: ${f.aqi > 100 ? 'white' : 'black'}">${f.aqi}</span>` :
+                    '<span class="text-muted">--</span>'
+                }
+            </td>
+            <td>
+                ${f.reasons.map(r => `<span class="reason-badge ${getReasonClass(r)}">${r}</span>`).join('')}
+            </td>
+        `;
+        tbody.appendChild(row);
+    });
+}
+
+// Event listeners
+document.getElementById('hourSelector').addEventListener('click', function(e) {
+    if (e.target.matches('button[data-hours]')) {
+        // Update active state
+        this.querySelectorAll('button').forEach(btn => btn.classList.remove('active'));
+        e.target.classList.add('active');
+
+        // Load new data
+        currentHours = parseInt(e.target.dataset.hours);
+        loadForecast(currentHours);
+    }
+});
+
+// Initial load
+loadForecast(currentHours);
+</script>
+{% endblock %}
