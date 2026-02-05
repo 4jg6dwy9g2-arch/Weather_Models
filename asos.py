@@ -1688,45 +1688,74 @@ def precompute_verification_cache() -> dict:
 
     # Helper function for fast observation lookup
     def get_cached_observation(station_id: str, target_time: datetime, max_delta_minutes: int = 30):
-        """Fast observation lookup using pre-built cache."""
+        """
+        Fast observation lookup using pre-built cache.
+
+        Returns composite observation with each variable from its nearest available time.
+        This handles ASOS stations that report MSLP every 5 min but temp/precip only hourly.
+        """
         station_cache = obs_cache.get(station_id, {})
         if not station_cache:
             return None
 
-        best_match = None
-        best_delta = timedelta(minutes=max_delta_minutes + 1)
         target_time_str = target_time.isoformat()
+        max_delta = timedelta(minutes=max_delta_minutes)
 
-        # Quick check for exact match first
-        if target_time_str in station_cache:
-            best_match = station_cache[target_time_str].copy()
-        else:
-            # Find nearest within tolerance
-            for obs_time_str, obs_data in station_cache.items():
-                try:
-                    obs_time = datetime.fromisoformat(obs_time_str)
-                    delta = abs(obs_time - target_time)
-                    if delta < best_delta:
-                        best_delta = delta
-                        best_match = obs_data.copy()
-                except ValueError:
+        # Find nearest observation for each variable separately
+        best = {
+            'temp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
+            'mslp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
+            'precip': {'value': None, 'delta': max_delta + timedelta(seconds=1)}
+        }
+
+        # Search through observations to find nearest for each variable
+        for obs_time_str, obs_data in station_cache.items():
+            try:
+                obs_time = datetime.fromisoformat(obs_time_str)
+                delta = abs(obs_time - target_time)
+
+                if delta > max_delta:
                     continue
 
-        if best_match and best_delta <= timedelta(minutes=max_delta_minutes):
-            # Calculate 6hr precip on demand for synoptic times only
-            if target_time.hour % 6 == 0:
-                cache_key = (station_id, target_time_str)
-                if cache_key in precip_6hr_cache:
-                    best_match['precip_6hr'] = precip_6hr_cache[cache_key]
-                else:
-                    precip_6hr = calculate_6hr_precip_total(db, station_id, target_time)
-                    precip_6hr_cache[cache_key] = precip_6hr
-                    best_match['precip_6hr'] = precip_6hr
-            else:
-                best_match['precip_6hr'] = None
-            return best_match
+                # Check each variable and update if this is closer
+                if obs_data.get('temp') is not None and delta < best['temp']['delta']:
+                    best['temp']['value'] = obs_data['temp']
+                    best['temp']['delta'] = delta
 
-        return None
+                if obs_data.get('mslp') is not None and delta < best['mslp']['delta']:
+                    best['mslp']['value'] = obs_data['mslp']
+                    best['mslp']['delta'] = delta
+
+                if obs_data.get('precip') is not None and delta < best['precip']['delta']:
+                    best['precip']['value'] = obs_data['precip']
+                    best['precip']['delta'] = delta
+
+            except ValueError:
+                continue
+
+        # Build composite observation
+        if all(best[v]['value'] is None for v in ['temp', 'mslp', 'precip']):
+            return None
+
+        composite_obs = {
+            'temp': best['temp']['value'],
+            'mslp': best['mslp']['value'],
+            'precip': best['precip']['value']
+        }
+
+        # Calculate 6hr precip on demand for synoptic times only
+        if target_time.hour % 6 == 0:
+            cache_key = (station_id, target_time_str)
+            if cache_key in precip_6hr_cache:
+                composite_obs['precip_6hr'] = precip_6hr_cache[cache_key]
+            else:
+                precip_6hr = calculate_6hr_precip_total(db, station_id, target_time)
+                precip_6hr_cache[cache_key] = precip_6hr
+                composite_obs['precip_6hr'] = precip_6hr
+        else:
+            composite_obs['precip_6hr'] = None
+
+        return composite_obs
 
     # Initialize cache structure
     cache_data = {
