@@ -72,6 +72,9 @@ WEATHERLINK_STATION_ID = os.getenv("WEATHERLINK_STATION_ID", "117994")
 DEFAULT_LAT = 38.8419
 DEFAULT_LON = -77.3091
 
+# Forecast retention window (days)
+FORECAST_RETENTION_DAYS = 20
+
 # EPA AQI color scale
 AQI_COLORS = {
     "Good": "#00e400",
@@ -106,7 +109,13 @@ def load_nws_cache():
     if NWS_CACHE_PATH.exists():
         try:
             with open(NWS_CACHE_PATH, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                # Normalize legacy format into runs list
+                if isinstance(data, dict) and "runs" not in data and "forecast" in data:
+                    data = {
+                        "runs": [data]
+                    }
+                return data
         except Exception as e:
             logger.warning(f"Error loading NWS cache: {e}")
     return {}
@@ -122,11 +131,9 @@ def save_nws_cache(payload: dict):
 
 
 def fetch_nws_forecast_cache(hours_ahead: int = 168):
-    """Fetch NWS forecast and cache it for dashboard overlays."""
+    """Fetch NWS forecast and cache only temperature data for verification overlays."""
     grid_id, grid_x, grid_y, forecast_url = get_grid_point(DEFAULT_LAT, DEFAULT_LON)
     forecast = fetch_hourly_forecast(forecast_url)
-    gusts_by_hour = fetch_wind_gusts(grid_id, grid_x, grid_y)
-    aqi_by_date = fetch_aqi_forecast(DEFAULT_LAT, DEFAULT_LON)
 
     now = datetime.now().astimezone()
     cutoff = now + timedelta(hours=hours_ahead)
@@ -136,51 +143,38 @@ def fetch_nws_forecast_cache(hours_ahead: int = 168):
         hour_time = datetime.fromisoformat(hour["datetime"])
         if hour_time > cutoff:
             break
-
-        aqi = None
-        if aqi_by_date:
-            date_str = hour_time.strftime("%Y-%m-%d")
-            aqi = aqi_by_date.get(date_str)
-
-        score, reasons = rate_running_conditions(hour, aqi=aqi, lat=DEFAULT_LAT, lon=DEFAULT_LON)
-
-        hour_utc = hour_time.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        hour_key = hour_utc.isoformat()
-        gust = gusts_by_hour.get(hour_key) if gusts_by_hour else None
-
-        humidity = hour.get("humidity") or 50
-        dew_point = nws_calculate_dew_point(hour["temperature"], humidity)
-
-        daylight = nws_is_daylight(hour_time.replace(tzinfo=None), DEFAULT_LAT, DEFAULT_LON)
-
         result.append({
             "datetime": hour["datetime"],
-            "datetime_local": hour["datetime_local"],
-            "temperature": hour["temperature"],
-            "wind_speed": hour["wind_speed_mph"],
-            "wind_gust": gust or hour["wind_speed_mph"],
-            "wind_direction": hour["wind_direction"],
-            "precipitation_chance": hour["precipitation_chance"],
-            "humidity": humidity,
-            "dew_point": dew_point,
-            "short_forecast": hour["short_forecast"],
-            "aqi": aqi,
-            "score": score,
-            "reasons": reasons,
-            "is_daylight": daylight
+            "temperature": hour["temperature"]
         })
 
-    payload = {
+    snapshot = {
         "success": True,
         "location": {"lat": DEFAULT_LAT, "lon": DEFAULT_LON, "grid": grid_id},
         "fetched_at": datetime.now().isoformat(),
         "hours_ahead": hours_ahead,
-        "forecast": result,
-        "best_times": sorted(result, key=lambda x: x["score"], reverse=True)[:10],
-        "ideal_temp_range": IDEAL_TEMP_RANGE
+        "forecast": result
     }
+    # Append snapshot to cache history (same retention as model runs)
+    cache = load_nws_cache()
+    runs = cache.get("runs", []) if isinstance(cache, dict) else []
+    runs.append(snapshot)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FORECAST_RETENTION_DAYS)
+    pruned = []
+    for run in runs:
+        try:
+            fetched_at = datetime.fromisoformat(run.get("fetched_at"))
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+            if fetched_at >= cutoff:
+                pruned.append(run)
+        except Exception:
+            continue
+
+    payload = {"runs": pruned}
     save_nws_cache(payload)
-    return payload
+    return snapshot
 
 
 def migrate_db_format(data: dict) -> dict:
@@ -1218,12 +1212,43 @@ def calculate_lead_time_verification(location_name: str) -> dict:
     runs = db[location_name].get("runs", {})
     now = datetime.now(timezone.utc)
 
-    # Collect errors by lead time
-    # Key: lead_time_hours, Value: {"gfs_temp": [...], "aifs_temp": [...], "ifs_temp": [...], "nws_temp": [...], "gfs_mslp": [...], "aifs_mslp": [...], "ifs_mslp": [...]}
+    # Collect sums/counts by lead time (supports cumulative stats)
     errors_by_lead_time = {}
 
     runs_with_obs = 0
     obs_by_time = {}
+
+    def _ensure_lt(lt):
+        if lt not in errors_by_lead_time:
+            errors_by_lead_time[lt] = {
+                "gfs_temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "aifs_temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "ifs_temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "nws_temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "gfs_mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "aifs_mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "ifs_mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+            }
+
+    def _add(lt, key, err):
+        _ensure_lt(lt)
+        errors_by_lead_time[lt][key]["sum_abs"] += abs(err)
+        errors_by_lead_time[lt][key]["sum"] += err
+        errors_by_lead_time[lt][key]["count"] += 1
+
+    # Seed with cumulative stats if present
+    cumulative = db[location_name].get("cumulative_stats", {}).get("by_lead_time", {})
+    for lt_str, stats in cumulative.items():
+        try:
+            lt = int(lt_str)
+        except ValueError:
+            continue
+        _ensure_lt(lt)
+        for key in ["gfs_temp", "aifs_temp", "ifs_temp", "gfs_mslp", "aifs_mslp", "ifs_mslp"]:
+            s = stats.get(key, {})
+            errors_by_lead_time[lt][key]["sum_abs"] += s.get("sum_abs", 0.0)
+            errors_by_lead_time[lt][key]["sum"] += s.get("sum", 0.0)
+            errors_by_lead_time[lt][key]["count"] += s.get("count", 0)
 
     for run_id, run_data in runs.items():
         observed = run_data.get("observed")
@@ -1272,11 +1297,7 @@ def calculate_lead_time_verification(location_name: str) -> dict:
             # Calculate lead time in hours
             lead_time_hours = int((valid_time - init_time).total_seconds() / 3600)
 
-            if lead_time_hours not in errors_by_lead_time:
-                errors_by_lead_time[lead_time_hours] = {
-                    "gfs_temp": [], "aifs_temp": [], "ifs_temp": [], "nws_temp": [],
-                    "gfs_mslp": [], "aifs_mslp": [], "ifs_mslp": []
-                }
+            _ensure_lt(lead_time_hours)
 
             # Cache observed temperature by valid time (UTC) for NWS comparisons
             if i < len(obs_temps):
@@ -1289,78 +1310,74 @@ def calculate_lead_time_verification(location_name: str) -> dict:
                 gfs_temp = gfs_temps[i]
                 obs_temp = obs_temps[i]
                 if gfs_temp is not None and obs_temp is not None:
-                    errors_by_lead_time[lead_time_hours]["gfs_temp"].append(gfs_temp - obs_temp)
+                    _add(lead_time_hours, "gfs_temp", gfs_temp - obs_temp)
 
             if i < len(aifs_temps) and i < len(obs_temps):
                 aifs_temp = aifs_temps[i]
                 obs_temp = obs_temps[i]
                 if aifs_temp is not None and obs_temp is not None:
-                    errors_by_lead_time[lead_time_hours]["aifs_temp"].append(aifs_temp - obs_temp)
+                    _add(lead_time_hours, "aifs_temp", aifs_temp - obs_temp)
 
             if i < len(ifs_temps) and i < len(obs_temps):
                 ifs_temp = ifs_temps[i]
                 obs_temp = obs_temps[i]
                 if ifs_temp is not None and obs_temp is not None:
-                    errors_by_lead_time[lead_time_hours]["ifs_temp"].append(ifs_temp - obs_temp)
+                    _add(lead_time_hours, "ifs_temp", ifs_temp - obs_temp)
 
             # Collect MSLP errors
             if i < len(gfs_mslps) and i < len(obs_mslps):
                 gfs_mslp = gfs_mslps[i]
                 obs_mslp = obs_mslps[i]
                 if gfs_mslp is not None and obs_mslp is not None:
-                    errors_by_lead_time[lead_time_hours]["gfs_mslp"].append(gfs_mslp - obs_mslp)
+                    _add(lead_time_hours, "gfs_mslp", gfs_mslp - obs_mslp)
 
             if i < len(aifs_mslps) and i < len(obs_mslps):
                 aifs_mslp = aifs_mslps[i]
                 obs_mslp = obs_mslps[i]
                 if aifs_mslp is not None and obs_mslp is not None:
-                    errors_by_lead_time[lead_time_hours]["aifs_mslp"].append(aifs_mslp - obs_mslp)
+                    _add(lead_time_hours, "aifs_mslp", aifs_mslp - obs_mslp)
 
             if i < len(ifs_mslps) and i < len(obs_mslps):
                 ifs_mslp = ifs_mslps[i]
                 obs_mslp = obs_mslps[i]
                 if ifs_mslp is not None and obs_mslp is not None:
-                    errors_by_lead_time[lead_time_hours]["ifs_mslp"].append(ifs_mslp - obs_mslp)
+                    _add(lead_time_hours, "ifs_mslp", ifs_mslp - obs_mslp)
 
     # NWS verification (temperature only) using cached forecast + WeatherLink observations
     nws_cache = load_nws_cache()
-    if nws_cache and nws_cache.get("forecast") and nws_cache.get("fetched_at"):
+    runs = nws_cache.get("runs", []) if isinstance(nws_cache, dict) else []
+    for run in runs:
+        if not run.get("forecast") or not run.get("fetched_at"):
+            continue
         try:
-            nws_init = datetime.fromisoformat(nws_cache["fetched_at"])
+            nws_init = datetime.fromisoformat(run["fetched_at"])
             if nws_init.tzinfo is None:
                 nws_init = nws_init.replace(tzinfo=timezone.utc)
         except Exception:
-            nws_init = None
+            continue
 
-        if nws_init:
-            for entry in nws_cache.get("forecast", []):
-                try:
-                    valid_time = datetime.fromisoformat(entry["datetime"])
-                    if valid_time.tzinfo is None:
-                        valid_time = valid_time.replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
+        for entry in run.get("forecast", []):
+            try:
+                valid_time = datetime.fromisoformat(entry["datetime"])
+                if valid_time.tzinfo is None:
+                    valid_time = valid_time.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
 
-                if valid_time >= now:
-                    continue
+            if valid_time >= now:
+                continue
 
-                # Only include 6-hourly verification times
-                if valid_time.hour % 6 != 0:
-                    continue
+            # Only include 6-hourly verification times
+            if valid_time.hour % 6 != 0:
+                continue
 
-                lead_time_hours = int((valid_time - nws_init).total_seconds() / 3600)
-                obs_temp = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
-                temp_val = entry.get("temperature")
-                if obs_temp is None or temp_val is None:
-                    continue
+            lead_time_hours = int((valid_time - nws_init).total_seconds() / 3600)
+            obs_temp = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
+            temp_val = entry.get("temperature")
+            if obs_temp is None or temp_val is None:
+                continue
 
-                if lead_time_hours not in errors_by_lead_time:
-                    errors_by_lead_time[lead_time_hours] = {
-                        "gfs_temp": [], "aifs_temp": [], "ifs_temp": [], "nws_temp": [],
-                        "gfs_mslp": [], "aifs_mslp": [], "ifs_mslp": []
-                    }
-
-                errors_by_lead_time[lead_time_hours]["nws_temp"].append(temp_val - obs_temp)
+            _add(lead_time_hours, "nws_temp", temp_val - obs_temp)
 
     # Calculate statistics for each lead time
     lead_times = sorted(errors_by_lead_time.keys())
@@ -1394,65 +1411,74 @@ def calculate_lead_time_verification(location_name: str) -> dict:
         gfs_temp_errors = errors["gfs_temp"]
         aifs_temp_errors = errors["aifs_temp"]
 
-        if gfs_temp_errors:
-            result["gfs_temp_mae"].append(round(sum(abs(e) for e in gfs_temp_errors) / len(gfs_temp_errors), 2))
-            result["gfs_temp_bias"].append(round(sum(gfs_temp_errors) / len(gfs_temp_errors), 2))
+        if gfs_temp_errors["count"] > 0:
+            result["gfs_temp_mae"].append(round(gfs_temp_errors["sum_abs"] / gfs_temp_errors["count"], 2))
+            result["gfs_temp_bias"].append(round(gfs_temp_errors["sum"] / gfs_temp_errors["count"], 2))
         else:
             result["gfs_temp_mae"].append(None)
             result["gfs_temp_bias"].append(None)
 
-        if aifs_temp_errors:
-            result["aifs_temp_mae"].append(round(sum(abs(e) for e in aifs_temp_errors) / len(aifs_temp_errors), 2))
-            result["aifs_temp_bias"].append(round(sum(aifs_temp_errors) / len(aifs_temp_errors), 2))
+        if aifs_temp_errors["count"] > 0:
+            result["aifs_temp_mae"].append(round(aifs_temp_errors["sum_abs"] / aifs_temp_errors["count"], 2))
+            result["aifs_temp_bias"].append(round(aifs_temp_errors["sum"] / aifs_temp_errors["count"], 2))
         else:
             result["aifs_temp_mae"].append(None)
             result["aifs_temp_bias"].append(None)
 
         ifs_temp_errors = errors["ifs_temp"]
-        if ifs_temp_errors:
-            result["ifs_temp_mae"].append(round(sum(abs(e) for e in ifs_temp_errors) / len(ifs_temp_errors), 2))
-            result["ifs_temp_bias"].append(round(sum(ifs_temp_errors) / len(ifs_temp_errors), 2))
+        if ifs_temp_errors["count"] > 0:
+            result["ifs_temp_mae"].append(round(ifs_temp_errors["sum_abs"] / ifs_temp_errors["count"], 2))
+            result["ifs_temp_bias"].append(round(ifs_temp_errors["sum"] / ifs_temp_errors["count"], 2))
         else:
             result["ifs_temp_mae"].append(None)
             result["ifs_temp_bias"].append(None)
 
-        nws_temp_errors = errors.get("nws_temp", [])
-        if nws_temp_errors:
-            result["nws_temp_mae"].append(round(sum(abs(e) for e in nws_temp_errors) / len(nws_temp_errors), 2))
-            result["nws_temp_bias"].append(round(sum(nws_temp_errors) / len(nws_temp_errors), 2))
+        nws_temp_errors = errors.get("nws_temp", None)
+        if nws_temp_errors and nws_temp_errors["count"] > 0:
+            result["nws_temp_mae"].append(round(nws_temp_errors["sum_abs"] / nws_temp_errors["count"], 2))
+            result["nws_temp_bias"].append(round(nws_temp_errors["sum"] / nws_temp_errors["count"], 2))
         else:
             result["nws_temp_mae"].append(None)
             result["nws_temp_bias"].append(None)
 
-        result["temp_sample_counts"].append(max(len(gfs_temp_errors), len(aifs_temp_errors), len(ifs_temp_errors), len(nws_temp_errors)))
+        result["temp_sample_counts"].append(max(
+            gfs_temp_errors["count"],
+            aifs_temp_errors["count"],
+            ifs_temp_errors["count"],
+            nws_temp_errors["count"] if nws_temp_errors else 0
+        ))
 
         # MSLP
         gfs_mslp_errors = errors["gfs_mslp"]
         aifs_mslp_errors = errors["aifs_mslp"]
 
-        if gfs_mslp_errors:
-            result["gfs_mslp_mae"].append(round(sum(abs(e) for e in gfs_mslp_errors) / len(gfs_mslp_errors), 2))
-            result["gfs_mslp_bias"].append(round(sum(gfs_mslp_errors) / len(gfs_mslp_errors), 2))
+        if gfs_mslp_errors["count"] > 0:
+            result["gfs_mslp_mae"].append(round(gfs_mslp_errors["sum_abs"] / gfs_mslp_errors["count"], 2))
+            result["gfs_mslp_bias"].append(round(gfs_mslp_errors["sum"] / gfs_mslp_errors["count"], 2))
         else:
             result["gfs_mslp_mae"].append(None)
             result["gfs_mslp_bias"].append(None)
 
-        if aifs_mslp_errors:
-            result["aifs_mslp_mae"].append(round(sum(abs(e) for e in aifs_mslp_errors) / len(aifs_mslp_errors), 2))
-            result["aifs_mslp_bias"].append(round(sum(aifs_mslp_errors) / len(aifs_mslp_errors), 2))
+        if aifs_mslp_errors["count"] > 0:
+            result["aifs_mslp_mae"].append(round(aifs_mslp_errors["sum_abs"] / aifs_mslp_errors["count"], 2))
+            result["aifs_mslp_bias"].append(round(aifs_mslp_errors["sum"] / aifs_mslp_errors["count"], 2))
         else:
             result["aifs_mslp_mae"].append(None)
             result["aifs_mslp_bias"].append(None)
 
         ifs_mslp_errors = errors["ifs_mslp"]
-        if ifs_mslp_errors:
-            result["ifs_mslp_mae"].append(round(sum(abs(e) for e in ifs_mslp_errors) / len(ifs_mslp_errors), 2))
-            result["ifs_mslp_bias"].append(round(sum(ifs_mslp_errors) / len(ifs_mslp_errors), 2))
+        if ifs_mslp_errors["count"] > 0:
+            result["ifs_mslp_mae"].append(round(ifs_mslp_errors["sum_abs"] / ifs_mslp_errors["count"], 2))
+            result["ifs_mslp_bias"].append(round(ifs_mslp_errors["sum"] / ifs_mslp_errors["count"], 2))
         else:
             result["ifs_mslp_mae"].append(None)
             result["ifs_mslp_bias"].append(None)
 
-        result["mslp_sample_counts"].append(max(len(gfs_mslp_errors), len(aifs_mslp_errors), len(ifs_mslp_errors)))
+        result["mslp_sample_counts"].append(max(
+            gfs_mslp_errors["count"],
+            aifs_mslp_errors["count"],
+            ifs_mslp_errors["count"]
+        ))
 
     return result
 
@@ -1496,9 +1522,47 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
 
     fcst_key, obs_key = var_map[variable]
 
-    # Collect errors grouped by date
-    # Key: date string (YYYY-MM-DD), Value: {"gfs": [errors], "aifs": [errors], "ifs": [errors], "nws": [errors]}
+    # Collect sums/counts grouped by date
+    # Key: date string (YYYY-MM-DD)
     errors_by_date = {}
+
+    def _ensure_date(date_key):
+        if date_key not in errors_by_date:
+            errors_by_date[date_key] = {
+                "gfs": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "aifs": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "ifs": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "nws": {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+            }
+
+    def _add(date_key, model_key, err):
+        _ensure_date(date_key)
+        errors_by_date[date_key][model_key]["sum_abs"] += abs(err)
+        errors_by_date[date_key][model_key]["sum"] += err
+        errors_by_date[date_key][model_key]["count"] += 1
+
+    # Seed from cached daily stats (keeps long-term trend after trimming)
+    cached_ts = db[location_name].get("cumulative_stats", {}).get("time_series", {})
+    for date_key, model_data in cached_ts.items():
+        try:
+            date_obj = datetime.fromisoformat(date_key).date()
+        except ValueError:
+            continue
+        if date_obj < cutoff_date.date():
+            continue
+
+        _ensure_date(date_key)
+        model_key = None
+        var_key = 'temp' if variable == 'temp' else 'mslp'
+
+        for model_key in ["gfs", "aifs", "ifs"]:
+            for lt_key, stats in model_data.get(model_key, {}).get(var_key, {}).items():
+                # Keep only the selected lead time
+                if int(lt_key) != lead_time_hours:
+                    continue
+                errors_by_date[date_key][model_key]["sum_abs"] += stats.get("sum_abs", 0.0)
+                errors_by_date[date_key][model_key]["sum"] += stats.get("sum", 0.0)
+                errors_by_date[date_key][model_key]["count"] += stats.get("count", 0)
 
     # Build observed lookup by valid time for NWS verification (temp only)
     obs_by_time = {}
@@ -1560,71 +1624,70 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
 
             # Use the date of the valid time for grouping
             date_key = valid_time.date().isoformat()
-
-            if date_key not in errors_by_date:
-                errors_by_date[date_key] = {"gfs": [], "aifs": [], "ifs": [], "nws": []}
+            _ensure_date(date_key)
 
             # Collect errors for each model
             if i < len(gfs_values) and i < len(obs_values):
                 gfs_val = gfs_values[i]
                 obs_val = obs_values[i]
                 if gfs_val is not None and obs_val is not None:
-                    errors_by_date[date_key]["gfs"].append(gfs_val - obs_val)
+                    _add(date_key, "gfs", gfs_val - obs_val)
 
             if i < len(aifs_values) and i < len(obs_values):
                 aifs_val = aifs_values[i]
                 obs_val = obs_values[i]
                 if aifs_val is not None and obs_val is not None:
-                    errors_by_date[date_key]["aifs"].append(aifs_val - obs_val)
+                    _add(date_key, "aifs", aifs_val - obs_val)
 
             if ifs_values and i < len(ifs_values) and i < len(obs_values):
                 ifs_val = ifs_values[i]
                 obs_val = obs_values[i]
                 if ifs_val is not None and obs_val is not None:
-                    errors_by_date[date_key]["ifs"].append(ifs_val - obs_val)
+                    _add(date_key, "ifs", ifs_val - obs_val)
 
     # NWS verification (temperature only) using cached forecast + WeatherLink observations
     if variable == 'temp':
         nws_cache = load_nws_cache()
-        if nws_cache and nws_cache.get("forecast") and nws_cache.get("fetched_at"):
+        runs = nws_cache.get("runs", []) if isinstance(nws_cache, dict) else []
+        for run in runs:
+            if not run.get("forecast") or not run.get("fetched_at"):
+                continue
             try:
-                nws_init = datetime.fromisoformat(nws_cache["fetched_at"])
+                nws_init = datetime.fromisoformat(run["fetched_at"])
                 if nws_init.tzinfo is None:
                     nws_init = nws_init.replace(tzinfo=timezone.utc)
             except Exception:
-                nws_init = None
+                continue
 
-            if nws_init:
-                for entry in nws_cache.get("forecast", []):
-                    try:
-                        valid_time = datetime.fromisoformat(entry["datetime"])
-                        if valid_time.tzinfo is None:
-                            valid_time = valid_time.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        continue
+            for entry in run.get("forecast", []):
+                try:
+                    valid_time = datetime.fromisoformat(entry["datetime"])
+                    if valid_time.tzinfo is None:
+                        valid_time = valid_time.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
 
-                    # Only include past times
-                    if valid_time >= now:
-                        continue
+                # Only include past times
+                if valid_time >= now:
+                    continue
 
-                    # Only include 6-hourly verification times
-                    if valid_time.hour % 6 != 0:
-                        continue
+                # Only include 6-hourly verification times
+                if valid_time.hour % 6 != 0:
+                    continue
 
-                    # Calculate lead time in hours
-                    lead_time = int((valid_time - nws_init).total_seconds() / 3600)
-                    if lead_time != lead_time_hours:
-                        continue
+                # Calculate lead time in hours
+                lead_time = int((valid_time - nws_init).total_seconds() / 3600)
+                if lead_time != lead_time_hours:
+                    continue
 
-                    temp_val = entry.get("temperature")
-                    obs_val = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
-                    if temp_val is None or obs_val is None:
-                        continue
+                temp_val = entry.get("temperature")
+                obs_val = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
+                if temp_val is None or obs_val is None:
+                    continue
 
-                    date_key = valid_time.date().isoformat()
-                    if date_key not in errors_by_date:
-                        errors_by_date[date_key] = {"gfs": [], "aifs": [], "ifs": [], "nws": []}
-                    errors_by_date[date_key]["nws"].append(temp_val - obs_val)
+                date_key = valid_time.date().isoformat()
+                _ensure_date(date_key)
+                _add(date_key, "nws", temp_val - obs_val)
 
     # Calculate daily MAE and Bias
     dates = sorted(errors_by_date.keys())
@@ -1640,26 +1703,26 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
 
     for date in dates:
         for model in ["gfs", "aifs", "ifs"]:
-            errors = errors_by_date[date][model]
-            if errors:
-                mae = sum(abs(e) for e in errors) / len(errors)
-                bias = sum(errors) / len(errors)
+            stats = errors_by_date[date][model]
+            if stats["count"] > 0:
+                mae = stats["sum_abs"] / stats["count"]
+                bias = stats["sum"] / stats["count"]
                 result[model]["mae"].append(round(mae, 2))
                 result[model]["bias"].append(round(bias, 2))
-                result[model]["counts"].append(len(errors))
+                result[model]["counts"].append(stats["count"])
             else:
                 result[model]["mae"].append(None)
                 result[model]["bias"].append(None)
                 result[model]["counts"].append(0)
 
-        if variable == 'temp' and "nws" in errors_by_date[date]:
-            errors = errors_by_date[date]["nws"]
-            if errors:
-                mae = sum(abs(e) for e in errors) / len(errors)
-                bias = sum(errors) / len(errors)
+        if variable == 'temp':
+            stats = errors_by_date[date]["nws"]
+            if stats["count"] > 0:
+                mae = stats["sum_abs"] / stats["count"]
+                bias = stats["sum"] / stats["count"]
                 result["nws"]["mae"].append(round(mae, 2))
                 result["nws"]["bias"].append(round(bias, 2))
-                result["nws"]["counts"].append(len(errors))
+                result["nws"]["counts"].append(stats["count"])
             else:
                 result["nws"]["mae"].append(None)
                 result["nws"]["bias"].append(None)
@@ -1677,7 +1740,7 @@ def save_forecast_data(location_name, gfs_data, aifs_data, observed=None, verifi
 
     # Initialize location if needed
     if location_name not in db:
-        db[location_name] = {"runs": {}, "latest_run": None}
+        db[location_name] = {"runs": {}, "latest_run": None, "cumulative_stats": {}}
 
     # Use GFS init_time as the run key (all models should have same init time)
     run_key = gfs_data.get("init_time")
@@ -1708,9 +1771,240 @@ def save_forecast_data(location_name, gfs_data, aifs_data, observed=None, verifi
     db[location_name]["runs"][run_key] = run_data
     db[location_name]["latest_run"] = run_key
 
+    # Trim runs while preserving long-term stats
+    prune_forecasts_db(db, location_name, retention_days=FORECAST_RETENTION_DAYS)
+
     save_forecasts_db(db)
     logger.info(f"Saved run {run_key} for {location_name} (total runs: {len(db[location_name]['runs'])})")
     return str(FORECASTS_FILE)
+
+
+def _init_cumulative_stats(location_data: dict):
+    if "cumulative_stats" not in location_data:
+        location_data["cumulative_stats"] = {}
+    stats = location_data["cumulative_stats"]
+    if "by_lead_time" not in stats:
+        stats["by_lead_time"] = {}
+    if "time_series" not in stats:
+        stats["time_series"] = {}
+    if "total_runs" not in stats:
+        stats["total_runs"] = 0
+    if "generated_at" not in stats:
+        stats["generated_at"] = None
+
+
+def _accumulate_fairfax_stats_from_run(location_data: dict, run_data: dict):
+    """
+    Accumulate long-term verification stats from a run before it is trimmed.
+    Stores sums and counts by lead time for temp/mslp and model.
+    """
+    _init_cumulative_stats(location_data)
+    cumulative = location_data["cumulative_stats"]["by_lead_time"]
+
+    observed = run_data.get("observed")
+    if not observed or not observed.get("temps"):
+        return
+
+    gfs_data = run_data.get("gfs", {})
+    aifs_data = run_data.get("aifs", {})
+    ifs_data = run_data.get("ifs", {})
+
+    init_time_str = gfs_data.get("init_time")
+    if not init_time_str:
+        return
+
+    try:
+        init_time = datetime.fromisoformat(init_time_str)
+        if init_time.tzinfo is None:
+            init_time = init_time.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return
+
+    forecast_times = gfs_data.get("times", [])
+    gfs_temps = gfs_data.get("temps", [])
+    aifs_temps = aifs_data.get("temps", [])
+    ifs_temps = ifs_data.get("temps", []) if ifs_data else []
+    gfs_mslps = gfs_data.get("mslps", [])
+    aifs_mslps = aifs_data.get("mslps", [])
+    ifs_mslps = ifs_data.get("mslps", []) if ifs_data else []
+    obs_temps = observed.get("temps", [])
+    obs_mslps = observed.get("mslps", [])
+
+    for i, time_str in enumerate(forecast_times):
+        try:
+            valid_time = datetime.fromisoformat(time_str)
+            if valid_time.tzinfo is None:
+                valid_time = valid_time.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        lead_time_hours = int((valid_time - init_time).total_seconds() / 3600)
+        lt_key = str(lead_time_hours)
+        if lt_key not in cumulative:
+            cumulative[lt_key] = {
+                "gfs_temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "aifs_temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "ifs_temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "gfs_mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "aifs_mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "ifs_mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+            }
+
+        def _acc(model_key, fcst_vals, obs_vals):
+            if i < len(fcst_vals) and i < len(obs_vals):
+                fcst_val = fcst_vals[i]
+                obs_val = obs_vals[i]
+                if fcst_val is not None and obs_val is not None:
+                    err = fcst_val - obs_val
+                    cumulative[lt_key][model_key]["sum_abs"] += abs(err)
+                    cumulative[lt_key][model_key]["sum"] += err
+                    cumulative[lt_key][model_key]["count"] += 1
+
+        _acc("gfs_temp", gfs_temps, obs_temps)
+        _acc("aifs_temp", aifs_temps, obs_temps)
+        if ifs_temps:
+            _acc("ifs_temp", ifs_temps, obs_temps)
+
+        _acc("gfs_mslp", gfs_mslps, obs_mslps)
+        _acc("aifs_mslp", aifs_mslps, obs_mslps)
+        if ifs_mslps:
+            _acc("ifs_mslp", ifs_mslps, obs_mslps)
+
+
+def _accumulate_fairfax_daily_stats_from_run(location_data: dict, run_data: dict):
+    """
+    Accumulate per-day MAE/bias stats from a run into the time_series cache.
+    """
+    _init_cumulative_stats(location_data)
+    time_series = location_data["cumulative_stats"]["time_series"]
+
+    observed = run_data.get("observed")
+    if not observed or not observed.get("temps"):
+        return
+
+    gfs_data = run_data.get("gfs", {})
+    aifs_data = run_data.get("aifs", {})
+    ifs_data = run_data.get("ifs", {})
+
+    init_time_str = gfs_data.get("init_time")
+    if not init_time_str:
+        return
+
+    try:
+        init_time = datetime.fromisoformat(init_time_str)
+        if init_time.tzinfo is None:
+            init_time = init_time.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return
+
+    forecast_times = gfs_data.get("times", [])
+    gfs_temps = gfs_data.get("temps", [])
+    aifs_temps = aifs_data.get("temps", [])
+    ifs_temps = ifs_data.get("temps", []) if ifs_data else []
+    gfs_mslps = gfs_data.get("mslps", [])
+    aifs_mslps = aifs_data.get("mslps", [])
+    ifs_mslps = ifs_data.get("mslps", []) if ifs_data else []
+    obs_temps = observed.get("temps", [])
+    obs_mslps = observed.get("mslps", [])
+
+    def _ensure(date_key, model, var, lt_key):
+        time_series.setdefault(date_key, {})
+        time_series[date_key].setdefault(model, {})
+        time_series[date_key][model].setdefault(var, {})
+        time_series[date_key][model][var].setdefault(lt_key, {"sum_abs": 0.0, "sum": 0.0, "count": 0})
+
+    def _add(date_key, model, var, lt_key, err):
+        _ensure(date_key, model, var, lt_key)
+        stats = time_series[date_key][model][var][lt_key]
+        stats["sum_abs"] += abs(err)
+        stats["sum"] += err
+        stats["count"] += 1
+
+    for i, time_str in enumerate(forecast_times):
+        try:
+            valid_time = datetime.fromisoformat(time_str)
+            if valid_time.tzinfo is None:
+                valid_time = valid_time.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        date_key = valid_time.date().isoformat()
+        lead_time_hours = int((valid_time - init_time).total_seconds() / 3600)
+        lt_key = str(lead_time_hours)
+
+        if i < len(gfs_temps) and i < len(obs_temps):
+            fcst_val = gfs_temps[i]
+            obs_val = obs_temps[i]
+            if fcst_val is not None and obs_val is not None:
+                _add(date_key, "gfs", "temp", lt_key, fcst_val - obs_val)
+
+        if i < len(aifs_temps) and i < len(obs_temps):
+            fcst_val = aifs_temps[i]
+            obs_val = obs_temps[i]
+            if fcst_val is not None and obs_val is not None:
+                _add(date_key, "aifs", "temp", lt_key, fcst_val - obs_val)
+
+        if ifs_temps and i < len(ifs_temps) and i < len(obs_temps):
+            fcst_val = ifs_temps[i]
+            obs_val = obs_temps[i]
+            if fcst_val is not None and obs_val is not None:
+                _add(date_key, "ifs", "temp", lt_key, fcst_val - obs_val)
+
+        if i < len(gfs_mslps) and i < len(obs_mslps):
+            fcst_val = gfs_mslps[i]
+            obs_val = obs_mslps[i]
+            if fcst_val is not None and obs_val is not None:
+                _add(date_key, "gfs", "mslp", lt_key, fcst_val - obs_val)
+
+        if i < len(aifs_mslps) and i < len(obs_mslps):
+            fcst_val = aifs_mslps[i]
+            obs_val = obs_mslps[i]
+            if fcst_val is not None and obs_val is not None:
+                _add(date_key, "aifs", "mslp", lt_key, fcst_val - obs_val)
+
+        if ifs_mslps and i < len(ifs_mslps) and i < len(obs_mslps):
+            fcst_val = ifs_mslps[i]
+            obs_val = obs_mslps[i]
+            if fcst_val is not None and obs_val is not None:
+                _add(date_key, "ifs", "mslp", lt_key, fcst_val - obs_val)
+
+
+def prune_forecasts_db(db: dict, location_name: str, retention_days: int = 20):
+    """
+    Trim old runs while preserving long-term stats.
+    """
+    if location_name not in db:
+        return
+
+    location_data = db[location_name]
+    _init_cumulative_stats(location_data)
+
+    runs = location_data.get("runs", {})
+    if not runs:
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    to_delete = []
+
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        if init_time < cutoff:
+            _accumulate_fairfax_stats_from_run(location_data, run_data)
+            _accumulate_fairfax_daily_stats_from_run(location_data, run_data)
+            to_delete.append(run_key)
+
+    for run_key in to_delete:
+        runs.pop(run_key, None)
+
+    if to_delete:
+        location_data["cumulative_stats"]["total_runs"] += len(to_delete)
+        location_data["cumulative_stats"]["generated_at"] = datetime.now(timezone.utc).isoformat()
 
 
 def get_latest_init_times(init_hour: Optional[int] = None):
@@ -3241,6 +3535,7 @@ def api_asos_verification_map():
     metric = request.args.get('metric', 'mae')
     model = request.args.get('model', 'gfs')
     lead_time = int(request.args.get('lead_time', 24))
+    period = request.args.get('period', 'all')
 
     # Check cache
     cache_key = f"{variable}_{metric}_{model}_{lead_time}"
@@ -3252,8 +3547,11 @@ def api_asos_verification_map():
             return jsonify(_verification_cache[cache_key])
 
     try:
-        # Get verification data from cache
-        verification = asos.get_verification_data_from_cache(model, variable, lead_time)
+        # Get verification data (all-time cache or recent window)
+        if period == 'monthly':
+            verification = asos.get_verification_data_from_monthly_cache(model, variable, lead_time)
+        else:
+            verification = asos.get_verification_data_from_cache(model, variable, lead_time)
 
         if not verification:
             return jsonify({
@@ -3400,7 +3698,10 @@ def api_nws_forecast_cache():
     data = load_nws_cache()
     if not data:
         return jsonify({"success": False, "error": "No NWS cache available"}), 200
-    return jsonify(data)
+    runs = data.get("runs", [])
+    if not runs:
+        return jsonify({"success": False, "error": "No NWS cache available"}), 200
+    return jsonify(runs[-1])
 
 
 @app.route('/api/asos/station-verification')
@@ -3408,6 +3709,7 @@ def api_asos_station_verification():
     """Get detailed verification for a single station across all lead times."""
     station_id = request.args.get('station_id')
     model = request.args.get('model') # Required model filter
+    period = request.args.get('period', 'all')
 
     if not station_id:
         return jsonify({"success": False, "error": "Missing station_id parameter"}), 400
@@ -3415,7 +3717,10 @@ def api_asos_station_verification():
         return jsonify({"success": False, "error": "Missing model parameter"}), 400
 
     try:
-        raw_result = asos.get_station_detail(station_id, model)
+        if period == 'monthly':
+            raw_result = asos.get_station_detail_monthly(station_id, model, days_back=30)
+        else:
+            raw_result = asos.get_station_detail(station_id, model)
 
         if "error" in raw_result:
             return jsonify({"success": False, "error": raw_result["error"]}), 404
@@ -3451,7 +3756,8 @@ def api_asos_station_verification():
             "success": True,
             "station_id": station_id,
             "station_name": raw_result["station"]["name"],
-            "verification": verification_data
+            "verification": verification_data,
+            "period": period
         })
 
     except Exception as e:
@@ -3509,11 +3815,17 @@ def api_asos_mean_verification():
     """Get mean verification (MAE and Bias) across all stations by lead time for all models."""
     # The 'model' parameter is no longer taken here, as we fetch for all models.
     # Location is not directly used for mean across all stations.
+    period = request.args.get('period', 'all').lower()
 
     try:
-        gfs_results = asos.get_mean_verification_from_cache('gfs')
-        aifs_results = asos.get_mean_verification_from_cache('aifs')
-        ifs_results = asos.get_mean_verification_from_cache('ifs')
+        if period == 'monthly':
+            gfs_results = asos.get_mean_verification_from_monthly_cache('gfs')
+            aifs_results = asos.get_mean_verification_from_monthly_cache('aifs')
+            ifs_results = asos.get_mean_verification_from_monthly_cache('ifs')
+        else:
+            gfs_results = asos.get_mean_verification_from_cache('gfs')
+            aifs_results = asos.get_mean_verification_from_cache('aifs')
+            ifs_results = asos.get_mean_verification_from_cache('ifs')
 
         # Check for errors from asos functions
         if "error" in gfs_results:
@@ -3567,13 +3879,33 @@ def api_asos_mean_verification():
         }
 
         # Get cache timestamp
-        cache = asos.load_verification_cache()
-        cache_timestamp = cache.get("last_updated") if cache else None
+        window_start = None
+        window_end = None
+        if period == 'monthly':
+            db = asos.load_asos_forecasts_db()
+            cache_timestamp = db.get("cumulative_stats", {}).get("monthly_generated_at")
+            if cache_timestamp:
+                try:
+                    end_dt = datetime.fromisoformat(cache_timestamp)
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    start_dt = end_dt - timedelta(days=30)
+                    window_start = start_dt.isoformat()
+                    window_end = end_dt.isoformat()
+                except Exception:
+                    window_start = None
+                    window_end = None
+        else:
+            cache = asos.load_verification_cache()
+            cache_timestamp = cache.get("last_updated") if cache else None
 
         return jsonify({
             "success": True,
             "verification": combined_verification,
-            "cache_timestamp": cache_timestamp
+            "cache_timestamp": cache_timestamp,
+            "period": period,
+            "window_start": window_start,
+            "window_end": window_end
         })
 
     except Exception as e:
@@ -3902,6 +4234,10 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
             obs_count = asos.fetch_and_store_observations()
             broadcast_sync_log(f"Fetched {obs_count} ASOS observations", 'success')
             asos_results['observations'] = {'status': 'synced', 'count': obs_count}
+
+            broadcast_sync_log("Rebuilding monthly ASOS cache (last 30 days)...", 'info')
+            asos.rebuild_monthly_station_cache(days_back=30)
+            broadcast_sync_log("Monthly ASOS cache updated", 'success')
 
             results['asos'] = {
                 'status': 'success',

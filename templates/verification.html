@@ -99,6 +99,10 @@
                             <option value="288">12d</option>
                             <option value="360">15d</option>
                         </select>
+                        <div class="form-check form-switch align-self-center ms-1">
+                            <input class="form-check-input" type="checkbox" id="asosPeriodToggle">
+                            <label class="form-check-label small" for="asosPeriodToggle">Last 30 days</label>
+                        </div>
                     </div>
                 </div>
                 <div class="card-body p-0">
@@ -116,6 +120,7 @@
                     <!-- ASOS Station Detailed Charts -->
                     <div id="asosStationCharts" class="card-body border-top d-none">
                         <h5 class="card-title mb-3">Verification for <span id="asosStationName"></span></h5>
+                        <div id="asosStationMessage" class="alert alert-info d-none mb-3"></div>
                         <div class="row">
                             <div class="col-lg-6 mb-4">
                                 <div class="card h-100">
@@ -149,15 +154,15 @@
                                                 <tr>
                                                     <th>Lead Time</th>
                                                     <th>Days</th>
-                                                    <th colspan="2" class="text-center bg-danger bg-opacity-10">GFS Temperature</th>
-                                                    <th colspan="2" class="text-center bg-warning bg-opacity-10">AIFS Temperature</th>
+                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Temperature</th>
+                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Temperature</th>
                                                     <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Temperature</th>
                                                     <th>Winner</th>
-                                                    <th colspan="2" class="text-center bg-danger bg-opacity-10">GFS Pressure</th>
-                                                    <th colspan="2" class="text-center bg-warning bg-opacity-10">AIFS Pressure</th>
+                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Pressure</th>
+                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Pressure</th>
                                                     <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Pressure</th>
-                                                    <th colspan="2" class="text-center bg-danger bg-opacity-10">GFS Precipitation</th>
-                                                    <th colspan="2" class="text-center bg-warning bg-opacity-10">AIFS Precipitation</th>
+                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Precipitation</th>
+                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Precipitation</th>
                                                     <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Precipitation</th>
                                                 </tr>
                                                 <tr>
@@ -455,18 +460,25 @@ function clearAsosMarkers() {
 
 let currentAsosTempChart = null;
 let currentAsosMslpChart = null;
+let currentAsosStationId = null;
+let currentAsosStationName = null;
 
 // Load detailed verification data for a single ASOS station
 async function loadAsosStationCharts(stationId, stationName) {
     const model = document.getElementById('asosModel').value; // Get the selected model
+    const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
+
+    currentAsosStationId = stationId;
+    currentAsosStationName = stationName;
 
     // Show the chart container and update the station name
     document.getElementById('asosStationCharts').classList.remove('d-none');
-    document.getElementById('asosStationName').textContent = stationName;
+    const periodLabel = period === 'monthly' ? ' (Last 30 days)' : '';
+    document.getElementById('asosStationName').textContent = stationName + periodLabel;
 
     try {
         const response = await fetch(
-            `/api/asos/station-verification?station_id=${encodeURIComponent(stationId)}&model=${encodeURIComponent(model)}`
+            `/api/asos/station-verification?station_id=${encodeURIComponent(stationId)}&model=${encodeURIComponent(model)}&period=${period}`
         );
         const data = await response.json();
 
@@ -474,24 +486,36 @@ async function loadAsosStationCharts(stationId, stationName) {
             throw new Error(data.error || 'No detailed verification data available for this station.');
         }
 
-        renderAsosVerificationCharts(data.verification);
+        document.getElementById('asosStationMessage').classList.add('d-none');
+        renderAsosVerificationCharts(data.verification, period);
 
     } catch (error) {
         console.error(`Error loading detailed verification for ${stationName}:`, error);
-        // Optionally hide the chart section or display an error message there
-        document.getElementById('asosStationCharts').classList.add('d-none');
+        const msgEl = document.getElementById('asosStationMessage');
+        msgEl.textContent = period === 'monthly'
+            ? 'No 30-day station data yet. Run a sync or switch to All-time.'
+            : 'No station verification data available yet.';
+        msgEl.classList.remove('d-none');
     }
 }
 
 // Render detailed verification charts for a single ASOS station
-function renderAsosVerificationCharts(v) {
-    const labels = v.lead_times.map(h => formatLeadTime(h));
+function renderAsosVerificationCharts(v, period = 'all') {
+    const periodSuffix = period === 'monthly' ? ' (30-day avg)' : '';
+    const tempIndices = v.lead_times
+        .map((_, i) => i)
+        .filter(i => v.temp_mae[i] !== null || v.temp_bias[i] !== null);
+    const mslpIndices = v.lead_times
+        .map((_, i) => i)
+        .filter(i => v.mslp_mae[i] !== null || v.mslp_bias[i] !== null);
+    const tempLabels = tempIndices.map(i => formatLeadTime(v.lead_times[i]));
+    const mslpLabels = mslpIndices.map(i => formatLeadTime(v.lead_times[i]));
 
     // Temperature MAE and Bias Chart
     const tempDatasets = [
         {
-            label: 'MAE (°F)',
-            data: v.temp_mae,
+            label: `MAE (°F)${periodSuffix}`,
+            data: tempIndices.map(i => v.temp_mae[i]),
             borderColor: '#dc3545',
             backgroundColor: 'rgba(220, 53, 69, 0.1)',
             fill: false,
@@ -501,8 +525,8 @@ function renderAsosVerificationCharts(v) {
             yAxisID: 'y'
         },
         {
-            label: 'Bias (°F)',
-            data: v.temp_bias,
+            label: `Bias (°F)${periodSuffix}`,
+            data: tempIndices.map(i => v.temp_bias[i]),
             borderColor: '#0d6efd',
             backgroundColor: 'rgba(13, 110, 253, 0.1)',
             fill: false,
@@ -517,7 +541,7 @@ function renderAsosVerificationCharts(v) {
     if (currentAsosTempChart) currentAsosTempChart.destroy();
     currentAsosTempChart = new Chart(document.getElementById('asosTempVerificationChart'), {
         type: 'line',
-        data: { labels: labels, datasets: tempDatasets },
+        data: { labels: tempLabels, datasets: tempDatasets },
         options: {
             responsive: true,
             maintainAspectRatio: false,
@@ -574,8 +598,8 @@ function renderAsosVerificationCharts(v) {
     // Pressure MAE and Bias Chart
     const mslpDatasets = [
         {
-            label: 'MAE (mb)',
-            data: v.mslp_mae,
+            label: `MAE (mb)${periodSuffix}`,
+            data: mslpIndices.map(i => v.mslp_mae[i]),
             borderColor: '#6f42c1',
             backgroundColor: 'rgba(111, 66, 193, 0.1)',
             fill: false,
@@ -585,8 +609,8 @@ function renderAsosVerificationCharts(v) {
             yAxisID: 'y'
         },
         {
-            label: 'Bias (mb)',
-            data: v.mslp_bias,
+            label: `Bias (mb)${periodSuffix}`,
+            data: mslpIndices.map(i => v.mslp_bias[i]),
             borderColor: '#fd7e14',
             backgroundColor: 'rgba(253, 126, 20, 0.1)',
             fill: false,
@@ -601,7 +625,7 @@ function renderAsosVerificationCharts(v) {
     if (currentAsosMslpChart) currentAsosMslpChart.destroy();
     currentAsosMslpChart = new Chart(document.getElementById('asosMslpVerificationChart'), {
         type: 'line',
-        data: { labels: labels, datasets: mslpDatasets },
+        data: { labels: mslpLabels, datasets: mslpDatasets },
         options: {
             responsive: true,
             maintainAspectRatio: false,
@@ -657,9 +681,9 @@ function renderAsosVerificationCharts(v) {
 }
 
 // Load and display Mean ASOS Verification
-async function loadMeanAsosVerification() {
+async function loadMeanAsosVerification(period = 'all') {
     try {
-        const response = await fetch('/api/asos/mean-verification');
+        const response = await fetch(`/api/asos/mean-verification?period=${encodeURIComponent(period)}`);
         const data = await response.json();
 
         if (!data.success) {
@@ -685,8 +709,17 @@ async function loadMeanAsosVerification() {
                 ageText = `${days}d ago`;
             }
 
+            const label = period === 'monthly' ? '30-day Cache' : 'Cache';
+            let windowText = '';
+            if (period === 'monthly' && data.window_start && data.window_end) {
+                const start = new Date(data.window_start);
+                const end = new Date(data.window_end);
+                const fmt = { month: 'short', day: 'numeric' };
+                windowText = ` (${start.toLocaleDateString('en-US', fmt)}–${end.toLocaleDateString('en-US', fmt)})`;
+            }
+
             document.getElementById('cacheTimestamp').innerHTML =
-                `<i class="bi bi-clock"></i> Cache: ${ageText}`;
+                `<i class="bi bi-clock"></i> ${label}: ${ageText}${windowText}`;
         }
 
     } catch (error) {
@@ -738,8 +771,8 @@ function renderAsosVerificationTable(v) {
         let winner = '--';
         let winnerClass = 'badge bg-secondary';
         const tempMaes = [
-            { name: 'GFS', mae: gfsTempMae, class: 'badge bg-danger' },
-            { name: 'AIFS', mae: aifsTempMae, class: 'badge bg-warning text-dark' },
+            { name: 'GFS', mae: gfsTempMae, class: 'badge bg-primary' },
+            { name: 'AIFS', mae: aifsTempMae, class: 'badge bg-info text-dark' },
             { name: 'IFS', mae: ifsTempMae, class: 'badge bg-success' }
         ].filter(m => m.mae !== null && m.mae !== undefined);
 
@@ -795,6 +828,7 @@ async function loadAsosVerification() {
     const metric = document.getElementById('asosMetric').value;
     const model = document.getElementById('asosModel').value;
     const leadTime = document.getElementById('asosLeadTime').value;
+    const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
 
     console.log(`[loadAsosVerification] Fetching map data for variable=${variable}, metric=${metric}, model=${model}, leadTime=${leadTime}`);
 
@@ -804,7 +838,7 @@ async function loadAsosVerification() {
 
     try {
         const response = await fetch(
-            `/api/asos/verification-map?variable=${variable}&metric=${metric}&model=${model}&lead_time=${leadTime}`
+            `/api/asos/verification-map?variable=${variable}&metric=${metric}&model=${model}&lead_time=${leadTime}&period=${period}`
         );
         console.log('[loadAsosVerification] Received response:', response);
 
@@ -987,8 +1021,8 @@ function renderTimeSeriesChart(data, metric) {
                 {
                     label: 'GFS',
                     data: gfsRolling,
-                    borderColor: '#dc3545',
-                    backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                    borderColor: '#0d6efd',
+                    backgroundColor: 'rgba(13, 110, 253, 0.1)',
                     borderWidth: 2,
                     tension: 0.3,
                     pointRadius: 1,
@@ -997,8 +1031,8 @@ function renderTimeSeriesChart(data, metric) {
                 {
                     label: 'AIFS',
                     data: aifsRolling,
-                    borderColor: '#ffc107',
-                    backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                    borderColor: '#0dcaf0',
+                    backgroundColor: 'rgba(13, 202, 240, 0.1)',
                     borderWidth: 2,
                     tension: 0.3,
                     pointRadius: 1,
@@ -1007,8 +1041,8 @@ function renderTimeSeriesChart(data, metric) {
                 {
                     label: 'IFS',
                     data: ifsRolling,
-                    borderColor: '#198754',
-                    backgroundColor: 'rgba(25, 135, 84, 0.1)',
+                    borderColor: '#20c997',
+                    backgroundColor: 'rgba(32, 201, 151, 0.1)',
                     borderWidth: 2,
                     tension: 0.3,
                     pointRadius: 1,
@@ -1073,8 +1107,20 @@ function renderTimeSeriesChart(data, metric) {
 // Event listeners for ASOS controls
 document.getElementById('asosVariable').addEventListener('change', loadAsosVerification);
 document.getElementById('asosMetric').addEventListener('change', loadAsosVerification);
-document.getElementById('asosModel').addEventListener('change', loadAsosVerification);
+document.getElementById('asosModel').addEventListener('change', function() {
+    loadAsosVerification();
+    if (currentAsosStationId) {
+        loadAsosStationCharts(currentAsosStationId, currentAsosStationName || '');
+    }
+});
 document.getElementById('asosLeadTime').addEventListener('change', loadAsosVerification);
+document.getElementById('asosPeriodToggle').addEventListener('change', function() {
+    loadAsosVerification();
+    loadMeanAsosVerification(this.checked ? 'monthly' : 'all');
+    if (currentAsosStationId) {
+        loadAsosStationCharts(currentAsosStationId, currentAsosStationName || '');
+    }
+});
 
 // Event listeners for time series controls
 document.getElementById('tsVariable').addEventListener('change', loadTimeSeriesChart);
@@ -1086,7 +1132,8 @@ document.getElementById('tsTimeFrame').addEventListener('change', loadTimeSeries
 document.addEventListener('DOMContentLoaded', function() {
     initAsosMap();
     setTimeout(loadAsosVerification, 50); // Small delay
-    setTimeout(loadMeanAsosVerification, 250); // Small delay for mean verification after map
+    const period = document.getElementById('asosPeriodToggle')?.checked ? 'monthly' : 'all';
+    setTimeout(() => loadMeanAsosVerification(period), 250); // Small delay for mean verification after map
     setTimeout(loadTimeSeriesChart, 300); // Load time series chart
 });
 
