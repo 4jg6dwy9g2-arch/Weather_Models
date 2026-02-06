@@ -32,6 +32,18 @@ import concurrent.futures # Import for ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# Stations known to report cumulative or unreliable precip that breaks 6-hr totals
+PRECIP_EXCLUDE_STATIONS = {"SMD"}
+
+
+def should_include_precip(fcst_val, obs_val) -> bool:
+    """Include precip verification unless both forecast and observed are zero."""
+    if fcst_val is None or obs_val is None:
+        return False
+    if fcst_val == 0 and obs_val == 0:
+        return False
+    return True
+
 # IEM Rate Limiter - 1 call per second
 iem_rate_limiter = RateLimiter(calls_per_second=1)
 
@@ -437,6 +449,11 @@ def load_asos_forecasts_db() -> dict:
                 # Ensure time_series exists in cumulative_stats
                 if "time_series" not in data["cumulative_stats"]:
                     data["cumulative_stats"]["time_series"] = {}
+                # Monthly cache for recent stats
+                if "by_station_monthly" not in data["cumulative_stats"]:
+                    data["cumulative_stats"]["by_station_monthly"] = {}
+                if "monthly_generated_at" not in data["cumulative_stats"]:
+                    data["cumulative_stats"]["monthly_generated_at"] = None
                 return data
         except Exception as e:
             logger.warning(f"Error loading asos_forecasts.json: {e}")
@@ -446,7 +463,9 @@ def load_asos_forecasts_db() -> dict:
         "cumulative_stats": {
             "by_station": {},
             "by_lead_time": {},
-            "time_series": {}
+            "time_series": {},
+            "by_station_monthly": {},
+            "monthly_generated_at": None
         }
     }
 
@@ -563,6 +582,8 @@ def accumulate_stats_from_run(
 
                     fcst_val = fcst_values[i]
                     obs_val = obs[obs_key]
+                    if var == 'precip' and not should_include_precip(fcst_val, obs_val):
+                        continue
                     error = fcst_val - obs_val
                     abs_error = abs(error)
 
@@ -631,6 +652,8 @@ def accumulate_stats_from_run(
 
                     fcst_val = fcst_values[i]
                     obs_val = obs[obs_key]
+                    if var == 'precip' and not should_include_precip(fcst_val, obs_val):
+                        continue
                     error = fcst_val - obs_val
 
                     # Initialize structures if needed
@@ -847,6 +870,8 @@ def calculate_6hr_precip_total(db: dict, station_id: str, end_time: datetime) ->
     Returns:
         6-hour precipitation total in inches, or None if insufficient data
     """
+    if station_id in PRECIP_EXCLUDE_STATIONS:
+        return None
     station_obs = db.get("observations", {}).get(station_id, {})
 
     if not station_obs:
@@ -1094,6 +1119,10 @@ def get_verification_data(
             obs_val = obs[obs_key]
 
             # Calculate error and add to running totals
+            if variable == 'precip' and not should_include_precip(fcst_val, obs_val):
+                continue
+            if variable == 'precip' and not should_include_precip(fcst_val, obs_val):
+                continue
             error = fcst_val - obs_val
             if station_id not in station_stats:
                 station_stats[station_id] = {
@@ -1117,6 +1146,106 @@ def get_verification_data(
         mae = stats['sum_abs_errors'] / stats['count']
         bias = stats['sum_errors'] / stats['count']
 
+        results[station_id] = {
+            'mae': round(mae, 2),
+            'bias': round(bias, 2),
+            'count': stats['count'],
+            'lat': station.get('lat'),
+            'lon': station.get('lon'),
+            'name': station.get('name', station_id),
+            'state': station.get('state', '')
+        }
+
+    return results
+
+
+def get_verification_data_recent(
+    model: str,
+    variable: str,
+    lead_time_hours: int,
+    days_back: int = 30
+) -> Dict[str, dict]:
+    """
+    Get verification data for all stations within a recent window.
+    Uses run data + stored observations only (no cumulative stats).
+    """
+    db = load_asos_forecasts_db()
+    stations = db.get("stations", {})
+    runs = db.get("runs", {})
+
+    if not stations:
+        return {}
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days_back)
+
+    var_map = {
+        'temp': ('temps', 'temp'),
+        'mslp': ('mslps', 'mslp'),
+        'precip': ('precips', 'precip_6hr')
+    }
+    if variable not in var_map:
+        return {}
+
+    fcst_key, obs_key = var_map[variable]
+
+    station_stats = {}
+
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        forecast_hours = run_data.get("forecast_hours", [])
+        model_data = run_data.get(model.lower())
+        if not model_data:
+            continue
+
+        if lead_time_hours not in forecast_hours:
+            continue
+        fcst_idx = forecast_hours.index(lead_time_hours)
+
+        valid_time = init_time + timedelta(hours=lead_time_hours)
+        if valid_time >= now or valid_time < cutoff:
+            continue
+
+        for station_id, fcst_data in model_data.items():
+            if station_id not in stations:
+                continue
+
+            fcst_values = fcst_data.get(fcst_key, [])
+            if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                continue
+            fcst_val = fcst_values[fcst_idx]
+
+            obs = get_stored_observation(db, station_id, valid_time)
+            if obs is None or obs.get(obs_key) is None:
+                continue
+            obs_val = obs[obs_key]
+
+            if variable == 'precip' and not should_include_precip(fcst_val, obs_val):
+                continue
+            error = fcst_val - obs_val
+            if station_id not in station_stats:
+                station_stats[station_id] = {
+                    'sum_abs_errors': 0.0,
+                    'sum_errors': 0.0,
+                    'count': 0
+                }
+            station_stats[station_id]['sum_abs_errors'] += abs(error)
+            station_stats[station_id]['sum_errors'] += error
+            station_stats[station_id]['count'] += 1
+
+    results = {}
+    for station_id, stats in station_stats.items():
+        if stats['count'] == 0:
+            continue
+        station = stations.get(station_id, {})
+        mae = stats['sum_abs_errors'] / stats['count']
+        bias = stats['sum_errors'] / stats['count']
         results[station_id] = {
             'mae': round(mae, 2),
             'bias': round(bias, 2),
@@ -1254,11 +1383,16 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
 
                 # Precip (6-hour accumulated)
                 fcst_precips = fcst_data.get('precips', [])
-                if i < len(fcst_precips) and fcst_precips[i] is not None and obs.get('precip_6hr') is not None:
-                    error = fcst_precips[i] - obs['precip_6hr']
-                    stats_by_lt[lt][m]['precip']['sum_abs_errors'] += abs(error)
-                    stats_by_lt[lt][m]['precip']['sum_errors'] += error
-                    stats_by_lt[lt][m]['precip']['count'] += 1
+                if i < len(fcst_precips):
+                    fcst_val = fcst_precips[i]
+                    obs_val = obs.get('precip_6hr')
+                    if should_include_precip(fcst_val, obs_val):
+                        if var == 'precip' and not should_include_precip(fcst_val, obs_val):
+                            continue
+                        error = fcst_val - obs_val
+                        stats_by_lt[lt][m]['precip']['sum_abs_errors'] += abs(error)
+                        stats_by_lt[lt][m]['precip']['sum_errors'] += error
+                        stats_by_lt[lt][m]['precip']['count'] += 1
 
     # Calculate final metrics
     result_data = {}
@@ -1578,11 +1712,14 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
 
                     # Precipitation (6-hour accumulated)
                     fcst_precips = fcst_data.get('precips', [])
-                    if i < len(fcst_precips) and fcst_precips[i] is not None and obs.get('precip_6hr') is not None:
-                        error = fcst_precips[i] - obs['precip_6hr']
-                        aggregated_stats[lt]['precip']['sum_abs_errors'] += abs(error)
-                        aggregated_stats[lt]['precip']['sum_errors'] += error
-                        aggregated_stats[lt]['precip']['count'] += 1
+                    if i < len(fcst_precips):
+                        fcst_val = fcst_precips[i]
+                        obs_val = obs.get('precip_6hr')
+                        if should_include_precip(fcst_val, obs_val):
+                            error = fcst_val - obs_val
+                            aggregated_stats[lt]['precip']['sum_abs_errors'] += abs(error)
+                            aggregated_stats[lt]['precip']['sum_errors'] += error
+                            aggregated_stats[lt]['precip']['count'] += 1
 
         # Calculate mean MAE and Bias for each lead time
         result = {
@@ -1879,6 +2016,8 @@ def precompute_verification_cache() -> dict:
 
                         fcst_val = fcst_values[i]
                         obs_val = obs[obs_key]
+                        if var == 'precip' and not should_include_precip(fcst_val, obs_val):
+                            continue
                         error = fcst_val - obs_val
                         abs_error = abs(error)
 
@@ -2090,6 +2229,8 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
 
                         fcst_val = fcst_values[fcst_idx]
                         obs_val = obs[obs_key]
+                        if var == 'precip' and not should_include_precip(fcst_val, obs_val):
+                            continue
                         error = fcst_val - obs_val
 
                         # Store error by date (append to any existing cumulative data)
@@ -2140,6 +2281,62 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
     return result
 
 
+def get_station_detail_monthly(station_id: str, model: str, days_back: int = 30) -> dict:
+    """
+    Get detailed verification for a single station using the monthly cache.
+    """
+    db = load_asos_forecasts_db()
+    monthly = db.get("cumulative_stats", {}).get("by_station_monthly", {})
+
+    station = db.get("stations", {}).get(station_id)
+    if not station:
+        return {"error": "Station not found"}
+
+    model_data = monthly.get(station_id, {}).get(model, {})
+    if not model_data:
+        return {"error": "No monthly data for this station"}
+
+    # Build lead time list from available temp or mslp data
+    lead_times = sorted({int(k) for k in model_data.get("temp", {}).keys()} |
+                        {int(k) for k in model_data.get("mslp", {}).keys()})
+
+    temp_mae = []
+    temp_bias = []
+    mslp_mae = []
+    mslp_bias = []
+
+    for lt in lead_times:
+        lt_str = str(lt)
+
+        temp_stats = model_data.get("temp", {}).get(lt_str)
+        if temp_stats and temp_stats.get("count", 0) > 0:
+            count = temp_stats["count"]
+            temp_mae.append(round(temp_stats["sum_abs_errors"] / count, 2))
+            temp_bias.append(round(temp_stats["sum_errors"] / count, 2))
+        else:
+            temp_mae.append(None)
+            temp_bias.append(None)
+
+        mslp_stats = model_data.get("mslp", {}).get(lt_str)
+        if mslp_stats and mslp_stats.get("count", 0) > 0:
+            count = mslp_stats["count"]
+            mslp_mae.append(round(mslp_stats["sum_abs_errors"] / count, 2))
+            mslp_bias.append(round(mslp_stats["sum_errors"] / count, 2))
+        else:
+            mslp_mae.append(None)
+            mslp_bias.append(None)
+
+    return {
+        "station": station,
+        "lead_times": lead_times,
+        "temp_mae": temp_mae,
+        "temp_bias": temp_bias,
+        "mslp_mae": mslp_mae,
+        "mslp_bias": mslp_bias,
+        "period_days": days_back
+    }
+
+
 def get_verification_data_from_cache(
     model: str,
     variable: str,
@@ -2188,6 +2385,132 @@ def get_verification_data_from_cache(
     return results
 
 
+def get_verification_data_from_monthly_cache(
+    model: str,
+    variable: str,
+    lead_time_hours: int
+) -> Dict[str, dict]:
+    """
+    Get verification data from the rolling monthly cache.
+    """
+    db = load_asos_forecasts_db()
+    cache = db.get("cumulative_stats", {})
+    monthly = cache.get("by_station_monthly", {})
+
+    lt_str = str(lead_time_hours)
+    results = {}
+
+    for station_id, station_data in monthly.items():
+        model_data = station_data.get(model.lower(), {})
+        var_data = model_data.get(variable, {})
+        lt_stats = var_data.get(lt_str)
+        if not lt_stats:
+            continue
+
+        station_info = db.get("stations", {}).get(station_id, {})
+        count = lt_stats.get("count", 0)
+        if count <= 0:
+            continue
+
+        mae = lt_stats.get("sum_abs_errors", 0.0) / count
+        bias = lt_stats.get("sum_errors", 0.0) / count
+
+        results[station_id] = {
+            'mae': round(mae, 2),
+            'bias': round(bias, 2),
+            'count': count,
+            'lat': station_info.get('lat'),
+            'lon': station_info.get('lon'),
+            'name': station_info.get('name', station_id),
+            'state': station_info.get('state', '')
+        }
+
+    return results
+
+
+def rebuild_monthly_station_cache(days_back: int = 30) -> None:
+    """
+    Build rolling monthly per-station stats for the last N days.
+    Stored in cumulative_stats['by_station_monthly'].
+    """
+    db = load_asos_forecasts_db()
+    stations = db.get("stations", {})
+    runs = db.get("runs", {})
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days_back)
+
+    monthly = {}
+
+    var_map = {
+        'temp': ('temps', 'temp'),
+        'mslp': ('mslps', 'mslp'),
+        'precip': ('precips', 'precip_6hr')
+    }
+
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        forecast_hours = run_data.get("forecast_hours", [])
+        if not forecast_hours:
+            continue
+
+        for model in ['gfs', 'aifs', 'ifs']:
+            model_data = run_data.get(model)
+            if not model_data:
+                continue
+
+            for lead_time_hours in forecast_hours:
+                valid_time = init_time + timedelta(hours=lead_time_hours)
+                if valid_time >= now or valid_time < cutoff:
+                    continue
+
+                lt_str = str(lead_time_hours)
+
+                for station_id, fcst_data in model_data.items():
+                    if station_id not in stations:
+                        continue
+
+                    for var, (fcst_key, obs_key) in var_map.items():
+                        fcst_values = fcst_data.get(fcst_key, [])
+                        if lead_time_hours not in forecast_hours:
+                            continue
+                        try:
+                            fcst_idx = forecast_hours.index(lead_time_hours)
+                        except ValueError:
+                            continue
+
+                        if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                            continue
+                        fcst_val = fcst_values[fcst_idx]
+
+                        obs = get_stored_observation(db, station_id, valid_time)
+                        if obs is None or obs.get(obs_key) is None:
+                            continue
+                        obs_val = obs[obs_key]
+
+                        error = fcst_val - obs_val
+
+                        monthly.setdefault(station_id, {}).setdefault(model, {}).setdefault(var, {}).setdefault(
+                            lt_str, {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+                        )
+
+                        stats = monthly[station_id][model][var][lt_str]
+                        stats['sum_abs_errors'] += abs(error)
+                        stats['sum_errors'] += error
+                        stats['count'] += 1
+
+    db.setdefault("cumulative_stats", {})
+    db["cumulative_stats"]["by_station_monthly"] = monthly
+    db["cumulative_stats"]["monthly_generated_at"] = now.isoformat()
+    save_asos_forecasts_db(db)
+
+
 def get_mean_verification_from_cache(model: str) -> dict:
     """
     Get mean verification from cache for a specific model.
@@ -2230,6 +2553,71 @@ def get_mean_verification_from_cache(model: str) -> dict:
         result["mslp_bias"].append(lt_data.get("mslp", {}).get("bias"))
         result["precip_mae"].append(lt_data.get("precip", {}).get("mae"))
         result["precip_bias"].append(lt_data.get("precip", {}).get("bias"))
+
+    return result
+
+
+def get_mean_verification_from_monthly_cache(model: str) -> dict:
+    """
+    Get mean verification for the last ~30 days from the monthly cache.
+
+    Args:
+        model: Model name ('gfs', 'aifs', 'ifs')
+    """
+    db = load_asos_forecasts_db()
+    monthly = db.get("cumulative_stats", {}).get("by_station_monthly", {})
+
+    # Collect all lead times available for this model
+    lead_times = set()
+    for station_data in monthly.values():
+        model_data = station_data.get(model.lower(), {})
+        for var in ["temp", "mslp", "precip"]:
+            lead_times.update({int(k) for k in model_data.get(var, {}).keys()})
+
+    lead_times = sorted(lead_times)
+
+    def _init_acc():
+        return {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+
+    result = {
+        "lead_times": lead_times,
+        "temp_mae": [],
+        "temp_bias": [],
+        "mslp_mae": [],
+        "mslp_bias": [],
+        "precip_mae": [],
+        "precip_bias": []
+    }
+
+    for lt in lead_times:
+        lt_str = str(lt)
+        acc = {
+            "temp": _init_acc(),
+            "mslp": _init_acc(),
+            "precip": _init_acc()
+        }
+
+        for station_data in monthly.values():
+            model_data = station_data.get(model.lower(), {})
+            for var in ["temp", "mslp", "precip"]:
+                stats = model_data.get(var, {}).get(lt_str)
+                if not stats or stats.get("count", 0) <= 0:
+                    continue
+                acc[var]["sum_abs"] += stats.get("sum_abs_errors", 0.0)
+                acc[var]["sum"] += stats.get("sum_errors", 0.0)
+                acc[var]["count"] += stats.get("count", 0)
+
+        for var, mae_key, bias_key in [
+            ("temp", "temp_mae", "temp_bias"),
+            ("mslp", "mslp_mae", "mslp_bias"),
+            ("precip", "precip_mae", "precip_bias")
+        ]:
+            if acc[var]["count"] > 0:
+                result[mae_key].append(round(acc[var]["sum_abs"] / acc[var]["count"], 2))
+                result[bias_key].append(round(acc[var]["sum"] / acc[var]["count"], 2))
+            else:
+                result[mae_key].append(None)
+                result[bias_key].append(None)
 
     return result
 
