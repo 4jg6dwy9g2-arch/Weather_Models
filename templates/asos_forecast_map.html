@@ -1,0 +1,765 @@
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <div>
+            <i class="bi bi-geo-alt"></i> ASOS Station Forecasts
+            <span class="badge bg-secondary ms-2" id="asosForecastStationCount">-- stations</span>
+            <br>
+            <small class="text-muted" id="asosForecastValidTime">Loading...</small>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+            <select class="form-select form-select-sm" id="asosForecastVariable" style="width: auto;">
+                <option value="temp">Temperature</option>
+                <option value="precip">Precipitation</option>
+            </select>
+            <select class="form-select form-select-sm" id="asosForecastModel" style="width: auto;">
+                <option value="gfs">GFS</option>
+                <option value="aifs">AIFS</option>
+                <option value="ifs">IFS</option>
+                <option value="nws">NWS</option>
+            </select>
+            <div class="d-flex flex-column align-items-start" style="min-width: 280px;">
+                <label for="asosForecastHourSlider" class="form-label small mb-1">
+                    Lead Time: <strong id="asosForecastHourLabel">120h (5 days)</strong>
+                </label>
+                <div class="d-flex align-items-center gap-2 w-100">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="asosForecastPrevBtn" title="Previous">
+                        <i class="bi bi-chevron-left"></i>
+                    </button>
+                    <input type="range" class="form-range" id="asosForecastHourSlider"
+                           min="0" max="59" step="1" value="19" style="flex: 1;">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="asosForecastNextBtn" title="Next">
+                        <i class="bi bi-chevron-right"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="form-check form-switch align-self-center ms-1">
+                <input class="form-check-input" type="checkbox" id="asosForecastTrendsToggle">
+                <label class="form-check-label small" for="asosForecastTrendsToggle" title="Show change from previous forecast run">
+                    <i class="bi bi-graph-up-arrow"></i> Trends
+                </label>
+            </div>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div id="asosForecastMapContainer" style="height: 500px; position: relative;">
+            <div id="asosForecastMap" style="height: 100%; width: 100%;"></div>
+            <div id="asosForecastMapLoading" class="position-absolute top-50 start-50 translate-middle text-center" style="z-index: 1000;">
+                <div class="spinner-border text-primary" role="status"></div>
+                <p class="mt-2 text-muted">Loading station data...</p>
+            </div>
+
+            <!-- Legend -->
+            <div id="asosForecastLegend" class="position-absolute bottom-0 start-0 m-3 p-2 bg-white rounded shadow-sm" style="z-index: 1000; font-size: 0.85rem;">
+                <div id="tempLegend" style="display: none;">
+                    <strong>Temperature</strong><br>
+                    <div class="d-flex align-items-center gap-1 mt-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #000080; border-radius: 50%;"></span> <0°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #0000ff; border-radius: 50%;"></span> 0-10°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #00bfff; border-radius: 50%;"></span> 15-25°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #87cefa; border-radius: 50%;"></span> 25-35°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #7fffd4; border-radius: 50%;"></span> 35-45°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #00fa9a; border-radius: 50%;"></span> 50-60°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #adff2f; border-radius: 50%;"></span> 65-75°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #ffa500; border-radius: 50%;"></span> 80-90°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #ff4500; border-radius: 50%;"></span> 95-100°F
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #dc143c; border-radius: 50%;"></span> >100°F
+                    </div>
+                </div>
+                <div id="tempTrendLegend" style="display: none;">
+                    <strong>Temp Trend</strong><br>
+                    <div class="d-flex align-items-center gap-1 mt-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #00008b; border-radius: 50%;"></span> <-10°F (Much Colder)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #0000ff; border-radius: 50%;"></span> -6 to -10°F (Colder)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #87ceeb; border-radius: 50%;"></span> -1 to -2°F (Slightly Colder)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #e8e8e8; border-radius: 50%;"></span> -1 to +1°F (No Change)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #ffb6c1; border-radius: 50%;"></span> +1 to +2°F (Slightly Warmer)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #ff0000; border-radius: 50%;"></span> +6 to +10°F (Warmer)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #8b0000; border-radius: 50%;"></span> >+10°F (Much Warmer)
+                    </div>
+                </div>
+                <div id="precipLegend" style="display: none;">
+                    <strong>Precip (6hr)</strong><br>
+                    <div class="d-flex align-items-center gap-1 mt-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #f0f0f0; border-radius: 50%;"></span> <0.01"
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #d0e8ff; border-radius: 50%;"></span> 0.01-0.10"
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #90c8ff; border-radius: 50%;"></span> 0.10-0.25"
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #4080ff; border-radius: 50%;"></span> 0.25-0.50"
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #2050d0; border-radius: 50%;"></span> 0.50-1.00"
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #002080; border-radius: 50%;"></span> >1.00"
+                    </div>
+                </div>
+                <div id="precipTrendLegend" style="display: none;">
+                    <strong>Precip Trend</strong><br>
+                    <div class="d-flex align-items-center gap-1 mt-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #8b4513; border-radius: 50%;"></span> <-0.5" (Much Drier)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #cd853f; border-radius: 50%;"></span> -0.1 to -0.25" (Drier)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #f0e68c; border-radius: 50%;"></span> -0.01 to -0.05" (Slightly Drier)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #e8e8e8; border-radius: 50%;"></span> -0.01 to +0.01" (No Change)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #98fb98; border-radius: 50%;"></span> +0.01 to +0.05" (Slightly Wetter)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #00fa9a; border-radius: 50%;"></span> +0.1 to +0.25" (Wetter)
+                    </div>
+                    <div class="d-flex align-items-center gap-1">
+                        <span style="display: inline-block; width: 12px; height: 12px; background: #228b22; border-radius: 50%;"></span> >+0.5" (Much Wetter)
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Station Forecast Charts (shown when clicking a station) -->
+        <div id="asosStationForecastCharts" class="card-body border-top d-none">
+            <h5 class="card-title mb-3">
+                <span id="asosForecastChartMode">Forecast</span> for <span id="asosForecastStationName"></span>
+                <button type="button" class="btn btn-sm btn-outline-secondary float-end" onclick="closeStationForecast()">
+                    <i class="bi bi-x-lg"></i> Close
+                </button>
+            </h5>
+            <div class="row">
+                <div class="col-lg-6 mb-4">
+                    <div class="card h-100">
+                        <div class="card-header"><i class="bi bi-thermometer-half"></i> Temperature Forecast</div>
+                        <div class="card-body chart-container chart-container-medium">
+                            <canvas id="asosForecastTempChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-lg-6 mb-4">
+                    <div class="card h-100">
+                        <div class="card-header"><i class="bi bi-cloud-rain"></i> Precipitation Forecast</div>
+                        <div class="card-body chart-container chart-container-medium">
+                            <canvas id="asosForecastPrecipChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .chart-container-medium {
+        position: relative;
+        height: 300px;
+    }
+</style>
+
+<script>
+let asosForecastMap = null;
+let asosForecastMarkers = [];
+let currentForecastStationId = null;
+let tempForecastChart = null;
+let precipForecastChart = null;
+// Full 6-hourly forecast hours for trends (0-360 every 6h)
+let availableForecastHours = [6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144, 150, 156, 162, 168, 174, 180, 186, 192, 198, 204, 210, 216, 222, 228, 234, 240, 246, 252, 258, 264, 270, 276, 282, 288, 294, 300, 306, 312, 318, 324, 330, 336, 342, 348, 354, 360];
+let currentHourIndex = 19; // Default to 120h (now at index 19 in full array)
+
+// Initialize ASOS forecast map
+function initAsosForecastMap() {
+    if (asosForecastMap) return;
+
+    asosForecastMap = L.map('asosForecastMap', {
+        zoomControl: true,
+        scrollWheelZoom: true
+    }).setView([39.8283, -98.5795], 4); // Center on CONUS
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors',
+        maxZoom: 18
+    }).addTo(asosForecastMap);
+
+    loadAsosForecastStations();
+}
+
+// Get color for forecast value
+function getForecastColor(value, variable, isTrends = false) {
+    if (isTrends) {
+        // Trend color scales
+        if (variable === 'temp') {
+            // Temperature trends: Blue (colder) to White (no change) to Red (warmer)
+            if (value < -10) return '#00008b';      // Dark Blue
+            if (value < -8) return '#0000cd';       // Medium Blue
+            if (value < -6) return '#0000ff';       // Blue
+            if (value < -4) return '#4169e1';       // Royal Blue
+            if (value < -2) return '#6495ed';       // Cornflower Blue
+            if (value < -1) return '#87ceeb';       // Sky Blue
+            if (value < 1) return '#e8e8e8';        // Light Gray (near zero)
+            if (value < 2) return '#ffb6c1';        // Light Pink
+            if (value < 4) return '#ff69b4';        // Hot Pink
+            if (value < 6) return '#ff1493';        // Deep Pink
+            if (value < 8) return '#ff0000';        // Red
+            if (value < 10) return '#dc143c';       // Crimson
+            return '#8b0000';                       // Dark Red
+        } else if (variable === 'precip') {
+            // Precipitation trends: Brown (drier) to White (no change) to Green (wetter)
+            if (value < -0.5) return '#8b4513';     // Saddle Brown
+            if (value < -0.25) return '#a0522d';    // Sienna
+            if (value < -0.1) return '#cd853f';     // Peru
+            if (value < -0.05) return '#daa520';    // Goldenrod
+            if (value < -0.01) return '#f0e68c';    // Khaki
+            if (value < 0.01) return '#e8e8e8';     // Light Gray (near zero)
+            if (value < 0.05) return '#98fb98';     // Pale Green
+            if (value < 0.1) return '#90ee90';      // Light Green
+            if (value < 0.25) return '#00fa9a';     // Medium Spring Green
+            if (value < 0.5) return '#00ff00';      // Lime
+            return '#228b22';                       // Forest Green
+        }
+    } else {
+        // Absolute value color scales
+        if (variable === 'temp') {
+            // Temperature color scale with 5-degree gradual transitions (blue to red)
+            if (value < 0) return '#000080';      // Navy
+            if (value < 5) return '#0000ff';      // Blue
+            if (value < 10) return '#4169e1';     // Royal Blue
+            if (value < 15) return '#1e90ff';     // Dodger Blue
+            if (value < 20) return '#00bfff';     // Deep Sky Blue
+            if (value < 25) return '#87ceeb';     // Sky Blue
+            if (value < 30) return '#87cefa';     // Light Sky Blue
+            if (value < 35) return '#afeeee';     // Pale Turquoise
+            if (value < 40) return '#7fffd4';     // Aquamarine
+            if (value < 45) return '#40e0d0';     // Turquoise
+            if (value < 50) return '#00ced1';     // Dark Turquoise
+            if (value < 55) return '#00fa9a';     // Medium Spring Green
+            if (value < 60) return '#90ee90';     // Light Green
+            if (value < 65) return '#98fb98';     // Pale Green
+            if (value < 70) return '#adff2f';     // Green Yellow
+            if (value < 75) return '#ffd700';     // Gold
+            if (value < 80) return '#ffcc00';     // Bright Gold
+            if (value < 85) return '#ffa500';     // Orange
+            if (value < 90) return '#ff8c00';     // Dark Orange
+            if (value < 95) return '#ff6347';     // Tomato
+            if (value < 100) return '#ff4500';    // Orange Red
+            return '#dc143c';                     // Crimson
+        } else if (variable === 'precip') {
+            // Precipitation color scale (white to dark blue)
+            if (value < 0.01) return '#f0f0f0';
+            if (value < 0.1) return '#d0e8ff';
+            if (value < 0.25) return '#90c8ff';
+            if (value < 0.5) return '#4080ff';
+            if (value < 1.0) return '#2050d0';
+            return '#002080';
+        }
+    }
+    return '#808080';
+}
+
+// Update legend visibility
+function updateForecastLegend(variable, isTrends) {
+    const tempLegend = document.getElementById('tempLegend');
+    const tempTrendLegend = document.getElementById('tempTrendLegend');
+    const precipLegend = document.getElementById('precipLegend');
+    const precipTrendLegend = document.getElementById('precipTrendLegend');
+
+    // Hide all legends first
+    tempLegend.style.display = 'none';
+    tempTrendLegend.style.display = 'none';
+    precipLegend.style.display = 'none';
+    precipTrendLegend.style.display = 'none';
+
+    // Show appropriate legend
+    if (variable === 'temp') {
+        if (isTrends) {
+            tempTrendLegend.style.display = 'block';
+        } else {
+            tempLegend.style.display = 'block';
+        }
+    } else {
+        if (isTrends) {
+            precipTrendLegend.style.display = 'block';
+        } else {
+            precipLegend.style.display = 'block';
+        }
+    }
+}
+
+// Update forecast hour label
+function updateForecastHourLabel(index) {
+    const hours = availableForecastHours[index];
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+
+    let label = `${hours}h`;
+    if (days > 0) {
+        if (remainingHours === 0) {
+            label += ` (${days} day${days > 1 ? 's' : ''})`;
+        } else {
+            label += ` (${days}d ${remainingHours}h)`;
+        }
+    }
+
+    document.getElementById('asosForecastHourLabel').textContent = label;
+}
+
+// Load ASOS stations and add markers
+async function loadAsosForecastStations() {
+    try {
+        document.getElementById('asosForecastMapLoading').style.display = 'block';
+
+        // Get control values
+        const variable = document.getElementById('asosForecastVariable').value;
+        const model = document.getElementById('asosForecastModel').value;
+        const sliderIndex = parseInt(document.getElementById('asosForecastHourSlider').value);
+        const leadTime = availableForecastHours[sliderIndex];
+        const showTrends = document.getElementById('asosForecastTrendsToggle').checked;
+
+        // Update label
+        updateForecastHourLabel(sliderIndex);
+
+        // Update legend
+        updateForecastLegend(variable, showTrends);
+
+        // Fetch forecast summary
+        const response = await fetch(`/api/asos/forecast-summary?variable=${variable}&model=${model}&lead_time=${leadTime}&trends=${showTrends}`);
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'Failed to load forecast data');
+        }
+
+        // Check if trends are actually available
+        const trendsActuallyShown = showTrends && data.trends_available;
+
+        // Update legend based on what's actually being shown
+        updateForecastLegend(variable, trendsActuallyShown);
+
+        // Clear existing markers
+        asosForecastMarkers.forEach(marker => marker.remove());
+        asosForecastMarkers = [];
+
+        // Add markers for each station with forecast data
+        data.stations.forEach(station => {
+            const color = getForecastColor(station.value, variable, trendsActuallyShown);
+
+            const marker = L.circleMarker([station.lat, station.lon], {
+                radius: 5,
+                fillColor: color,
+                color: '#fff',
+                weight: 1,
+                opacity: 1,
+                fillOpacity: 0.8
+            });
+
+            // Format value for tooltip
+            let valueStr;
+            if (trendsActuallyShown) {
+                // Show trend with sign
+                const sign = station.value >= 0 ? '+' : '';
+                if (variable === 'temp') {
+                    valueStr = `${sign}${station.value.toFixed(1)}°F`;
+                } else {
+                    valueStr = `${sign}${station.value.toFixed(2)} in`;
+                }
+            } else {
+                // Show absolute value
+                if (variable === 'temp') {
+                    valueStr = `${station.value.toFixed(1)}°F`;
+                } else {
+                    valueStr = `${station.value.toFixed(2)} in`;
+                }
+            }
+
+            marker.bindTooltip(
+                `<strong>${station.station_id}</strong><br>${station.name}<br>${valueStr}`,
+                { direction: 'top', offset: [0, -5] }
+            );
+
+            marker.on('click', () => {
+                loadStationForecast(station.station_id, station.name);
+            });
+
+            marker.addTo(asosForecastMap);
+            asosForecastMarkers.push(marker);
+        });
+
+        document.getElementById('asosForecastStationCount').textContent = `${data.count} stations`;
+
+        // Display valid time
+        const initTime = new Date(data.init_time);
+        const validTime = new Date(initTime.getTime() + (leadTime * 60 * 60 * 1000));
+        const formatOptions = {
+            weekday: 'short',
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+            timeZoneName: 'short'
+        };
+        const validTimeStr = validTime.toLocaleString('en-US', formatOptions);
+        let modeText = '';
+        if (showTrends && !data.trends_available) {
+            modeText = ' <span class="badge bg-warning text-dark">Trends unavailable - need 2+ forecast runs</span>';
+        } else if (trendsActuallyShown) {
+            modeText = ' (trend from previous run)';
+        }
+        document.getElementById('asosForecastValidTime').innerHTML =
+            `<i class="bi bi-clock"></i> Valid: <strong>${validTimeStr}</strong>${modeText} (${model.toUpperCase()} forecast from ${initTime.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric' })})`;
+
+        document.getElementById('asosForecastMapLoading').style.display = 'none';
+
+    } catch (error) {
+        console.error('Error loading ASOS forecast stations:', error);
+        document.getElementById('asosForecastMapLoading').innerHTML = `
+            <i class="bi bi-exclamation-triangle fs-1 text-danger"></i>
+            <p class="mt-2 text-muted">Failed to load forecast data</p>
+        `;
+    }
+}
+
+// Load forecast for a specific station
+async function loadStationForecast(stationId, stationName) {
+    currentForecastStationId = stationId;
+
+    try {
+        document.getElementById('asosForecastStationName').textContent = stationName;
+        document.getElementById('asosStationForecastCharts').classList.remove('d-none');
+
+        const showTrends = document.getElementById('asosForecastTrendsToggle').checked;
+        const url = `/api/asos/station-forecast?station_id=${encodeURIComponent(stationId)}&trends=${showTrends}`;
+
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || 'No forecast data available');
+        }
+
+        renderStationForecastCharts(data, showTrends);
+
+    } catch (error) {
+        console.error('Error loading station forecast:', error);
+        alert(`Failed to load forecast for ${stationName}: ${error.message}`);
+    }
+}
+
+// Render forecast charts for a station
+function renderStationForecastCharts(data, showTrends = false) {
+    const labels = data.times.map(t => {
+        const date = new Date(t);
+        return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: 'numeric' });
+    });
+
+    const isTrends = showTrends && data.show_trends;
+
+    // Update chart title
+    const modeText = isTrends ? 'Forecast Trends' : 'Forecast';
+    document.getElementById('asosForecastChartMode').textContent = modeText;
+
+    // Temperature Chart
+    if (tempForecastChart) tempForecastChart.destroy();
+
+    const tempDatasets = [
+        {
+            label: 'GFS',
+            data: data.gfs.temps,
+            borderColor: '#0d6efd',
+            backgroundColor: 'rgba(13, 110, 253, 0.1)',
+            borderWidth: 2,
+            tension: 0.3,
+            pointRadius: 2
+        },
+        {
+            label: 'AIFS',
+            data: data.aifs.temps,
+            borderColor: '#0dcaf0',
+            backgroundColor: 'rgba(13, 202, 240, 0.1)',
+            borderWidth: 2,
+            tension: 0.3,
+            pointRadius: 2
+        },
+        {
+            label: 'IFS',
+            data: data.ifs.temps,
+            borderColor: '#20c997',
+            backgroundColor: 'rgba(32, 201, 151, 0.1)',
+            borderWidth: 2,
+            tension: 0.3,
+            pointRadius: 2
+        },
+        {
+            label: 'NWS',
+            data: data.nws.temps,
+            borderColor: '#000000',
+            backgroundColor: 'rgba(0, 0, 0, 0.1)',
+            borderWidth: 2,
+            tension: 0.3,
+            pointRadius: 2
+        }
+    ];
+
+    const tempChartOptions = {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            legend: { position: 'top' },
+            tooltip: {
+                callbacks: {
+                    label: (context) => {
+                        const value = context.parsed.y;
+                        if (value === null || value === undefined) return `${context.dataset.label}: --`;
+                        if (isTrends) {
+                            const sign = value >= 0 ? '+' : '';
+                            return `${context.dataset.label}: ${sign}${value.toFixed(1)}°F`;
+                        }
+                        return `${context.dataset.label}: ${value.toFixed(1)}°F`;
+                    }
+                }
+            }
+        },
+        scales: {
+            y: {
+                title: {
+                    display: true,
+                    text: isTrends ? 'Temperature Change (°F)' : 'Temperature (°F)'
+                }
+            }
+        }
+    };
+
+    // Add zero line for trends mode
+    if (isTrends) {
+        tempChartOptions.plugins.annotation = {
+            annotations: {
+                zeroLine: {
+                    type: 'line',
+                    yMin: 0,
+                    yMax: 0,
+                    borderColor: '#999',
+                    borderWidth: 2,
+                    borderDash: [5, 5]
+                }
+            }
+        };
+    }
+
+    tempForecastChart = new Chart(document.getElementById('asosForecastTempChart'), {
+        type: 'line',
+        data: { labels, datasets: tempDatasets },
+        options: tempChartOptions
+    });
+
+    // Precipitation Chart
+    if (precipForecastChart) precipForecastChart.destroy();
+
+    const precipDatasets = [
+        {
+            label: 'GFS',
+            data: data.gfs.precips,
+            borderColor: '#0d6efd',
+            backgroundColor: 'rgba(13, 110, 253, 0.5)',
+            borderWidth: 1
+        },
+        {
+            label: 'AIFS',
+            data: data.aifs.precips,
+            borderColor: '#0dcaf0',
+            backgroundColor: 'rgba(13, 202, 240, 0.5)',
+            borderWidth: 1
+        },
+        {
+            label: 'IFS',
+            data: data.ifs.precips,
+            borderColor: '#20c997',
+            backgroundColor: 'rgba(32, 201, 151, 0.5)',
+            borderWidth: 1
+        },
+        {
+            label: 'NWS',
+            data: data.nws.precips,
+            borderColor: '#000000',
+            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+            borderWidth: 1
+        }
+    ];
+
+    const precipChartOptions = {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            legend: { position: 'top' },
+            tooltip: {
+                callbacks: {
+                    label: (context) => {
+                        const value = context.parsed.y;
+                        if (value === null || value === undefined) return `${context.dataset.label}: --`;
+                        if (isTrends) {
+                            const sign = value >= 0 ? '+' : '';
+                            return `${context.dataset.label}: ${sign}${value.toFixed(2)} in`;
+                        }
+                        return `${context.dataset.label}: ${value.toFixed(2)} in`;
+                    }
+                }
+            }
+        },
+        scales: {
+            y: {
+                title: {
+                    display: true,
+                    text: isTrends ? 'Precipitation Change (inches)' : 'Precipitation (inches, 6hr)'
+                }
+            }
+        }
+    };
+
+    // Add zero line and allow negative values for trends mode
+    if (isTrends) {
+        precipChartOptions.plugins.annotation = {
+            annotations: {
+                zeroLine: {
+                    type: 'line',
+                    yMin: 0,
+                    yMax: 0,
+                    borderColor: '#999',
+                    borderWidth: 2,
+                    borderDash: [5, 5]
+                }
+            }
+        };
+    } else {
+        precipChartOptions.scales.y.min = 0;
+    }
+
+    precipForecastChart = new Chart(document.getElementById('asosForecastPrecipChart'), {
+        type: 'bar',
+        data: { labels, datasets: precipDatasets },
+        options: precipChartOptions
+    });
+}
+
+// Close station forecast view
+function closeStationForecast() {
+    document.getElementById('asosStationForecastCharts').classList.add('d-none');
+    currentForecastStationId = null;
+}
+
+// Initialize map when tab is shown
+document.addEventListener('DOMContentLoaded', function() {
+    const asosTab = document.getElementById('asos-forecast-tab');
+    if (asosTab) {
+        asosTab.addEventListener('shown.bs.tab', function() {
+            if (!asosForecastMap) {
+                initAsosForecastMap();
+            } else {
+                asosForecastMap.invalidateSize();
+            }
+        });
+    }
+
+    // Reload forecast and map when trends toggle changes
+    const trendsToggle = document.getElementById('asosForecastTrendsToggle');
+    if (trendsToggle) {
+        trendsToggle.addEventListener('change', function() {
+            // Reload map with trend colors
+            if (asosForecastMap) {
+                loadAsosForecastStations();
+            }
+
+            // Reload station forecast charts if open
+            if (currentForecastStationId) {
+                const stationName = document.getElementById('asosForecastStationName').textContent;
+                loadStationForecast(currentForecastStationId, stationName);
+            }
+        });
+    }
+
+    // Reload map when controls change
+    const forecastVariable = document.getElementById('asosForecastVariable');
+    const forecastModel = document.getElementById('asosForecastModel');
+    const forecastHourSlider = document.getElementById('asosForecastHourSlider');
+
+    if (forecastVariable) {
+        forecastVariable.addEventListener('change', () => {
+            if (asosForecastMap) loadAsosForecastStations();
+        });
+    }
+    if (forecastModel) {
+        forecastModel.addEventListener('change', () => {
+            if (asosForecastMap) loadAsosForecastStations();
+        });
+    }
+    if (forecastHourSlider) {
+        // Update label in real-time as slider moves
+        forecastHourSlider.addEventListener('input', () => {
+            updateForecastHourLabel(parseInt(forecastHourSlider.value));
+        });
+
+        // Reload map when slider is released
+        forecastHourSlider.addEventListener('change', () => {
+            if (asosForecastMap) loadAsosForecastStations();
+        });
+    }
+
+    // Previous/Next buttons for forecast time
+    const prevBtn = document.getElementById('asosForecastPrevBtn');
+    const nextBtn = document.getElementById('asosForecastNextBtn');
+
+    if (prevBtn && forecastHourSlider) {
+        prevBtn.addEventListener('click', () => {
+            const currentIndex = parseInt(forecastHourSlider.value);
+            const newIndex = Math.max(0, currentIndex - 1);
+            forecastHourSlider.value = newIndex;
+            updateForecastHourLabel(newIndex);
+            if (asosForecastMap) loadAsosForecastStations();
+        });
+    }
+
+    if (nextBtn && forecastHourSlider) {
+        nextBtn.addEventListener('click', () => {
+            const currentIndex = parseInt(forecastHourSlider.value);
+            const newIndex = Math.min(availableForecastHours.length - 1, currentIndex + 1);
+            forecastHourSlider.value = newIndex;
+            updateForecastHourLabel(newIndex);
+            if (asosForecastMap) loadAsosForecastStations();
+        });
+    }
+});
+</script>
