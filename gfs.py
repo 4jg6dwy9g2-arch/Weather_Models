@@ -16,7 +16,7 @@ import xarray as xr
 from base import WeatherModel
 
 # Instantiate a rate limiter for Herbie calls (e.g., 1 call every 5 seconds)
-herbie_rate_limiter = RateLimiter(calls_per_second=1)
+herbie_rate_limiter = RateLimiter(calls_per_second=10)  # AWS S3 can handle high throughput
 
 class Variable:
     def __init__(self, name, display_name, units, herbie_search, category, colormap, contour_levels, fill=True, level=None):

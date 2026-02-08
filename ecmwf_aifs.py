@@ -35,7 +35,7 @@ from rate_limiter import RateLimiter # Import the RateLimiter
 
 # Instantiate a rate limiter for ECMWF Open Data calls (e.g., 1 call every 2 seconds)
 
-ecmwf_rate_limiter = RateLimiter(calls_per_second=1)
+ecmwf_rate_limiter = RateLimiter(calls_per_second=5)  # ECMWF open data can handle moderate throughput
 
 
 
