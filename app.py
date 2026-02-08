@@ -64,6 +64,9 @@ FORECASTS_FILE = Path(__file__).parent / "forecasts.json"
 # ASOS forecast trends storage file (last 2 runs with 6-hourly data)
 ASOS_TRENDS_FILE = Path(__file__).parent / "asos_forecast_trends.json"
 
+# ERA5 analog forecast history (tracks predictions over time)
+ANALOG_HISTORY_FILE = Path(__file__).parent / "analog_forecast_history.json"
+
 if load_dotenv:
     load_dotenv()
 
@@ -196,6 +199,59 @@ def store_asos_trend_run(init_time: datetime, model: str, station_forecasts: dic
     # Save
     save_asos_trends_db(db)
     logger.info(f"Stored {model.upper()} trend forecasts for {len(station_forecasts)} stations at {run_key}")
+
+
+def load_analog_history():
+    """Load the analog forecast history from JSON file."""
+    if ANALOG_HISTORY_FILE.exists():
+        try:
+            with open(ANALOG_HISTORY_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading analog_forecast_history.json: {e}")
+    return {"predictions": []}
+
+
+def save_analog_prediction(target_date: str, analog_precip: float, analog_temp: float,
+                           climatology_precip: float, climatology_temp: float,
+                           top_analogs: list, avg_correlation: float):
+    """
+    Save an analog forecast prediction to the history file.
+    Keeps all predictions indefinitely for long-term analysis.
+
+    Args:
+        target_date: Date being analyzed (analog match date)
+        analog_precip: Predicted 14-day precipitation
+        analog_temp: Predicted 14-day temperature
+        climatology_precip: Climatological normal precipitation
+        climatology_temp: Climatological normal temperature
+        top_analogs: List of top analog dates with correlations
+        avg_correlation: Average pattern similarity of top analogs (0-1)
+    """
+    history = load_analog_history()
+
+    prediction = {
+        "prediction_date": datetime.now(timezone.utc).isoformat(),
+        "target_date": target_date,
+        "analog_precip": analog_precip,
+        "analog_temp": analog_temp,
+        "climatology_precip": climatology_precip,
+        "climatology_temp": climatology_temp,
+        "avg_correlation": avg_correlation,
+        "top_analogs": top_analogs[:5]  # Keep top 5 analogs
+    }
+
+    history["predictions"].append(prediction)
+
+    # Keep all predictions indefinitely for long-term analysis
+    # No cutoff applied
+
+    try:
+        with open(ANALOG_HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+        logger.info(f"Saved analog prediction for {target_date} (avg correlation: {avg_correlation:.3f})")
+    except Exception as e:
+        logger.error(f"Error saving analog prediction: {e}")
 
 
 def fetch_nws_forecast_cache(hours_ahead: int = 168):
@@ -3925,6 +3981,21 @@ def api_era5_analogs():
             climatology_normal_precip = None
             climatology_normal_temp = None
 
+        # Save prediction to history
+        if avg_precip is not None and avg_temp is not None:
+            # Calculate average correlation from top analogs
+            avg_correlation = sum(a['correlation'] for a in top_analogs) / len(top_analogs) if top_analogs else 0
+
+            save_analog_prediction(
+                target_date=current_date_str,
+                analog_precip=avg_precip,
+                analog_temp=avg_temp,
+                climatology_precip=climatology_normal_precip if climatology_normal_precip else 0,
+                climatology_temp=climatology_normal_temp if climatology_normal_temp else 0,
+                top_analogs=[{'date': a['date'], 'correlation': a['correlation']} for a in top_analogs],
+                avg_correlation=avg_correlation
+            )
+
         # Return top N
         return jsonify({
             "success": True,
@@ -3939,6 +4010,32 @@ def api_era5_analogs():
 
     except Exception as e:
         logger.error(f"Error finding analogs: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/era5/analog-history')
+def api_era5_analog_history():
+    """
+    Get historical analog forecast predictions for charting.
+
+    Returns:
+        JSON with list of historical predictions including dates and values
+    """
+    try:
+        history = load_analog_history()
+        predictions = history.get("predictions", [])
+
+        # Sort by prediction date
+        predictions_sorted = sorted(predictions, key=lambda x: x["prediction_date"])
+
+        return jsonify({
+            "success": True,
+            "predictions": predictions_sorted,
+            "count": len(predictions_sorted)
+        })
+
+    except Exception as e:
+        logger.error(f"Error loading analog history: {e}")
         return jsonify({"success": False, "error": str(e)})
 
 
@@ -4560,14 +4657,8 @@ def api_asos_forecast_summary():
     show_trends = request.args.get('trends', 'false').lower() == 'true'
 
     try:
-        # Use trends database if in trends mode and lead_time is 6-hourly
-        # Otherwise use verification database
-        if show_trends and lead_time % 6 == 0:
-            db = load_asos_trends_db()
-            logger.info(f"Using trends database for lead_time {lead_time}h")
-        else:
-            db = asos.load_asos_forecasts_db()
-
+        # Always use the regular forecast database for dynamic trend calculation
+        db = asos.load_asos_forecasts_db()
         runs = db.get("runs", {})
         stations = db.get("stations", {})
 
@@ -4592,22 +4683,40 @@ def api_asos_forecast_summary():
         # Get model data
         model_data = run_data.get(model, {})
 
-        # If trends mode, get previous run for simple comparison
+        # If trends mode, get previous run and match by valid time
         prev_model_data = {}
+        prev_lead_time_index = None
         if show_trends and len(sorted_runs) >= 2:
             prev_run_key = sorted_runs[-2]
             prev_run_data = runs[prev_run_key]
             prev_model_data = prev_run_data.get(model, {})
+            prev_forecast_hours = prev_run_data.get("forecast_hours", [])
 
             latest_init = datetime.fromisoformat(latest_run_key)
             prev_init = datetime.fromisoformat(prev_run_key)
             time_diff_hours = int((latest_init - prev_init).total_seconds() / 3600)
 
-            logger.info(
-                f"Trends mode: comparing {model.upper()} F{lead_time:03d} | "
-                f"Latest: {latest_init.strftime('%m/%d %HZ')} | "
-                f"Previous: {prev_init.strftime('%m/%d %HZ')} ({time_diff_hours}h apart)"
-            )
+            # Calculate valid time for the latest forecast
+            valid_time_target = latest_init + timedelta(hours=lead_time)
+
+            # Find the forecast hour in previous run that matches this valid time
+            # prev_init + prev_lead_time = valid_time_target
+            # prev_lead_time = valid_time_target - prev_init
+            prev_lead_time_needed = int((valid_time_target - prev_init).total_seconds() / 3600)
+
+            # Find this in the previous run's forecast hours
+            if prev_lead_time_needed in prev_forecast_hours:
+                prev_lead_time_index = prev_forecast_hours.index(prev_lead_time_needed)
+                logger.info(
+                    f"Trends mode: comparing {model.upper()} for valid time {valid_time_target.strftime('%m/%d %HZ')} | "
+                    f"Latest: {latest_init.strftime('%m/%d %HZ')} F{lead_time:03d} | "
+                    f"Previous: {prev_init.strftime('%m/%d %HZ')} F{prev_lead_time_needed:03d}"
+                )
+            else:
+                logger.warning(
+                    f"Trends mode: F{prev_lead_time_needed:03d} not available in previous run (has {prev_forecast_hours}), "
+                    f"cannot calculate trends for {model.upper()} at lead time {lead_time}h"
+                )
 
         # Extract forecast value for each station
         station_forecasts = []
@@ -4626,19 +4735,19 @@ def api_asos_forecast_summary():
             else:
                 latest_value = None
 
-            # Calculate trend if requested (simple: same forecast hour from previous run)
+            # Calculate trend if requested (compare same VALID TIME from previous run)
             value = latest_value  # Default to absolute value
 
-            if show_trends and prev_model_data and latest_value is not None:
+            if show_trends and prev_model_data and latest_value is not None and prev_lead_time_index is not None:
                 prev_station_data = prev_model_data.get(station_id, {})
 
-                # Compare the SAME forecast hour from previous run (e.g., F120 vs F120)
+                # Compare forecasts for the SAME valid time (different lead times)
                 if variable == 'temp':
                     prev_temps = prev_station_data.get('temps', [])
-                    prev_value = prev_temps[lead_time_index] if lead_time_index < len(prev_temps) else None
+                    prev_value = prev_temps[prev_lead_time_index] if prev_lead_time_index < len(prev_temps) else None
                 elif variable == 'precip':
                     prev_precips = prev_station_data.get('precips', [])
-                    prev_value = prev_precips[lead_time_index] if lead_time_index < len(prev_precips) else None
+                    prev_value = prev_precips[prev_lead_time_index] if prev_lead_time_index < len(prev_precips) else None
                 else:
                     prev_value = None
 
@@ -4650,8 +4759,8 @@ def api_asos_forecast_summary():
                     # Debug logging for first few stations
                     if debug_count < 3:
                         logger.info(
-                            f"Trend: {station_id} F{lead_time:03d} = {value:+.1f}°F | "
-                            f"Latest: {latest_value:.1f}°F | Prev: {prev_value:.1f}°F"
+                            f"Trend: {station_id} = {value:+.1f}{'°F' if variable == 'temp' else ' in'} | "
+                            f"Latest: {latest_value:.1f} | Prev: {prev_value:.1f}"
                         )
                         debug_count += 1
 
@@ -5554,6 +5663,26 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
             obs_count = asos.fetch_and_store_observations()
             broadcast_sync_log(f"Fetched {obs_count} ASOS observations", 'success')
             asos_results['observations'] = {'status': 'synced', 'count': obs_count}
+
+            # Store 6-hourly forecasts for trend visualization (last 2 runs only)
+            broadcast_sync_log("Storing 6-hourly forecast data for trend visualization...", 'info')
+            try:
+                store_asos_trend_run(gfs_init, 'gfs', gfs_forecasts)
+                store_asos_trend_run(aifs_init, 'aifs', aifs_forecasts)
+                store_asos_trend_run(ifs_init, 'ifs', ifs_forecasts)
+
+                # NWS trends (if available)
+                if asos_results.get('nws', {}).get('status') == 'synced':
+                    nws_forecast_hours = [h for h in forecast_hours if h <= 168]
+                    nws_trends = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init)
+                    store_asos_trend_run(gfs_init, 'nws', nws_trends)
+
+                broadcast_sync_log("Trend visualization data stored successfully", 'success')
+                asos_results['trends'] = {'status': 'synced'}
+            except Exception as e:
+                broadcast_sync_log(f"Warning: Trend data storage failed: {e}", 'warning')
+                logger.warning(f"Trend data storage failed: {e}")
+                asos_results['trends'] = {'status': 'error', 'error': str(e)}
 
             broadcast_sync_log("Rebuilding monthly ASOS cache (last 30 days)...", 'info')
             asos.rebuild_monthly_station_cache(days_back=30)

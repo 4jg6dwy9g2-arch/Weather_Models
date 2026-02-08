@@ -318,28 +318,35 @@
                                 <i class="bi bi-search"></i> Find Analogs
                             </button>
                             <div id="analog-results" class="mt-4" style="display: none;">
+                                <p class="text-muted small mb-3">
+                                    <i class="bi bi-info-circle"></i> Values shown are averaged over the 2-week period following each analog pattern match
+                                </p>
                                 <div class="row mb-3">
                                     <div class="col-md-3">
                                         <div class="alert alert-success mb-0">
                                             <strong>Analog precip:</strong><br>
+                                            <small class="text-muted">Following 14 days</small><br>
                                             <span id="analog-avg-precip" class="fs-4">--</span>
                                         </div>
                                     </div>
                                     <div class="col-md-3">
-                                        <div class="alert alert-info mb-0">
+                                        <div class="alert alert-secondary mb-0">
                                             <strong>Normal precip:</strong><br>
+                                            <small class="text-muted">Following 14 days</small><br>
                                             <span id="analog-climatology-precip" class="fs-4">--</span>
                                         </div>
                                     </div>
                                     <div class="col-md-3">
                                         <div class="alert alert-warning mb-0">
                                             <strong>Analog temp:</strong><br>
+                                            <small class="text-muted">Following 14 days</small><br>
                                             <span id="analog-avg-temp" class="fs-4">--</span>
                                         </div>
                                     </div>
                                     <div class="col-md-3">
                                         <div class="alert alert-secondary mb-0">
                                             <strong>Normal temp:</strong><br>
+                                            <small class="text-muted">Following 14 days</small><br>
                                             <span id="analog-climatology-temp" class="fs-4">--</span>
                                         </div>
                                     </div>
@@ -380,6 +387,22 @@
                                 to the current forecast. Similar patterns often lead to similar weather outcomes, making analogs useful for
                                 understanding possible future scenarios. Pattern similarity is measured using spatial correlation.
                             </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Analog Prediction History Chart -->
+                <div class="card">
+                    <div class="card-header">
+                        <i class="bi bi-graph-up"></i> Analog Forecast History
+                        <small class="text-muted ms-2">Track predictions and pattern similarity over time</small>
+                    </div>
+                    <div class="card-body">
+                        <p class="text-muted small mb-2">
+                            <i class="bi bi-info-circle"></i> Hover over chart to see pattern similarity (correlation strength) for each prediction
+                        </p>
+                        <div class="chart-container" style="height: 300px;">
+                            <canvas id="analogHistoryChart"></canvas>
                         </div>
                     </div>
                 </div>
@@ -1239,14 +1262,12 @@ function loadAnalogs() {
                 const comparisonDiv = document.getElementById('analog-precip-comparison');
                 const comparisonText = document.getElementById('analog-precip-comparison-text');
 
+                comparisonDiv.className = 'alert alert-success';
                 if (diff > 0.1) {
-                    comparisonDiv.className = 'alert alert-primary';
                     comparisonText.textContent = `Analogs show ${diff.toFixed(2)}" more than normal (${pctDiff > 0 ? '+' : ''}${pctDiff}% above average)`;
                 } else if (diff < -0.1) {
-                    comparisonDiv.className = 'alert alert-warning';
                     comparisonText.textContent = `Analogs show ${Math.abs(diff).toFixed(2)}" less than normal (${pctDiff}% below average)`;
                 } else {
-                    comparisonDiv.className = 'alert alert-secondary';
                     comparisonText.textContent = `Analogs show near-normal precipitation`;
                 }
                 comparisonDiv.style.display = 'block';
@@ -1261,14 +1282,12 @@ function loadAnalogs() {
                 const comparisonDiv = document.getElementById('analog-temp-comparison');
                 const comparisonText = document.getElementById('analog-temp-comparison-text');
 
+                comparisonDiv.className = 'alert alert-warning';
                 if (diff > 1) {
-                    comparisonDiv.className = 'alert alert-danger';
                     comparisonText.textContent = `Analogs show ${diff.toFixed(1)}°F warmer than normal (${pctDiff > 0 ? '+' : ''}${pctDiff}% above average)`;
                 } else if (diff < -1) {
-                    comparisonDiv.className = 'alert alert-info';
                     comparisonText.textContent = `Analogs show ${Math.abs(diff).toFixed(1)}°F cooler than normal (${pctDiff}% below average)`;
                 } else {
-                    comparisonDiv.className = 'alert alert-secondary';
                     comparisonText.textContent = `Analogs show near-normal temperatures`;
                 }
                 comparisonDiv.style.display = 'block';
@@ -1304,6 +1323,9 @@ function loadAnalogs() {
             });
 
             document.getElementById('analog-results').style.display = 'block';
+
+            // Reload the history chart to include the new prediction
+            loadAnalogHistory();
         })
         .catch(error => {
             document.getElementById('analog-loading').style.display = 'none';
@@ -1397,10 +1419,163 @@ function navigateMapDate(direction) {
     loadHeightMap();
 }
 
+// Analog history chart
+let analogHistoryChart = null;
+
+function loadAnalogHistory() {
+    fetch('/api/era5/analog-history')
+        .then(response => response.json())
+        .then(data => {
+            if (!data.success || !data.predictions || data.predictions.length === 0) {
+                console.log('No analog history data available');
+                return;
+            }
+
+            const predictions = data.predictions;
+
+            // Extract data for chart
+            const dates = predictions.map(p => {
+                const date = new Date(p.prediction_date);
+                return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            });
+
+            const precipValues = predictions.map(p => p.analog_precip);
+            const precipNormals = predictions.map(p => p.climatology_precip);
+            const tempValues = predictions.map(p => p.analog_temp);
+            const tempNormals = predictions.map(p => p.climatology_temp);
+            const correlations = predictions.map(p => p.avg_correlation || 0);
+
+            // Create chart
+            const ctx = document.getElementById('analogHistoryChart').getContext('2d');
+
+            if (analogHistoryChart) {
+                analogHistoryChart.destroy();
+            }
+
+            analogHistoryChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: dates,
+                    datasets: [
+                        {
+                            label: 'Analog Precip (14-day)',
+                            data: precipValues,
+                            borderColor: '#22c55e',
+                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                            tension: 0.3,
+                            fill: true,
+                            yAxisID: 'y-precip'
+                        },
+                        {
+                            label: 'Normal Precip',
+                            data: precipNormals,
+                            borderColor: '#86efac',
+                            borderDash: [5, 5],
+                            borderWidth: 2,
+                            tension: 0.3,
+                            fill: false,
+                            yAxisID: 'y-precip'
+                        },
+                        {
+                            label: 'Analog Temp (14-day avg)',
+                            data: tempValues,
+                            borderColor: '#ffc107',
+                            backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                            tension: 0.3,
+                            fill: true,
+                            yAxisID: 'y-temp'
+                        },
+                        {
+                            label: 'Normal Temp',
+                            data: tempNormals,
+                            borderColor: '#fde68a',
+                            borderDash: [5, 5],
+                            borderWidth: 2,
+                            tension: 0.3,
+                            fill: false,
+                            yAxisID: 'y-temp'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    plugins: {
+                        legend: {
+                            position: 'top'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.dataset.yAxisID === 'y-precip') {
+                                        label += context.parsed.y.toFixed(2) + '"';
+                                    } else {
+                                        label += context.parsed.y.toFixed(1) + '°F';
+                                    }
+                                    return label;
+                                },
+                                afterBody: function(tooltipItems) {
+                                    if (tooltipItems.length > 0) {
+                                        const index = tooltipItems[0].dataIndex;
+                                        const correlation = correlations[index];
+                                        const percentage = (correlation * 100).toFixed(1);
+                                        return '\nPattern Similarity: ' + percentage + '%';
+                                    }
+                                    return '';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        'y-precip': {
+                            type: 'linear',
+                            position: 'left',
+                            title: {
+                                display: true,
+                                text: 'Precipitation (inches)'
+                            },
+                            grid: {
+                                color: '#e0e0e0'
+                            }
+                        },
+                        'y-temp': {
+                            type: 'linear',
+                            position: 'right',
+                            title: {
+                                display: true,
+                                text: 'Temperature (°F)'
+                            },
+                            grid: {
+                                drawOnChartArea: false
+                            }
+                        },
+                        x: {
+                            grid: {
+                                display: false
+                            }
+                        }
+                    }
+                }
+            });
+        })
+        .catch(error => {
+            console.error('Error loading analog history:', error);
+        });
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     initCharts();
     loadData();
     initEraCharts();
+    loadAnalogHistory();  // Load analog prediction history chart
 
     // Set default ERA5 dates (last 30 days)
     setEraDateRange(30);
