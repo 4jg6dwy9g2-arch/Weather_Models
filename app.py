@@ -45,6 +45,7 @@ from nws_forecast import (
 NWS_CACHE_PATH = Path(__file__).resolve().parent / "nws_forecast_cache.json"
 import asos
 import rossby_waves
+import nws_batch
 
 try:
     from astral import LocationInfo, moon
@@ -59,6 +60,9 @@ from pangu_integration import pangu_bp, cleanup_database, load_runs_db
 
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = Path(__file__).parent / "forecasts.json"
+
+# ASOS forecast trends storage file (last 2 runs with 6-hourly data)
+ASOS_TRENDS_FILE = Path(__file__).parent / "asos_forecast_trends.json"
 
 if load_dotenv:
     load_dotenv()
@@ -130,6 +134,70 @@ def save_nws_cache(payload: dict):
         logger.warning(f"Error saving NWS cache: {e}")
 
 
+def load_asos_trends_db():
+    """Load the ASOS forecast trends database from JSON file."""
+    if ASOS_TRENDS_FILE.exists():
+        try:
+            with open(ASOS_TRENDS_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading asos_forecast_trends.json: {e}")
+    return {"runs": {}, "stations": {}}
+
+
+def save_asos_trends_db(db: dict):
+    """Save the ASOS forecast trends database to JSON file."""
+    try:
+        with open(ASOS_TRENDS_FILE, 'w') as f:
+            json.dump(db, f, indent=2)
+        logger.info(f"Saved ASOS trends to {ASOS_TRENDS_FILE}")
+    except Exception as e:
+        logger.error(f"Error saving ASOS trends database: {e}")
+
+
+def store_asos_trend_run(init_time: datetime, model: str, station_forecasts: dict):
+    """
+    Store a single model run with 6-hourly forecast data for trend visualization.
+    Keeps only the last 2 runs in the database.
+
+    Args:
+        init_time: Model initialization time
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
+        station_forecasts: Dict mapping station_id to forecast data
+            Each station dict has: temps, mslps, precips (lists aligned with 6-hourly forecast_hours)
+    """
+    db = load_asos_trends_db()
+
+    # Update stations dict (always keep current)
+    stations = asos.get_stations_dict()
+    db["stations"] = stations
+
+    # Forecast hours for trends: every 6 hours from 0 to 360
+    forecast_hours = list(range(0, 361, 6))
+
+    # Create run entry if needed
+    run_key = init_time.isoformat()
+    if run_key not in db["runs"]:
+        db["runs"][run_key] = {
+            "forecast_hours": forecast_hours,
+        }
+
+    # Store this model's forecasts
+    db["runs"][run_key][model.lower()] = station_forecasts
+
+    # Keep only the last 2 runs
+    sorted_runs = sorted(db["runs"].keys())
+    if len(sorted_runs) > 2:
+        # Remove oldest runs
+        for old_run in sorted_runs[:-2]:
+            del db["runs"][old_run]
+            logger.info(f"Removed old trend run: {old_run}")
+
+    # Save
+    save_asos_trends_db(db)
+    logger.info(f"Stored {model.upper()} trend forecasts for {len(station_forecasts)} stations at {run_key}")
+
+
 def fetch_nws_forecast_cache(hours_ahead: int = 168):
     """Fetch NWS forecast and cache only temperature data for verification overlays."""
     grid_id, grid_x, grid_y, forecast_url = get_grid_point(DEFAULT_LAT, DEFAULT_LON)
@@ -151,7 +219,7 @@ def fetch_nws_forecast_cache(hours_ahead: int = 168):
     snapshot = {
         "success": True,
         "location": {"lat": DEFAULT_LAT, "lon": DEFAULT_LON, "grid": grid_id},
-        "fetched_at": datetime.now().isoformat(),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
         "hours_ahead": hours_ahead,
         "forecast": result
     }
@@ -716,6 +784,7 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
 
     # Calculate wave number forecast at 24-hour intervals for 15 days
     z500_waves = None  # Current wave number (F000)
+    z500_field = None  # Store F000 z500 field for analog matching
     z500_waves_forecast = {
         "times": [],
         "wave_numbers": [],
@@ -743,9 +812,15 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
             z500_waves_forecast["amplitudes"].append(amplitudes[0] if amplitudes else None)
             z500_waves_forecast["variance_explained"].append(variance[0] if variance else None)
 
-            # Store F000 as current wave number
+            # Store F000 as current wave number and save full field
             if fhr == 0:
                 z500_waves = wave_metrics
+                # Save the full z500 field for analog matching (F000 only)
+                z500_field = {
+                    'values': z500_data.values.tolist(),
+                    'latitude': z500_data.latitude.values.tolist(),
+                    'longitude': z500_data.longitude.values.tolist()
+                }
                 amp_str = f"{amplitudes[0]:.1f}m" if amplitudes else "N/A"
                 var_str = f"{variance[0]:.1f}%" if variance else "N/A"
                 logger.info(f"GFS wave number: {wave_metrics.get('wave_number')} (amplitude: {amp_str}, variance: {var_str})")
@@ -766,7 +841,8 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
         "times": times,
         "init_time": init_time.isoformat(),
         "z500_waves": z500_waves,
-        "z500_waves_forecast": z500_waves_forecast
+        "z500_waves_forecast": z500_waves_forecast,
+        "z500_field": z500_field
     }
 
 
@@ -1182,7 +1258,7 @@ def calculate_all_verification(gfs_data: dict, aifs_data: dict, observed: dict, 
     return verification
 
 
-def calculate_lead_time_verification(location_name: str) -> dict:
+def calculate_lead_time_verification(location_name: str, days_back: Optional[int] = None, use_cumulative: bool = True) -> dict:
     """
     Calculate verification metrics grouped by lead time (forecast hour).
     Aggregates data across all historical runs.
@@ -1211,12 +1287,62 @@ def calculate_lead_time_verification(location_name: str) -> dict:
 
     runs = db[location_name].get("runs", {})
     now = datetime.now(timezone.utc)
+    cutoff_date = now - timedelta(days=days_back) if days_back else None
 
     # Collect sums/counts by lead time (supports cumulative stats)
     errors_by_lead_time = {}
 
     runs_with_obs = 0
     obs_by_time = {}
+
+    # Build WeatherLink observation lookup for all valid times across runs
+    time_keys = set()
+    for run_id, run_data in runs.items():
+        gfs_data = run_data.get("gfs", {})
+        init_time_str = gfs_data.get("init_time")
+        if not init_time_str:
+            continue
+        try:
+            init_time = datetime.fromisoformat(init_time_str)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        forecast_times = gfs_data.get("times", [])
+        for time_str in forecast_times:
+            try:
+                valid_time = datetime.fromisoformat(time_str)
+                if valid_time.tzinfo is None:
+                    valid_time = valid_time.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if valid_time >= now:
+                continue
+            if cutoff_date and valid_time < cutoff_date:
+                continue
+            time_keys.add(valid_time.astimezone(timezone.utc).isoformat())
+
+    obs_lookup = {}
+    if time_keys:
+        sorted_time_keys = sorted(time_keys)
+        obs_times = []
+        for t in sorted_time_keys:
+            try:
+                dt = datetime.fromisoformat(t)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                obs_times.append(dt.replace(tzinfo=None))
+            except Exception:
+                obs_times.append(None)
+        obs_data = weatherlink.get_observations(obs_times, times_are_utc=True)
+        obs_temps = obs_data.get("temps", [])
+        obs_mslps = obs_data.get("mslps", [])
+        for idx, t in enumerate(sorted_time_keys):
+            obs_lookup[t] = {
+                "temp": obs_temps[idx] if idx < len(obs_temps) else None,
+                "mslp": obs_mslps[idx] if idx < len(obs_mslps) else None
+            }
 
     def _ensure_lt(lt):
         if lt not in errors_by_lead_time:
@@ -1237,24 +1363,21 @@ def calculate_lead_time_verification(location_name: str) -> dict:
         errors_by_lead_time[lt][key]["count"] += 1
 
     # Seed with cumulative stats if present
-    cumulative = db[location_name].get("cumulative_stats", {}).get("by_lead_time", {})
-    for lt_str, stats in cumulative.items():
-        try:
-            lt = int(lt_str)
-        except ValueError:
-            continue
-        _ensure_lt(lt)
-        for key in ["gfs_temp", "aifs_temp", "ifs_temp", "gfs_mslp", "aifs_mslp", "ifs_mslp"]:
-            s = stats.get(key, {})
-            errors_by_lead_time[lt][key]["sum_abs"] += s.get("sum_abs", 0.0)
-            errors_by_lead_time[lt][key]["sum"] += s.get("sum", 0.0)
-            errors_by_lead_time[lt][key]["count"] += s.get("count", 0)
+    if use_cumulative:
+        cumulative = db[location_name].get("cumulative_stats", {}).get("by_lead_time", {})
+        for lt_str, stats in cumulative.items():
+            try:
+                lt = int(lt_str)
+            except ValueError:
+                continue
+            _ensure_lt(lt)
+            for key in ["gfs_temp", "aifs_temp", "ifs_temp", "gfs_mslp", "aifs_mslp", "ifs_mslp"]:
+                s = stats.get(key, {})
+                errors_by_lead_time[lt][key]["sum_abs"] += s.get("sum_abs", 0.0)
+                errors_by_lead_time[lt][key]["sum"] += s.get("sum", 0.0)
+                errors_by_lead_time[lt][key]["count"] += s.get("count", 0)
 
     for run_id, run_data in runs.items():
-        observed = run_data.get("observed")
-        if not observed or not observed.get("temps"):
-            continue
-
         gfs_data = run_data.get("gfs", {})
         aifs_data = run_data.get("aifs", {})
         ifs_data = run_data.get("ifs", {})
@@ -1279,9 +1402,7 @@ def calculate_lead_time_verification(location_name: str) -> dict:
         gfs_mslps = gfs_data.get("mslps", [])
         aifs_mslps = aifs_data.get("mslps", [])
         ifs_mslps = ifs_data.get("mslps", []) if ifs_data else []
-        obs_temps = observed.get("temps", [])
-        obs_mslps = observed.get("mslps", [])
-
+        run_has_obs = False
         for i, time_str in enumerate(forecast_times):
             try:
                 valid_time = datetime.fromisoformat(time_str)
@@ -1293,55 +1414,59 @@ def calculate_lead_time_verification(location_name: str) -> dict:
             # Only include past times (verified)
             if valid_time >= now:
                 continue
+            if cutoff_date and valid_time < cutoff_date:
+                continue
 
             # Calculate lead time in hours
             lead_time_hours = int((valid_time - init_time).total_seconds() / 3600)
 
             _ensure_lt(lead_time_hours)
 
+            time_key = valid_time.astimezone(timezone.utc).isoformat()
+            obs = obs_lookup.get(time_key, {})
+            obs_temp = obs.get("temp")
+            obs_mslp = obs.get("mslp")
+            if obs_temp is not None or obs_mslp is not None:
+                run_has_obs = True
+
             # Cache observed temperature by valid time (UTC) for NWS comparisons
-            if i < len(obs_temps):
-                obs_temp = obs_temps[i]
-                if obs_temp is not None:
-                    obs_by_time[valid_time.astimezone(timezone.utc).isoformat()] = obs_temp
+            if obs_temp is not None:
+                obs_by_time[time_key] = obs_temp
 
             # Collect temperature errors
-            if i < len(gfs_temps) and i < len(obs_temps):
+            if i < len(gfs_temps):
                 gfs_temp = gfs_temps[i]
-                obs_temp = obs_temps[i]
                 if gfs_temp is not None and obs_temp is not None:
                     _add(lead_time_hours, "gfs_temp", gfs_temp - obs_temp)
 
-            if i < len(aifs_temps) and i < len(obs_temps):
+            if i < len(aifs_temps):
                 aifs_temp = aifs_temps[i]
-                obs_temp = obs_temps[i]
                 if aifs_temp is not None and obs_temp is not None:
                     _add(lead_time_hours, "aifs_temp", aifs_temp - obs_temp)
 
-            if i < len(ifs_temps) and i < len(obs_temps):
+            if i < len(ifs_temps):
                 ifs_temp = ifs_temps[i]
-                obs_temp = obs_temps[i]
                 if ifs_temp is not None and obs_temp is not None:
                     _add(lead_time_hours, "ifs_temp", ifs_temp - obs_temp)
 
             # Collect MSLP errors
-            if i < len(gfs_mslps) and i < len(obs_mslps):
+            if i < len(gfs_mslps):
                 gfs_mslp = gfs_mslps[i]
-                obs_mslp = obs_mslps[i]
                 if gfs_mslp is not None and obs_mslp is not None:
                     _add(lead_time_hours, "gfs_mslp", gfs_mslp - obs_mslp)
 
-            if i < len(aifs_mslps) and i < len(obs_mslps):
+            if i < len(aifs_mslps):
                 aifs_mslp = aifs_mslps[i]
-                obs_mslp = obs_mslps[i]
                 if aifs_mslp is not None and obs_mslp is not None:
                     _add(lead_time_hours, "aifs_mslp", aifs_mslp - obs_mslp)
 
-            if i < len(ifs_mslps) and i < len(obs_mslps):
+            if i < len(ifs_mslps):
                 ifs_mslp = ifs_mslps[i]
-                obs_mslp = obs_mslps[i]
                 if ifs_mslp is not None and obs_mslp is not None:
                     _add(lead_time_hours, "ifs_mslp", ifs_mslp - obs_mslp)
+
+        if run_has_obs:
+            runs_with_obs += 1
 
     # NWS verification (temperature only) using cached forecast + WeatherLink observations
     nws_cache = load_nws_cache()
@@ -1352,9 +1477,18 @@ def calculate_lead_time_verification(location_name: str) -> dict:
         try:
             nws_init = datetime.fromisoformat(run["fetched_at"])
             if nws_init.tzinfo is None:
-                nws_init = nws_init.replace(tzinfo=timezone.utc)
+                # Assume local time if tz missing, then convert to UTC
+                local_tz = datetime.now().astimezone().tzinfo
+                nws_init = nws_init.replace(tzinfo=local_tz).astimezone(timezone.utc)
+            else:
+                nws_init = nws_init.astimezone(timezone.utc)
         except Exception:
             continue
+
+        # Anchor NWS lead times to the previous 6-hour cycle (UTC) to align with other models
+        nws_cycle_init = nws_init.replace(minute=0, second=0, microsecond=0)
+        cycle_hour = (nws_cycle_init.hour // 6) * 6
+        nws_cycle_init = nws_cycle_init.replace(hour=cycle_hour)
 
         for entry in run.get("forecast", []):
             try:
@@ -1363,16 +1497,18 @@ def calculate_lead_time_verification(location_name: str) -> dict:
                     valid_time = valid_time.replace(tzinfo=timezone.utc)
             except Exception:
                 continue
-
-            if valid_time >= now:
+            utc_time = valid_time.astimezone(timezone.utc)
+            if utc_time >= now:
+                continue
+            if cutoff_date and utc_time < cutoff_date:
                 continue
 
-            # Only include 6-hourly verification times
-            if valid_time.hour % 6 != 0:
+            # Only include 6-hourly verification times (UTC)
+            if utc_time.hour % 6 != 0:
                 continue
 
-            lead_time_hours = int((valid_time - nws_init).total_seconds() / 3600)
-            obs_temp = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
+            lead_time_hours = int((utc_time - nws_cycle_init).total_seconds() / 3600)
+            obs_temp = obs_by_time.get(utc_time.isoformat())
             temp_val = entry.get("temperature")
             if obs_temp is None or temp_val is None:
                 continue
@@ -1521,6 +1657,7 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
         return {"error": "Invalid variable"}
 
     fcst_key, obs_key = var_map[variable]
+    obs_lookup_key = 'temp' if variable == 'temp' else 'mslp'
 
     # Collect sums/counts grouped by date
     # Key: date string (YYYY-MM-DD)
@@ -1564,14 +1701,63 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
                 errors_by_date[date_key][model_key]["sum"] += stats.get("sum", 0.0)
                 errors_by_date[date_key][model_key]["count"] += stats.get("count", 0)
 
+    # Build WeatherLink observation lookup for valid times in window
+    time_keys = set()
+    for run_id, run_data in runs.items():
+        gfs_data = run_data.get("gfs", {})
+        init_time_str = gfs_data.get("init_time")
+        if not init_time_str:
+            continue
+        try:
+            init_time = datetime.fromisoformat(init_time_str)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        forecast_times = gfs_data.get("times", [])
+        for time_str in forecast_times:
+            try:
+                valid_time = datetime.fromisoformat(time_str)
+                if valid_time.tzinfo is None:
+                    valid_time = valid_time.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+
+            if valid_time >= now or valid_time < cutoff_date:
+                continue
+
+            lead_time = int((valid_time - init_time).total_seconds() / 3600)
+            if lead_time != lead_time_hours:
+                continue
+
+            time_keys.add(valid_time.astimezone(timezone.utc).isoformat())
+
+    obs_lookup = {}
+    if time_keys:
+        sorted_time_keys = sorted(time_keys)
+        obs_times = []
+        for t in sorted_time_keys:
+            try:
+                dt = datetime.fromisoformat(t)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                obs_times.append(dt.replace(tzinfo=None))
+            except Exception:
+                obs_times.append(None)
+        obs_data = weatherlink.get_observations(obs_times, times_are_utc=True)
+        obs_temps = obs_data.get("temps", [])
+        obs_mslps = obs_data.get("mslps", [])
+        for idx, t in enumerate(sorted_time_keys):
+            obs_lookup[t] = {
+                "temp": obs_temps[idx] if idx < len(obs_temps) else None,
+                "mslp": obs_mslps[idx] if idx < len(obs_mslps) else None
+            }
+
     # Build observed lookup by valid time for NWS verification (temp only)
     obs_by_time = {}
 
     for run_id, run_data in runs.items():
-        observed = run_data.get("observed")
-        if not observed or not observed.get(obs_key):
-            continue
-
         gfs_data = run_data.get("gfs", {})
         aifs_data = run_data.get("aifs", {})
         ifs_data = run_data.get("ifs", {})
@@ -1595,8 +1781,6 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
         gfs_values = gfs_data.get(fcst_key, [])
         aifs_values = aifs_data.get(fcst_key, [])
         ifs_values = ifs_data.get(fcst_key, []) if ifs_data else []
-        obs_values = observed.get(obs_key, [])
-
         for i, time_str in enumerate(forecast_times):
             try:
                 valid_time = datetime.fromisoformat(time_str)
@@ -1608,6 +1792,8 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
             # Only include past times
             if valid_time >= now:
                 continue
+            if cutoff_date and valid_time < cutoff_date:
+                continue
 
             # Calculate lead time in hours
             lead_time = int((valid_time - init_time).total_seconds() / 3600)
@@ -1616,32 +1802,28 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
             if lead_time != lead_time_hours:
                 continue
 
-            # Cache observed values by valid time (UTC) for NWS comparisons
-            if i < len(obs_values):
-                obs_val = obs_values[i]
-                if obs_val is not None:
-                    obs_by_time[valid_time.astimezone(timezone.utc).isoformat()] = obs_val
+            time_key = valid_time.astimezone(timezone.utc).isoformat()
+            obs_val = obs_lookup.get(time_key, {}).get(obs_lookup_key)
+            if obs_val is not None:
+                obs_by_time[time_key] = obs_val
 
             # Use the date of the valid time for grouping
             date_key = valid_time.date().isoformat()
             _ensure_date(date_key)
 
             # Collect errors for each model
-            if i < len(gfs_values) and i < len(obs_values):
+            if i < len(gfs_values):
                 gfs_val = gfs_values[i]
-                obs_val = obs_values[i]
                 if gfs_val is not None and obs_val is not None:
                     _add(date_key, "gfs", gfs_val - obs_val)
 
-            if i < len(aifs_values) and i < len(obs_values):
+            if i < len(aifs_values):
                 aifs_val = aifs_values[i]
-                obs_val = obs_values[i]
                 if aifs_val is not None and obs_val is not None:
                     _add(date_key, "aifs", aifs_val - obs_val)
 
-            if ifs_values and i < len(ifs_values) and i < len(obs_values):
+            if ifs_values and i < len(ifs_values):
                 ifs_val = ifs_values[i]
-                obs_val = obs_values[i]
                 if ifs_val is not None and obs_val is not None:
                     _add(date_key, "ifs", ifs_val - obs_val)
 
@@ -1655,9 +1837,17 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
             try:
                 nws_init = datetime.fromisoformat(run["fetched_at"])
                 if nws_init.tzinfo is None:
-                    nws_init = nws_init.replace(tzinfo=timezone.utc)
+                    local_tz = datetime.now().astimezone().tzinfo
+                    nws_init = nws_init.replace(tzinfo=local_tz).astimezone(timezone.utc)
+                else:
+                    nws_init = nws_init.astimezone(timezone.utc)
             except Exception:
                 continue
+
+            # Anchor NWS lead times to the previous 6-hour cycle (UTC) to align with other models
+            nws_cycle_init = nws_init.replace(minute=0, second=0, microsecond=0)
+            cycle_hour = (nws_cycle_init.hour // 6) * 6
+            nws_cycle_init = nws_cycle_init.replace(hour=cycle_hour)
 
             for entry in run.get("forecast", []):
                 try:
@@ -1667,25 +1857,27 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
                 except Exception:
                     continue
 
+                utc_time = valid_time.astimezone(timezone.utc)
+
                 # Only include past times
-                if valid_time >= now:
+                if utc_time >= now:
                     continue
 
-                # Only include 6-hourly verification times
-                if valid_time.hour % 6 != 0:
+                # Only include 6-hourly verification times (UTC)
+                if utc_time.hour % 6 != 0:
                     continue
 
                 # Calculate lead time in hours
-                lead_time = int((valid_time - nws_init).total_seconds() / 3600)
+                lead_time = int((utc_time - nws_cycle_init).total_seconds() / 3600)
                 if lead_time != lead_time_hours:
                     continue
 
                 temp_val = entry.get("temperature")
-                obs_val = obs_by_time.get(valid_time.astimezone(timezone.utc).isoformat())
+                obs_val = obs_by_time.get(utc_time.isoformat())
                 if temp_val is None or obs_val is None:
                     continue
 
-                date_key = valid_time.date().isoformat()
+                date_key = utc_time.date().isoformat()
                 _ensure_date(date_key)
                 _add(date_key, "nws", temp_val - obs_val)
 
@@ -2050,6 +2242,12 @@ def dashboard():
     return render_template('current.html')
 
 
+@app.route('/forecasts')
+def forecast_comparison():
+    """Forecast comparison page with Fairfax and ASOS tabs."""
+    return render_template('forecast_comparison.html')
+
+
 @app.route('/dashboard')
 def forecast_dashboard():
     """Fairfax verification dashboard."""
@@ -2113,6 +2311,12 @@ def current_conditions():
 
 @app.route('/forecast')
 def run_forecast_page():
+    """Forecast comparison page with Fairfax and ASOS tabs."""
+    return render_template('forecast_comparison.html')
+
+
+@app.route('/run-forecast')
+def running_conditions_page():
     """Run forecast page - best times to run based on weather."""
     return render_template('forecast.html')
 
@@ -2266,9 +2470,13 @@ def api_verification_by_lead_time():
     Shows how forecast accuracy degrades with increasing lead time.
     """
     location_name = request.args.get('location', 'Fairfax, VA')
+    period = request.args.get('period', 'all').lower()
 
     try:
-        result = calculate_lead_time_verification(location_name)
+        if period == 'monthly':
+            result = calculate_lead_time_verification(location_name, days_back=30, use_cumulative=False)
+        else:
+            result = calculate_lead_time_verification(location_name, use_cumulative=True)
 
         if "error" in result:
             return jsonify({"success": False, "error": result["error"]})
@@ -2276,7 +2484,8 @@ def api_verification_by_lead_time():
         return jsonify({
             "success": True,
             "location": location_name,
-            "verification": result
+            "verification": result,
+            "period": period
         })
     except Exception as e:
         logger.error(f"Error calculating lead-time verification: {e}")
@@ -2312,15 +2521,11 @@ def calculate_temp_bias_history(location_name: str, lead_time_hours: int = 24, d
     now = datetime.now(timezone.utc)
     cutoff_date = now - timedelta(days=days_back)
 
-    # Collect individual verification points
+    # Collect candidate verification points (latest run per valid time)
     # Key: valid_time ISO string
     verification_points = {}
 
     for run_id, run_data in runs.items():
-        observed = run_data.get("observed")
-        if not observed or not observed.get("temps"):
-            continue
-
         gfs_data = run_data.get("gfs", {})
         aifs_data = run_data.get("aifs", {})
         ifs_data = run_data.get("ifs", {})
@@ -2336,15 +2541,10 @@ def calculate_temp_bias_history(location_name: str, lead_time_hours: int = 24, d
         except ValueError:
             continue
 
-        # Skip runs outside the time window
-        if init_time < cutoff_date:
-            continue
-
         forecast_times = gfs_data.get("times", [])
         gfs_temps = gfs_data.get("temps", [])
         aifs_temps = aifs_data.get("temps", [])
         ifs_temps = ifs_data.get("temps", []) if ifs_data else []
-        obs_temps = observed.get("temps", [])
 
         for i, time_str in enumerate(forecast_times):
             try:
@@ -2354,8 +2554,8 @@ def calculate_temp_bias_history(location_name: str, lead_time_hours: int = 24, d
             except (ValueError, TypeError):
                 continue
 
-            # Only include past times
-            if valid_time >= now:
+            # Only include past times within requested window
+            if valid_time >= now or valid_time < cutoff_date:
                 continue
 
             # Calculate lead time in hours
@@ -2369,31 +2569,40 @@ def calculate_temp_bias_history(location_name: str, lead_time_hours: int = 24, d
             if valid_time.hour % 6 != 0:
                 continue
 
-            # Use the valid time as the key
+            # Use the valid time as the key and keep latest init_time
             time_key = valid_time.astimezone(timezone.utc).isoformat()
+            existing = verification_points.get(time_key)
+            if existing and existing.get("init_time") and existing["init_time"] >= init_time:
+                continue
 
-            # Only store one verification per valid time (latest forecast run)
-            if i < len(obs_temps) and obs_temps[i] is not None:
-                obs_val = obs_temps[i]
-
-                verification_points[time_key] = {
-                    "observed": obs_val,
-                    "gfs_bias": None,
-                    "aifs_bias": None,
-                    "ifs_bias": None
-                }
-
-                if i < len(gfs_temps) and gfs_temps[i] is not None:
-                    verification_points[time_key]["gfs_bias"] = gfs_temps[i] - obs_val
-
-                if i < len(aifs_temps) and aifs_temps[i] is not None:
-                    verification_points[time_key]["aifs_bias"] = aifs_temps[i] - obs_val
-
-                if ifs_temps and i < len(ifs_temps) and ifs_temps[i] is not None:
-                    verification_points[time_key]["ifs_bias"] = ifs_temps[i] - obs_val
+            verification_points[time_key] = {
+                "init_time": init_time,
+                "gfs_val": gfs_temps[i] if i < len(gfs_temps) else None,
+                "aifs_val": aifs_temps[i] if i < len(aifs_temps) else None,
+                "ifs_val": ifs_temps[i] if (ifs_temps and i < len(ifs_temps)) else None
+            }
 
     # Sort by time and build result arrays
     sorted_times = sorted(verification_points.keys())
+
+    # Fetch observed values for all times (WeatherLink)
+    obs_times = []
+    for t in sorted_times:
+        try:
+            dt = datetime.fromisoformat(t)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            obs_times.append(dt.replace(tzinfo=None))
+        except Exception:
+            obs_times.append(None)
+
+    obs_lookup = {}
+    if obs_times:
+        obs_data = weatherlink.get_observations(obs_times, times_are_utc=True)
+        obs_vals = obs_data.get("temps", [])
+        for idx, t in enumerate(sorted_times):
+            if idx < len(obs_vals):
+                obs_lookup[t] = obs_vals[idx]
 
     result = {
         "dates": sorted_times,
@@ -2405,10 +2614,18 @@ def calculate_temp_bias_history(location_name: str, lead_time_hours: int = 24, d
 
     for time_key in sorted_times:
         point = verification_points[time_key]
-        result["observed"].append(round(point["observed"], 1) if point["observed"] is not None else None)
-        result["gfs_bias"].append(round(point["gfs_bias"], 2) if point["gfs_bias"] is not None else None)
-        result["aifs_bias"].append(round(point["aifs_bias"], 2) if point["aifs_bias"] is not None else None)
-        result["ifs_bias"].append(round(point["ifs_bias"], 2) if point["ifs_bias"] is not None else None)
+        obs_val = obs_lookup.get(time_key)
+        if obs_val is None:
+            result["observed"].append(None)
+            result["gfs_bias"].append(None)
+            result["aifs_bias"].append(None)
+            result["ifs_bias"].append(None)
+            continue
+
+        result["observed"].append(round(obs_val, 1))
+        result["gfs_bias"].append(round(point["gfs_val"] - obs_val, 2) if point["gfs_val"] is not None else None)
+        result["aifs_bias"].append(round(point["aifs_val"] - obs_val, 2) if point["aifs_val"] is not None else None)
+        result["ifs_bias"].append(round(point["ifs_val"] - obs_val, 2) if point["ifs_val"] is not None else None)
 
     return result
 
@@ -2593,15 +2810,11 @@ def calculate_mslp_bias_history(location_name: str, lead_time_hours: int = 24, d
     now = datetime.now(timezone.utc)
     cutoff_date = now - timedelta(days=days_back)
 
-    # Collect individual verification points
+    # Collect candidate verification points (latest run per valid time)
     # Key: valid_time ISO string
     verification_points = {}
 
     for run_id, run_data in runs.items():
-        observed = run_data.get("observed")
-        if not observed or not observed.get("mslps"):
-            continue
-
         gfs_data = run_data.get("gfs", {})
         aifs_data = run_data.get("aifs", {})
         ifs_data = run_data.get("ifs", {})
@@ -2617,15 +2830,10 @@ def calculate_mslp_bias_history(location_name: str, lead_time_hours: int = 24, d
         except ValueError:
             continue
 
-        # Skip runs outside the time window
-        if init_time < cutoff_date:
-            continue
-
         forecast_times = gfs_data.get("times", [])
         gfs_mslps = gfs_data.get("mslps", [])
         aifs_mslps = aifs_data.get("mslps", [])
         ifs_mslps = ifs_data.get("mslps", []) if ifs_data else []
-        obs_mslps = observed.get("mslps", [])
 
         for i, time_str in enumerate(forecast_times):
             try:
@@ -2635,8 +2843,8 @@ def calculate_mslp_bias_history(location_name: str, lead_time_hours: int = 24, d
             except (ValueError, TypeError):
                 continue
 
-            # Only include past times
-            if valid_time >= now:
+            # Only include past times within requested window
+            if valid_time >= now or valid_time < cutoff_date:
                 continue
 
             # Calculate lead time in hours
@@ -2650,31 +2858,40 @@ def calculate_mslp_bias_history(location_name: str, lead_time_hours: int = 24, d
             if valid_time.hour not in [0, 12]:
                 continue
 
-            # Use the valid time as the key
-            time_key = valid_time.isoformat()
+            # Use the valid time as the key and keep latest init_time
+            time_key = valid_time.astimezone(timezone.utc).isoformat()
+            existing = verification_points.get(time_key)
+            if existing and existing.get("init_time") and existing["init_time"] >= init_time:
+                continue
 
-            # Only store one verification per valid time (latest forecast run)
-            if i < len(obs_mslps) and obs_mslps[i] is not None:
-                obs_val = obs_mslps[i]
-
-                verification_points[time_key] = {
-                    "observed": obs_val,
-                    "gfs_bias": None,
-                    "aifs_bias": None,
-                    "ifs_bias": None
-                }
-
-                if i < len(gfs_mslps) and gfs_mslps[i] is not None:
-                    verification_points[time_key]["gfs_bias"] = gfs_mslps[i] - obs_val
-
-                if i < len(aifs_mslps) and aifs_mslps[i] is not None:
-                    verification_points[time_key]["aifs_bias"] = aifs_mslps[i] - obs_val
-
-                if ifs_mslps and i < len(ifs_mslps) and ifs_mslps[i] is not None:
-                    verification_points[time_key]["ifs_bias"] = ifs_mslps[i] - obs_val
+            verification_points[time_key] = {
+                "init_time": init_time,
+                "gfs_val": gfs_mslps[i] if i < len(gfs_mslps) else None,
+                "aifs_val": aifs_mslps[i] if i < len(aifs_mslps) else None,
+                "ifs_val": ifs_mslps[i] if (ifs_mslps and i < len(ifs_mslps)) else None
+            }
 
     # Sort by time and build result arrays
     sorted_times = sorted(verification_points.keys())
+
+    # Fetch observed values for all times (WeatherLink)
+    obs_times = []
+    for t in sorted_times:
+        try:
+            dt = datetime.fromisoformat(t)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            obs_times.append(dt.replace(tzinfo=None))
+        except Exception:
+            obs_times.append(None)
+
+    obs_lookup = {}
+    if obs_times:
+        obs_data = weatherlink.get_observations(obs_times, times_are_utc=True)
+        obs_vals = obs_data.get("mslps", [])
+        for idx, t in enumerate(sorted_times):
+            if idx < len(obs_vals):
+                obs_lookup[t] = obs_vals[idx]
 
     result = {
         "dates": sorted_times,
@@ -2686,10 +2903,18 @@ def calculate_mslp_bias_history(location_name: str, lead_time_hours: int = 24, d
 
     for time_key in sorted_times:
         point = verification_points[time_key]
-        result["observed"].append(round(point["observed"], 1) if point["observed"] is not None else None)
-        result["gfs_bias"].append(round(point["gfs_bias"], 2) if point["gfs_bias"] is not None else None)
-        result["aifs_bias"].append(round(point["aifs_bias"], 2) if point["aifs_bias"] is not None else None)
-        result["ifs_bias"].append(round(point["ifs_bias"], 2) if point["ifs_bias"] is not None else None)
+        obs_val = obs_lookup.get(time_key)
+        if obs_val is None:
+            result["observed"].append(None)
+            result["gfs_bias"].append(None)
+            result["aifs_bias"].append(None)
+            result["ifs_bias"].append(None)
+            continue
+
+        result["observed"].append(round(obs_val, 1))
+        result["gfs_bias"].append(round(point["gfs_val"] - obs_val, 2) if point["gfs_val"] is not None else None)
+        result["aifs_bias"].append(round(point["aifs_val"] - obs_val, 2) if point["aifs_val"] is not None else None)
+        result["ifs_bias"].append(round(point["ifs_val"] - obs_val, 2) if point["ifs_val"] is not None else None)
 
     return result
 
@@ -2943,8 +3168,8 @@ def api_wave_skill_correlation():
         if not asos_db or "runs" not in asos_db:
             return jsonify({"success": False, "error": "ASOS verification data not available"})
 
-        # Get cutoff date
-        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+        # Get cutoff date (timezone-aware)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
 
         # Collect wave-error pairs
         wave_error_data_72h = []
@@ -2998,15 +3223,15 @@ def api_wave_skill_correlation():
                         amplitude_error_data_120h.append({"x": amplitude, "y": mae_120h})
 
         # Calculate expected errors based on current wave pattern
-        latest_run = db[location_name].get("latest_run")
+        latest_run = fairfax_db[location_name].get("latest_run")
         current_wave_number = None
         expected_error_72h = None
         expected_error_120h = None
         predictability_status = "UNKNOWN"
         confidence = "Low"
 
-        if latest_run and latest_run in db[location_name]["runs"]:
-            current_run = db[location_name]["runs"][latest_run]
+        if latest_run and latest_run in fairfax_db[location_name]["runs"]:
+            current_run = fairfax_db[location_name]["runs"][latest_run]
             current_waves = current_run.get("gfs", {}).get("z500_waves", {})
             current_wave_number = current_waves.get("wave_number")
 
@@ -3058,6 +3283,662 @@ def api_wave_skill_correlation():
 
     except Exception as e:
         logger.error(f"Error calculating wave-skill correlation: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/era5/wave-analysis')
+def api_era5_wave_analysis():
+    """
+    Analyze Rossby waves from ERA5 reanalysis data.
+
+    Query params:
+        - start_date: Start date (YYYY-MM-DD), default: 30 days ago
+        - end_date: End date (YYYY-MM-DD), default: today
+
+    Returns wave numbers calculated from ERA5 500mb heights over time.
+    """
+    try:
+        import xarray as xr
+        from datetime import datetime, timedelta
+
+        # Get date range
+        end_date = request.args.get('end_date')
+        start_date = request.args.get('start_date')
+
+        if not end_date:
+            end_date = datetime.now()
+        else:
+            end_date = datetime.fromisoformat(end_date)
+
+        if not start_date:
+            start_date = end_date - timedelta(days=30)
+        else:
+            start_date = datetime.fromisoformat(start_date)
+
+        # Load ERA5 data
+        era5_files = list(Path("/Volumes/T7/Weather_Models/era5/global_500mb").glob("era5_z500_NH_*.nc"))
+
+        if not era5_files:
+            return jsonify({"success": False, "error": "No ERA5 data found. Please download data first."})
+
+        # Load the most recent file or combine multiple files
+        datasets = []
+        for f in era5_files:
+            try:
+                ds = xr.open_dataset(f)
+                datasets.append(ds)
+            except Exception as e:
+                logger.warning(f"Failed to load {f}: {e}")
+
+        if not datasets:
+            return jsonify({"success": False, "error": "Failed to load ERA5 datasets"})
+
+        # Combine datasets
+        ds = xr.concat(datasets, dim='time')
+        ds = ds.sortby('time')
+
+        # Filter to requested date range
+        ds = ds.sel(time=slice(start_date, end_date))
+
+        # Calculate wave numbers for each day
+        wave_data = []
+
+        for t in ds.time.values:
+            try:
+                # Get 500mb heights for this time (keep as DataArray with coordinates)
+                z500 = ds['z'].sel(time=t, pressure_level=500)
+
+                # Use rossby_waves module to calculate wave number (pass DataArray directly)
+                wave_result = rossby_waves.calculate_wave_number(z500, latitude=55.0)
+
+                wave_data.append({
+                    "time": str(t),
+                    "wave_number": wave_result.get("wave_number", 0),
+                    "dominant_waves": wave_result.get("dominant_wave_numbers", []),
+                    "variance_explained": wave_result.get("top_3_variance", {})
+                })
+            except Exception as e:
+                logger.warning(f"Failed to calculate wave for {t}: {e}")
+                continue
+
+        return jsonify({
+            "success": True,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "wave_data": wave_data
+        })
+
+    except Exception as e:
+        logger.error(f"Error in ERA5 wave analysis: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/era5/500mb-map')
+def api_era5_500mb_map():
+    """
+    Get 500mb height field for spatial mapping.
+
+    Query params:
+        - date: Date to fetch (YYYY-MM-DD), default: most recent
+
+    Returns 500mb height grid data for mapping.
+    """
+    try:
+        import xarray as xr
+        from datetime import datetime
+
+        # Get requested date
+        date_str = request.args.get('date')
+        if date_str:
+            target_date = datetime.fromisoformat(date_str)
+        else:
+            target_date = datetime.now()
+
+        # Load ERA5 data
+        era5_files = list(Path("/Volumes/T7/Weather_Models/era5/global_500mb").glob("era5_z500_NH_*.nc"))
+
+        if not era5_files:
+            return jsonify({"success": False, "error": "No ERA5 data found"})
+
+        # Load datasets
+        datasets = []
+        for f in era5_files:
+            try:
+                ds = xr.open_dataset(f)
+                datasets.append(ds)
+            except Exception as e:
+                logger.warning(f"Failed to load {f}: {e}")
+
+        if not datasets:
+            return jsonify({"success": False, "error": "Failed to load ERA5 datasets"})
+
+        # Combine and sort
+        ds = xr.concat(datasets, dim='time')
+        ds = ds.sortby('time')
+
+        # Check for pressure level coordinate
+        pressure_coord = None
+        for coord_name in ['pressure_level', 'level', 'plev', 'lev']:
+            if coord_name in ds.coords or coord_name in ds.dims:
+                pressure_coord = coord_name
+                break
+
+        if pressure_coord is None:
+            return jsonify({"success": False, "error": "Could not find pressure level coordinate in dataset"})
+
+        # Find nearest time to requested date
+        nearest_time = ds.sel(time=target_date, method='nearest')
+
+        # Get 500mb heights
+        z500 = nearest_time['z'].sel(**{pressure_coord: 500})
+
+        # Convert to dam (decameters) for traditional display
+        z500_dam = z500 / 9.80665
+
+        # Calculate wave number
+        wave_result = rossby_waves.calculate_wave_number(z500, latitude=55.0)
+
+        # Generate map image
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        from io import BytesIO
+        import base64
+        import pandas as pd
+
+        fig = plt.figure(figsize=(14, 8))
+        # Rotate view to center North America (central_longitude=-100°)
+        ax = fig.add_subplot(1, 1, 1, projection=ccrs.NorthPolarStereo(central_longitude=-100))
+
+        # Set extent for Northern Hemisphere
+        ax.set_extent([-180, 180, 20, 90], crs=ccrs.PlateCarree())
+
+        # Add map features
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.5)
+        ax.gridlines(draw_labels=False, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+
+        # Plot height field
+        lons = z500.longitude.values
+        lats = z500.latitude.values
+        heights = z500_dam.values
+
+        # Calculate climatological anomalies using 1990-2021 period
+        # Get day of year for the target date
+        target_doy = pd.Timestamp(nearest_time.time.values).dayofyear
+
+        # Filter to 1990-2021 for climatology calculation
+        clim_ds = ds.sel(time=slice('1990-01-01', '2021-12-31'))
+
+        # Calculate climatology with 31-day window
+        ds_with_doy = clim_ds.assign_coords(dayofyear=clim_ds.time.dt.dayofyear)
+        window_days = [(target_doy + offset - 1) % 366 + 1 for offset in range(-15, 16)]
+        mask = ds_with_doy.dayofyear.isin(window_days)
+
+        if mask.sum() > 0:
+            window_data = ds_with_doy.where(mask, drop=True)
+            clim_z500 = window_data['z'].sel(**{pressure_coord: 500}).mean(dim='time')
+            clim_z500_dam = clim_z500 / 9.80665
+            anomalies = heights - clim_z500_dam.values
+        else:
+            # Fallback to zonal mean if climatology fails
+            logger.warning(f"No climatology data for day {target_doy}, using zonal mean")
+            zonal_mean = np.mean(heights, axis=1, keepdims=True)
+            anomalies = heights - zonal_mean
+
+        # Contour fill for anomalies
+        anom_levels = np.arange(-30, 31, 2)  # Anomaly contours every 2 dam from -30 to +30
+        cf = ax.contourf(lons, lats, anomalies, levels=anom_levels, cmap='RdBu_r',
+                        transform=ccrs.PlateCarree(), extend='both')
+
+        # Contour lines for raw heights
+        height_levels = np.arange(460, 620, 6)  # Height contour every 60m (6 dam)
+        cs = ax.contour(lons, lats, heights, levels=height_levels[::2], colors='black',
+                       linewidths=0.8, transform=ccrs.PlateCarree(), alpha=0.7)
+        ax.clabel(cs, inline=True, fontsize=8, fmt='%d')
+
+        # Add colorbar
+        cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.05, shrink=0.8)
+        cbar.set_label('500mb Height Anomaly (dam)', fontsize=10)
+
+        # Title with top 3 wave numbers
+        date_str = pd.Timestamp(nearest_time.time.values).strftime('%Y-%m-%d %H:%M UTC')
+        wave_num = wave_result.get('wave_number', 0)
+        top_waves = wave_result.get('dominant_wave_numbers', [])
+        top_var = wave_result.get('top_3_variance', [])
+
+        # Format wave number display with variance explained
+        if len(top_waves) >= 3 and len(top_var) >= 3:
+            wave_text = f"Wave {top_waves[0]} ({top_var[0]:.0f}%), Wave {top_waves[1]} ({top_var[1]:.0f}%), Wave {top_waves[2]} ({top_var[2]:.0f}%)"
+        else:
+            wave_text = f"Wave {wave_num}"
+
+        plt.title(f'ERA5 500mb Height Anomalies (shaded) & Heights (contours) | {date_str}\nTop Wave Numbers: {wave_text}',
+                 fontsize=12, fontweight='bold')
+
+        # Convert to base64
+        buffer = BytesIO()
+        fig.savefig(buffer, format='png', bbox_inches='tight', dpi=120)
+        buffer.seek(0)
+        img_base64 = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode('utf-8')
+        plt.close(fig)
+
+        return jsonify({
+            "success": True,
+            "date": str(nearest_time.time.values),
+            "map_image": img_base64,
+            "wave_number": wave_result.get("wave_number", 0),
+            "dominant_waves": wave_result.get("dominant_wave_numbers", []),
+            "variance_explained": wave_result.get("top_3_variance", {})
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching 500mb map data: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/era5/analogs')
+def api_era5_analogs():
+    """
+    Find historical analog dates with similar 500mb height patterns using spatial correlation
+    of height anomalies. Anomalies are calculated as deviation from the zonal mean to remove
+    seasonal bias and focus on wave pattern similarity.
+
+    Query params:
+        - top_n: Number of top analogs to return (default: 10)
+
+    Returns:
+        JSON with list of analog dates sorted by spatial pattern similarity
+    """
+    try:
+        import xarray as xr
+        import numpy as np
+        import pandas as pd
+        from scipy.stats import pearsonr
+
+        top_n = int(request.args.get('top_n', 10))
+
+        # Load latest forecast data to get current pattern
+        db = load_forecasts_db()
+        location_name = 'Fairfax, VA'
+
+        if location_name not in db or not db[location_name].get('latest_run'):
+            return jsonify({"success": False, "error": "No forecast data available"})
+
+        latest_run = db[location_name]['latest_run']
+        run_data = db[location_name]['runs'].get(latest_run)
+
+        if not run_data or 'gfs' not in run_data:
+            return jsonify({"success": False, "error": "No GFS forecast data in latest run"})
+
+        # Get initialization time (00Z)
+        init_time = pd.Timestamp(latest_run)
+        current_date_str = init_time.isoformat()
+
+        # Get current z500 field
+        gfs_data = run_data['gfs']
+        z500_field_data = gfs_data.get('z500_field')
+
+        if not z500_field_data:
+            return jsonify({"success": False, "error": "No z500 field in current forecast. Please sync forecasts again to capture the field data."})
+
+        # Extract current pattern (GFS data)
+        current_z500_gfs = np.array(z500_field_data['values'])
+        current_lats_gfs = np.array(z500_field_data['latitude'])
+        current_lons_gfs = np.array(z500_field_data['longitude'])
+
+        logger.info(f"GFS data contains NaN: {np.any(np.isnan(current_z500_gfs))}")
+        logger.info(f"GFS lat range: {current_lats_gfs.min():.1f} to {current_lats_gfs.max():.1f}")
+        logger.info(f"GFS lon range: {current_lons_gfs.min():.1f} to {current_lons_gfs.max():.1f}")
+
+        # Convert GFS longitudes from 0/360 to -180/180 convention to match ERA5
+        if current_lons_gfs.max() > 180:
+            logger.info("Converting GFS longitudes from 0/360 to -180/180 convention")
+            current_lons_gfs = np.where(current_lons_gfs > 180, current_lons_gfs - 360, current_lons_gfs)
+
+        # Get wave number for display
+        current_waves = gfs_data.get('z500_waves', {})
+        current_wave_num = current_waves.get('wave_number')
+
+        # Load ERA5 data
+        era5_path = Path("/Volumes/T7/Weather_Models/era5/global_500mb")
+
+        if not era5_path.exists():
+            return jsonify({"success": False, "error": f"ERA5 data directory not found: {era5_path}"})
+
+        era5_files = list(era5_path.glob("era5_z500_NH_*.nc"))
+
+        if not era5_files:
+            return jsonify({"success": False, "error": "No ERA5 data found"})
+
+        # Load datasets
+        datasets = []
+        for f in era5_files:
+            try:
+                ds = xr.open_dataset(f)
+                datasets.append(ds)
+            except Exception as e:
+                logger.warning(f"Failed to load {f}: {e}")
+
+        if not datasets:
+            return jsonify({"success": False, "error": "Failed to load ERA5 datasets"})
+
+        # Combine and sort
+        ds = xr.concat(datasets, dim='time')
+        ds = ds.sortby('time')
+
+        # Check for pressure level coordinate
+        pressure_coord = None
+        for coord_name in ['pressure_level', 'level', 'plev', 'lev']:
+            if coord_name in ds.coords or coord_name in ds.dims:
+                pressure_coord = coord_name
+                break
+
+        if pressure_coord is None:
+            return jsonify({"success": False, "error": "Could not find pressure level coordinate in dataset"})
+
+        # Get ERA5 coordinates for regridding
+        era5_lats = ds['latitude'].values if 'latitude' in ds.coords else ds['lat'].values
+        era5_lons = ds['longitude'].values if 'longitude' in ds.coords else ds['lon'].values
+
+        logger.info(f"ERA5 lat range: {era5_lats.min():.1f} to {era5_lats.max():.1f}")
+        logger.info(f"ERA5 lon range: {era5_lons.min():.1f} to {era5_lons.max():.1f}")
+
+        # Find overlapping latitude/longitude range to avoid NaNs
+        # ERA5 latitudes (find overlap with GFS)
+        era5_lat_min, era5_lat_max = min(era5_lats), max(era5_lats)
+        gfs_lat_min, gfs_lat_max = min(current_lats_gfs), max(current_lats_gfs)
+        overlap_lat_min = max(era5_lat_min, gfs_lat_min)
+        overlap_lat_max = min(era5_lat_max, gfs_lat_max)
+
+        # Filter ERA5 coordinates to overlapping region
+        lat_mask = (era5_lats >= overlap_lat_min) & (era5_lats <= overlap_lat_max)
+        era5_lats_overlap = era5_lats[lat_mask]
+
+        # Use all longitudes (both should cover 0-360 or -180 to 180)
+        era5_lons_overlap = era5_lons
+
+        logger.info(f"Overlapping latitude range: {overlap_lat_min:.1f} to {overlap_lat_max:.1f}")
+        logger.info(f"Regridding GFS data from {current_z500_gfs.shape} to ERA5 grid {(len(era5_lats_overlap), len(era5_lons_overlap))}")
+
+        # Create xarray DataArray from GFS data
+        gfs_da = xr.DataArray(
+            current_z500_gfs,
+            coords={'latitude': current_lats_gfs, 'longitude': current_lons_gfs},
+            dims=['latitude', 'longitude']
+        )
+
+        # Interpolate to ERA5 grid (overlapping region only)
+        current_z500 = gfs_da.interp(latitude=era5_lats_overlap, longitude=era5_lons_overlap, method='linear').values
+        logger.info(f"Regridded GFS shape: {current_z500.shape}, contains NaN: {np.any(np.isnan(current_z500))}")
+
+        # Calculate climatology (day-of-year mean using 31-day window)
+        # Use 1990-2021 period for climatology (standard 30-year normal)
+        logger.info("Calculating climatology from ERA5 data (1990-2021)...")
+
+        # Filter to 1990-2021 and overlapping latitude range for climatology calculation
+        lat_coord_name = 'latitude' if 'latitude' in ds.coords else 'lat'
+        lon_coord_name = 'longitude' if 'longitude' in ds.coords else 'lon'
+
+        clim_ds = ds.sel(
+            time=slice('1990-01-01', '2021-12-31'),
+            **{lat_coord_name: era5_lats_overlap, lon_coord_name: era5_lons_overlap}
+        )
+
+        # Group by day of year and calculate mean
+        ds_with_doy = clim_ds.assign_coords(dayofyear=clim_ds.time.dt.dayofyear)
+
+        # Calculate climatology with 31-day smoothing window
+        climatology = {}
+        for doy in range(1, 367):  # 1-366 (leap years)
+            # Get window of +/- 15 days around this day of year
+            window_days = [(doy + offset - 1) % 366 + 1 for offset in range(-15, 16)]
+
+            # Select all times matching these days of year
+            mask = ds_with_doy.dayofyear.isin(window_days)
+            if mask.sum() > 0:
+                window_data = ds_with_doy.where(mask, drop=True)
+                clim_z500 = window_data['z'].sel(**{pressure_coord: 500}).mean(dim='time')
+                climatology[doy] = clim_z500.values
+
+        # Calculate current pattern anomaly (relative to climatology)
+        current_doy = init_time.dayofyear
+        if current_doy in climatology:
+            current_clim = climatology[current_doy]
+            current_anomaly = current_z500 - current_clim
+        else:
+            logger.warning(f"No climatology for day {current_doy}, using zonal mean")
+            current_zonal_mean = np.mean(current_z500, axis=1, keepdims=True)
+            current_anomaly = current_z500 - current_zonal_mean
+
+        current_flat = current_anomaly.flatten()
+        logger.info(f"Current anomaly shape: {current_anomaly.shape}, finite values: {np.sum(np.isfinite(current_flat))}/{len(current_flat)}")
+
+        # Calculate spatial correlations with all historical dates
+        # Restrict to same season (±45 days) to avoid seasonal bias in weather outcomes
+        analogs = []
+        seasonal_window = 45  # days
+
+        for t in ds.time.values:
+            try:
+                # Calculate anomaly (deviation from climatology for this date)
+                t_pd = pd.Timestamp(t)
+                historical_doy = t_pd.dayofyear
+
+                # Filter to seasonal window: only use dates within ±45 days of current date
+                current_doy = init_time.dayofyear
+                # Handle year wraparound (e.g., Dec 31 to Jan 31)
+                doy_diff = min(
+                    abs(historical_doy - current_doy),
+                    abs(historical_doy - current_doy + 365),
+                    abs(historical_doy - current_doy - 365)
+                )
+                if doy_diff > seasonal_window:
+                    continue  # Skip dates outside seasonal window
+
+                # Get historical z500 (overlapping region only)
+                z500 = ds['z'].sel(
+                    time=t,
+                    **{pressure_coord: 500, lat_coord_name: era5_lats_overlap, lon_coord_name: era5_lons_overlap}
+                )
+                historical_z500 = z500.values
+
+                if historical_doy in climatology:
+                    historical_clim = climatology[historical_doy]
+                    historical_anomaly = historical_z500 - historical_clim
+                else:
+                    # Fallback to zonal mean if no climatology
+                    historical_zonal_mean = np.mean(historical_z500, axis=1, keepdims=True)
+                    historical_anomaly = historical_z500 - historical_zonal_mean
+
+                historical_flat = historical_anomaly.flatten()
+
+                # Skip if different sizes (shouldn't happen but just in case)
+                min_size = min(len(current_flat), len(historical_flat))
+                if min_size == 0:
+                    continue
+
+                current_subset = current_flat[:min_size]
+                historical_subset = historical_flat[:min_size]
+
+                # Calculate spatial correlation of climatological anomalies
+                # Use only finite values from both arrays
+                finite_mask = np.isfinite(current_subset) & np.isfinite(historical_subset)
+                n_finite = np.sum(finite_mask)
+
+                # Require at least 90% of points to be finite for valid correlation
+                if n_finite > 0.9 * len(current_subset):
+                    current_finite = current_subset[finite_mask]
+                    historical_finite = historical_subset[finite_mask]
+
+                    correlation, _ = pearsonr(current_finite, historical_finite)
+
+                    # Calculate wave number for this date
+                    wave_result = rossby_waves.calculate_wave_number(z500, latitude=55.0)
+
+                    analogs.append({
+                        'date': str(t),
+                        'correlation': float(correlation),
+                        'wave_number': wave_result.get('wave_number')
+                    })
+
+            except Exception as e:
+                continue
+
+        # Sort by correlation (highest first)
+        analogs.sort(key=lambda x: x['correlation'], reverse=True)
+
+        logger.info(f"Found {len(analogs)} total analogs")
+        if len(analogs) > 0:
+            logger.info(f"Top correlation: {analogs[0]['correlation']:.3f}")
+
+        # Get top N analogs with minimum separation to avoid clustering
+        # Ensure analogs are at least 7 days apart to get diverse patterns
+        top_analogs = []
+        min_separation_days = 7
+
+        for analog in analogs:
+            # Check if this analog is too close to any already selected
+            analog_date = pd.Timestamp(analog['date'])
+            too_close = False
+
+            for selected in top_analogs:
+                selected_date = pd.Timestamp(selected['date'])
+                days_apart = abs((analog_date - selected_date).days)
+
+                if days_apart < min_separation_days:
+                    too_close = True
+                    break
+
+            # If not too close to any selected analog, add it
+            if not too_close:
+                top_analogs.append(analog)
+
+            # Stop once we have enough
+            if len(top_analogs) >= top_n:
+                break
+
+        logger.info(f"Selected {len(top_analogs)} diverse analogs (min {min_separation_days} days apart)")
+
+        # Load Fairfax weather data to calculate analog outcomes
+        weather_path = Path("/Volumes/T7/Weather_Models/era5/Fairfax/reanalysis-era5-single-levels-timeseries-sfc1zs15i59.nc")
+
+        if weather_path.exists():
+            try:
+                weather_ds = xr.open_dataset(weather_path)
+
+                for analog in top_analogs:
+                    try:
+                        analog_date = pd.Timestamp(analog['date'])
+                        # Calculate 14 days after analog date
+                        end_date = analog_date + pd.Timedelta(days=14)
+
+                        # Select precipitation for next 14 days
+                        precip_subset = weather_ds['tp'].sel(
+                            valid_time=slice(analog_date, end_date)
+                        )
+
+                        # Sum precipitation (convert from m to inches: 1m = 39.3701 inches)
+                        # ERA5 tp is in meters of water equivalent
+                        total_precip_m = float(precip_subset.sum().values)
+                        total_precip_in = total_precip_m * 39.3701
+                        analog['precip_14d'] = round(total_precip_in, 2)
+
+                        # Select temperature for next 14 days
+                        temp_subset = weather_ds['t2m'].sel(
+                            valid_time=slice(analog_date, end_date)
+                        )
+
+                        # Calculate average temperature (convert from Kelvin to Fahrenheit)
+                        avg_temp_k = float(temp_subset.mean().values)
+                        avg_temp_f = (avg_temp_k - 273.15) * 9/5 + 32
+                        analog['temp_14d'] = round(avg_temp_f, 1)
+
+                    except Exception as e:
+                        logger.warning(f"Could not get weather data for analog {analog['date']}: {e}")
+                        analog['precip_14d'] = None
+                        analog['temp_14d'] = None
+
+                # Calculate average precipitation across all analogs
+                precip_values = [a['precip_14d'] for a in top_analogs if a.get('precip_14d') is not None]
+                avg_precip = round(np.mean(precip_values), 2) if precip_values else None
+
+                # Calculate average temperature across all analogs
+                temp_values = [a['temp_14d'] for a in top_analogs if a.get('temp_14d') is not None]
+                avg_temp = round(np.mean(temp_values), 1) if temp_values else None
+
+                # Calculate climatological normals for current time of year
+                try:
+                    current_month = init_time.month
+                    current_day = init_time.day
+
+                    # Get all years of data for this approximate time of year
+                    climatology_precip = []
+                    climatology_temp = []
+
+                    for year in range(1940, 2026):
+                        try:
+                            start_date = pd.Timestamp(year=year, month=current_month, day=current_day)
+                            end_date = start_date + pd.Timedelta(days=14)
+
+                            # Precipitation climatology
+                            clim_precip = weather_ds['tp'].sel(
+                                valid_time=slice(start_date, end_date)
+                            )
+                            total_precip_m = float(clim_precip.sum().values)
+                            if not np.isnan(total_precip_m):
+                                total_precip_in = total_precip_m * 39.3701
+                                climatology_precip.append(total_precip_in)
+
+                            # Temperature climatology
+                            clim_temp = weather_ds['t2m'].sel(
+                                valid_time=slice(start_date, end_date)
+                            )
+                            avg_temp_k = float(clim_temp.mean().values)
+                            if not np.isnan(avg_temp_k):
+                                avg_temp_f = (avg_temp_k - 273.15) * 9/5 + 32
+                                climatology_temp.append(avg_temp_f)
+
+                        except:
+                            continue
+
+                    climatology_normal_precip = round(np.mean(climatology_precip), 2) if climatology_precip else None
+                    climatology_normal_temp = round(np.mean(climatology_temp), 1) if climatology_temp else None
+
+                except Exception as e:
+                    logger.warning(f"Could not calculate climatology: {e}")
+                    climatology_normal_precip = None
+                    climatology_normal_temp = None
+
+            except Exception as e:
+                logger.warning(f"Could not load Fairfax weather data: {e}")
+                avg_precip = None
+                avg_temp = None
+                climatology_normal_precip = None
+                climatology_normal_temp = None
+        else:
+            logger.warning(f"Fairfax weather data not found at {weather_path}")
+            avg_precip = None
+            avg_temp = None
+            climatology_normal_precip = None
+            climatology_normal_temp = None
+
+        # Return top N
+        return jsonify({
+            "success": True,
+            "current_date": current_date_str,
+            "current_wave_number": current_wave_num,
+            "analogs": top_analogs,
+            "avg_precip_14d": avg_precip,
+            "avg_temp_14d": avg_temp,
+            "climatology_precip_14d": climatology_normal_precip,
+            "climatology_temp_14d": climatology_normal_temp
+        })
+
+    except Exception as e:
+        logger.error(f"Error finding analogs: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)})
 
 
@@ -3451,28 +4332,28 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
         broadcast_sync_log(f"  [{model_name.upper()}] Extracting F{hour:03d} ({i}/{len(model_hours)}, {progress_pct}%)", 'info')
         logger.info(f"Extracting {model_name.upper()} F{hour:03d} at ASOS stations...")
 
+        # Fetch temp
         try:
-            # Fetch temperature
-            temp_data = model.fetch_data(temp_var, init_time, hour, region)
-            temp_vals = extract_model_at_stations(temp_data, stations)
+            data = model.fetch_data(temp_var, init_time, hour, region)
+            temp_vals = extract_model_at_stations(data, stations)
         except Exception as e:
             logger.warning(f"{model_name.upper()} temp F{hour} failed: {e}")
             broadcast_sync_log(f"  [{model_name.upper()}] WARNING: temp F{hour:03d} failed: {e}", 'warning')
             temp_vals = [None] * len(stations)
 
+        # Fetch mslp
         try:
-            # Fetch MSLP
-            mslp_data = model.fetch_data(mslp_var, init_time, hour, region)
-            mslp_vals = extract_model_at_stations(mslp_data, stations)
+            data = model.fetch_data(mslp_var, init_time, hour, region)
+            mslp_vals = extract_model_at_stations(data, stations)
         except Exception as e:
             logger.warning(f"{model_name.upper()} mslp F{hour} failed: {e}")
             broadcast_sync_log(f"  [{model_name.upper()}] WARNING: mslp F{hour:03d} failed: {e}", 'warning')
             mslp_vals = [None] * len(stations)
 
+        # Fetch precip
         try:
-            # Fetch precip
-            precip_data = model.fetch_data(precip_var, init_time, hour, region)
-            precip_vals = extract_model_at_stations(precip_data, stations)
+            data = model.fetch_data(precip_var, init_time, hour, region)
+            precip_vals = extract_model_at_stations(data, stations)
         except Exception as e:
             logger.warning(f"{model_name.upper()} precip F{hour} failed: {e}")
             broadcast_sync_log(f"  [{model_name.upper()}] WARNING: precip F{hour:03d} failed: {e}", 'warning')
@@ -3492,6 +4373,29 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
             station_forecasts[sid]['temps'].extend([None] * pad_count)
             station_forecasts[sid]['mslps'].extend([None] * pad_count)
             station_forecasts[sid]['precips'].extend([None] * pad_count)
+
+    # Convert AIFS/IFS cumulative precipitation to interval totals (6-hour accumulation)
+    if model_name.lower() in ['aifs', 'ifs']:
+        for sid in station_forecasts:
+            cumulative_precips = station_forecasts[sid]['precips']
+            interval_precips = []
+
+            for i, cum in enumerate(cumulative_precips):
+                if cum is None:
+                    interval_precips.append(None)
+                elif i == 0:
+                    # First interval is just the cumulative value (0 to first hour)
+                    interval_precips.append(cum)
+                else:
+                    prev_cum = cumulative_precips[i - 1]
+                    if prev_cum is not None:
+                        interval = cum - prev_cum
+                        # Ensure non-negative (rounding errors can cause tiny negatives)
+                        interval_precips.append(max(0.0, interval))
+                    else:
+                        interval_precips.append(None)
+
+            station_forecasts[sid]['precips'] = interval_precips
 
     return init_time, station_forecasts
 
@@ -3518,6 +4422,269 @@ def api_asos_stations():
     except Exception as e:
         logger.error(f"Error fetching ASOS stations: {e}")
         return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/asos/station-forecast')
+def api_asos_station_forecast():
+    """Get forecast data for a specific ASOS station (all models)."""
+    station_id = request.args.get('station_id')
+    show_trends = request.args.get('trends', 'false').lower() == 'true'
+    use_trends_db = request.args.get('use_trends_db', 'false').lower() == 'true'
+
+    if not station_id:
+        return jsonify({"success": False, "error": "Missing station_id parameter"}), 400
+
+    try:
+        # Use trends database if requested (for 6-hourly data), otherwise verification database
+        if use_trends_db:
+            db = load_asos_trends_db()
+            logger.info(f"Using trends database for station {station_id}")
+        else:
+            db = asos.load_asos_forecasts_db()
+
+        runs = db.get("runs", {})
+
+        if not runs:
+            return jsonify({"success": False, "error": "No forecast data available"}), 404
+
+        # Get the latest run
+        sorted_runs = sorted(runs.keys(), reverse=True)
+        latest_run_key = sorted_runs[0]
+        run_data = runs[latest_run_key]
+        forecast_hours = run_data.get("forecast_hours", [])
+
+        # Initialize time series
+        init_time = datetime.fromisoformat(latest_run_key)
+        times = [(init_time + timedelta(hours=h)).isoformat() for h in forecast_hours]
+
+        # Extract forecast data for each model
+        result = {
+            "success": True,
+            "station_id": station_id,
+            "init_time": latest_run_key,
+            "times": times,
+            "show_trends": show_trends,
+            "gfs": {"temps": [], "precips": []},
+            "aifs": {"temps": [], "precips": []},
+            "ifs": {"temps": [], "precips": []},
+            "nws": {"temps": [], "precips": []}
+        }
+
+        if show_trends and len(sorted_runs) >= 2:
+            # Calculate trends by comparing latest vs previous run
+            previous_run_key = sorted_runs[1]
+            previous_run_data = runs[previous_run_key]
+            previous_init_time = datetime.fromisoformat(previous_run_key)
+
+            result["previous_init_time"] = previous_run_key
+
+            for model in ['gfs', 'aifs', 'ifs', 'nws']:
+                latest_model_data = run_data.get(model, {})
+                latest_station_data = latest_model_data.get(station_id, {})
+                latest_temps = latest_station_data.get("temps", [])
+                latest_precips = latest_station_data.get("precips", [])
+
+                previous_model_data = previous_run_data.get(model, {})
+                previous_station_data = previous_model_data.get(station_id, {})
+                previous_hours = previous_run_data.get("forecast_hours", [])
+
+                # Build lookup of previous forecast by valid time
+                previous_by_valid_time = {}
+                for i, prev_hour in enumerate(previous_hours):
+                    valid_time = previous_init_time + timedelta(hours=prev_hour)
+                    previous_temps = previous_station_data.get("temps", [])
+                    previous_precips = previous_station_data.get("precips", [])
+
+                    if i < len(previous_temps):
+                        previous_by_valid_time[valid_time.isoformat()] = {
+                            "temp": previous_temps[i],
+                            "precip": previous_precips[i] if i < len(previous_precips) else None
+                        }
+
+                # Calculate trends for each forecast hour
+                temp_trends = []
+                precip_trends = []
+
+                for i, hour in enumerate(forecast_hours):
+                    valid_time = (init_time + timedelta(hours=hour)).isoformat()
+                    latest_temp = latest_temps[i] if i < len(latest_temps) else None
+                    latest_precip = latest_precips[i] if i < len(latest_precips) else None
+
+                    # Find matching forecast from previous run
+                    previous_forecast = previous_by_valid_time.get(valid_time)
+
+                    if previous_forecast and latest_temp is not None and previous_forecast["temp"] is not None:
+                        temp_trends.append(latest_temp - previous_forecast["temp"])
+                    else:
+                        temp_trends.append(None)
+
+                    if previous_forecast and latest_precip is not None and previous_forecast["precip"] is not None:
+                        precip_trends.append(latest_precip - previous_forecast["precip"])
+                    else:
+                        precip_trends.append(None)
+
+                result[model]["temps"] = temp_trends
+                result[model]["precips"] = precip_trends
+
+        else:
+            # Return absolute values (not trends)
+            for model in ['gfs', 'aifs', 'ifs', 'nws']:
+                model_data = run_data.get(model, {})
+                station_data = model_data.get(station_id, {})
+
+                result[model]["temps"] = station_data.get("temps", [None] * len(forecast_hours))
+                result[model]["precips"] = station_data.get("precips", [None] * len(forecast_hours))
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error getting station forecast for {station_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/asos/forecast-summary')
+def api_asos_forecast_summary():
+    """
+    Get forecast summary for all ASOS stations at a specific lead time.
+    Used for coloring map markers.
+
+    Query params:
+        variable: temp or precip
+        model: gfs, aifs, ifs, or nws
+        lead_time: forecast lead time in hours (default 24)
+        trends: 'true' to show change from previous run (default 'false')
+    """
+    variable = request.args.get('variable', 'temp')
+    model = request.args.get('model', 'gfs')
+    lead_time = int(request.args.get('lead_time', 24))
+    show_trends = request.args.get('trends', 'false').lower() == 'true'
+
+    try:
+        # Use trends database if in trends mode and lead_time is 6-hourly
+        # Otherwise use verification database
+        if show_trends and lead_time % 6 == 0:
+            db = load_asos_trends_db()
+            logger.info(f"Using trends database for lead_time {lead_time}h")
+        else:
+            db = asos.load_asos_forecasts_db()
+
+        runs = db.get("runs", {})
+        stations = db.get("stations", {})
+
+        if not runs:
+            return jsonify({"success": False, "error": "No forecast data available"}), 404
+
+        # Get the latest run
+        sorted_runs = sorted(runs.keys())
+        latest_run_key = sorted_runs[-1]
+        run_data = runs[latest_run_key]
+        forecast_hours = run_data.get("forecast_hours", [])
+
+        # Find the index for the requested lead time
+        if lead_time not in forecast_hours:
+            return jsonify({
+                "success": False,
+                "error": f"Lead time {lead_time}h not available. Available: {forecast_hours}"
+            }), 400
+
+        lead_time_index = forecast_hours.index(lead_time)
+
+        # Get model data
+        model_data = run_data.get(model, {})
+
+        # If trends mode, get previous run for simple comparison
+        prev_model_data = {}
+        if show_trends and len(sorted_runs) >= 2:
+            prev_run_key = sorted_runs[-2]
+            prev_run_data = runs[prev_run_key]
+            prev_model_data = prev_run_data.get(model, {})
+
+            latest_init = datetime.fromisoformat(latest_run_key)
+            prev_init = datetime.fromisoformat(prev_run_key)
+            time_diff_hours = int((latest_init - prev_init).total_seconds() / 3600)
+
+            logger.info(
+                f"Trends mode: comparing {model.upper()} F{lead_time:03d} | "
+                f"Latest: {latest_init.strftime('%m/%d %HZ')} | "
+                f"Previous: {prev_init.strftime('%m/%d %HZ')} ({time_diff_hours}h apart)"
+            )
+
+        # Extract forecast value for each station
+        station_forecasts = []
+        debug_count = 0
+        trends_calculated = 0
+
+        for station_id, station_info in stations.items():
+            station_data = model_data.get(station_id, {})
+
+            if variable == 'temp':
+                temps = station_data.get('temps', [])
+                latest_value = temps[lead_time_index] if lead_time_index < len(temps) else None
+            elif variable == 'precip':
+                precips = station_data.get('precips', [])
+                latest_value = precips[lead_time_index] if lead_time_index < len(precips) else None
+            else:
+                latest_value = None
+
+            # Calculate trend if requested (simple: same forecast hour from previous run)
+            value = latest_value  # Default to absolute value
+
+            if show_trends and prev_model_data and latest_value is not None:
+                prev_station_data = prev_model_data.get(station_id, {})
+
+                # Compare the SAME forecast hour from previous run (e.g., F120 vs F120)
+                if variable == 'temp':
+                    prev_temps = prev_station_data.get('temps', [])
+                    prev_value = prev_temps[lead_time_index] if lead_time_index < len(prev_temps) else None
+                elif variable == 'precip':
+                    prev_precips = prev_station_data.get('precips', [])
+                    prev_value = prev_precips[lead_time_index] if lead_time_index < len(prev_precips) else None
+                else:
+                    prev_value = None
+
+                # Calculate delta if both values exist
+                if prev_value is not None:
+                    value = latest_value - prev_value
+                    trends_calculated += 1
+
+                    # Debug logging for first few stations
+                    if debug_count < 3:
+                        logger.info(
+                            f"Trend: {station_id} F{lead_time:03d} = {value:+.1f}°F | "
+                            f"Latest: {latest_value:.1f}°F | Prev: {prev_value:.1f}°F"
+                        )
+                        debug_count += 1
+
+            if value is not None:
+                station_forecasts.append({
+                    "station_id": station_id,
+                    "lat": station_info.get('lat'),
+                    "lon": station_info.get('lon'),
+                    "name": station_info.get('name'),
+                    "value": value
+                })
+
+        # Trends are available if we calculated any
+        trends_available = show_trends and trends_calculated > 0
+
+        if show_trends and not trends_available:
+            logger.warning(f"No trends calculated for {model.upper()} at {lead_time}h")
+
+        return jsonify({
+            "success": True,
+            "variable": variable,
+            "model": model,
+            "lead_time": lead_time,
+            "init_time": latest_run_key,
+            "trends": show_trends,
+            "trends_available": trends_available,
+            "count": len(station_forecasts),
+            "stations": station_forecasts
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting ASOS forecast summary: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/asos/verification-map')
@@ -3776,10 +4943,35 @@ def api_asos_verification_time_series():
         gfs_data = asos.get_verification_time_series_from_cache('gfs', variable, lead_time, days_back)
         aifs_data = asos.get_verification_time_series_from_cache('aifs', variable, lead_time, days_back)
         ifs_data = asos.get_verification_time_series_from_cache('ifs', variable, lead_time, days_back)
+        nws_data = asos.get_verification_time_series_from_cache('nws', variable, lead_time, days_back)
 
         # Check for errors
         if "error" in gfs_data:
             return jsonify({"success": False, "error": gfs_data["error"]}), 404
+
+        # Calculate daily winners based on MAE
+        winner_counts = {"GFS": 0, "AIFS": 0, "IFS": 0, "NWS": 0, "Tie": 0}
+
+        for i in range(len(gfs_data["mae"])):
+            # Get MAE values for this date
+            maes = []
+            if gfs_data["mae"][i] is not None:
+                maes.append(("GFS", gfs_data["mae"][i]))
+            if aifs_data["mae"][i] is not None:
+                maes.append(("AIFS", aifs_data["mae"][i]))
+            if ifs_data["mae"][i] is not None:
+                maes.append(("IFS", ifs_data["mae"][i]))
+            if nws_data["mae"][i] is not None:
+                maes.append(("NWS", nws_data["mae"][i]))
+
+            # Find winner (lowest MAE)
+            if maes:
+                min_mae = min(m[1] for m in maes)
+                winners = [m[0] for m in maes if m[1] == min_mae]
+                if len(winners) == 1:
+                    winner_counts[winners[0]] += 1
+                else:
+                    winner_counts["Tie"] += 1
 
         # Combine data (use GFS dates as the baseline)
         return jsonify({
@@ -3800,6 +4992,12 @@ def api_asos_verification_time_series():
                 "bias": ifs_data["bias"],
                 "counts": ifs_data["counts"]
             },
+            "nws": {
+                "mae": nws_data["mae"],
+                "bias": nws_data["bias"],
+                "counts": nws_data["counts"]
+            },
+            "winner_counts": winner_counts,
             "variable": variable,
             "lead_time": lead_time,
             "days_back": days_back
@@ -3822,10 +5020,12 @@ def api_asos_mean_verification():
             gfs_results = asos.get_mean_verification_from_monthly_cache('gfs')
             aifs_results = asos.get_mean_verification_from_monthly_cache('aifs')
             ifs_results = asos.get_mean_verification_from_monthly_cache('ifs')
+            nws_results = asos.get_mean_verification_from_monthly_cache('nws')
         else:
             gfs_results = asos.get_mean_verification_from_cache('gfs')
             aifs_results = asos.get_mean_verification_from_cache('aifs')
             ifs_results = asos.get_mean_verification_from_cache('ifs')
+            nws_results = asos.get_mean_verification_from_cache('nws')
 
         # Check for errors from asos functions
         if "error" in gfs_results:
@@ -3845,7 +5045,8 @@ def api_asos_mean_verification():
             has_data = (
                 (gfs_results["temp_mae"][i] is not None) or
                 (aifs_results["temp_mae"][i] is not None) or
-                (ifs_results["temp_mae"][i] is not None)
+                (ifs_results["temp_mae"][i] is not None) or
+                (nws_results["temp_mae"][i] is not None)
             )
             if has_data:
                 filtered_indices.append(i)
@@ -3864,18 +5065,24 @@ def api_asos_mean_verification():
             "aifs_temp_bias": filter_array(aifs_results["temp_bias"], filtered_indices),
             "ifs_temp_mae": filter_array(ifs_results["temp_mae"], filtered_indices),
             "ifs_temp_bias": filter_array(ifs_results["temp_bias"], filtered_indices),
+            "nws_temp_mae": filter_array(nws_results["temp_mae"], filtered_indices),
+            "nws_temp_bias": filter_array(nws_results["temp_bias"], filtered_indices),
             "gfs_mslp_mae": filter_array(gfs_results["mslp_mae"], filtered_indices),
             "gfs_mslp_bias": filter_array(gfs_results["mslp_bias"], filtered_indices),
             "aifs_mslp_mae": filter_array(aifs_results["mslp_mae"], filtered_indices),
             "aifs_mslp_bias": filter_array(aifs_results["mslp_bias"], filtered_indices),
             "ifs_mslp_mae": filter_array(ifs_results["mslp_mae"], filtered_indices),
             "ifs_mslp_bias": filter_array(ifs_results["mslp_bias"], filtered_indices),
+            "nws_mslp_mae": filter_array(nws_results["mslp_mae"], filtered_indices),
+            "nws_mslp_bias": filter_array(nws_results["mslp_bias"], filtered_indices),
             "gfs_precip_mae": filter_array(gfs_results["precip_mae"], filtered_indices),
             "gfs_precip_bias": filter_array(gfs_results["precip_bias"], filtered_indices),
             "aifs_precip_mae": filter_array(aifs_results["precip_mae"], filtered_indices),
             "aifs_precip_bias": filter_array(aifs_results["precip_bias"], filtered_indices),
             "ifs_precip_mae": filter_array(ifs_results["precip_mae"], filtered_indices),
             "ifs_precip_bias": filter_array(ifs_results["precip_bias"], filtered_indices),
+            "nws_precip_mae": filter_array(nws_results["precip_mae"], filtered_indices),
+            "nws_precip_bias": filter_array(nws_results["precip_bias"], filtered_indices),
         }
 
         # Get cache timestamp
@@ -4024,6 +5231,24 @@ def api_asos_sync():
             logger.error(f"IFS ASOS sync failed: {e}")
             results['ifs'] = {'status': 'error', 'error': str(e)}
 
+        # Fetch NWS forecasts
+        try:
+            logger.info("Fetching NWS forecasts for ASOS stations...")
+            nws_raw = nws_batch.fetch_nws_forecasts_batch_sync(stations)
+
+            # Transform to ASOS format (temps/mslps/precips aligned with forecast_hours)
+            nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, forecast_hours, gfs_init)
+
+            # Use GFS init time for NWS (aligns verification timing)
+            asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
+
+            success_count = sum(1 for f in nws_raw.values() if f is not None)
+            results['nws'] = {'status': 'success', 'stations': success_count}
+            logger.info(f"NWS forecasts synced for {success_count} stations")
+        except Exception as e:
+            logger.error(f"NWS ASOS sync failed: {e}")
+            results['nws'] = {'status': 'error', 'error': str(e)}
+
         # Fetch observations for past valid times (always do this)
         try:
             logger.info("Fetching ASOS observations from IEM...")
@@ -4032,6 +5257,55 @@ def api_asos_sync():
         except Exception as e:
             logger.error(f"ASOS observations fetch failed: {e}")
             results['observations'] = {'status': 'error', 'error': str(e)}
+
+        # Fetch 6-hourly data for trend visualization (separate from verification)
+        logger.info("=" * 60)
+        logger.info("Fetching 6-hourly forecasts for trend visualization...")
+        forecast_hours_trends = list(range(0, 361, 6))
+        results['trends'] = {}
+
+        # Fetch GFS trends
+        try:
+            logger.info("Fetching GFS 6-hourly trend data...")
+            gfs_init_trends, gfs_trends = fetch_asos_forecasts_for_model('gfs', forecast_hours_trends, stations, init_hour)
+            store_asos_trend_run(gfs_init_trends, 'gfs', gfs_trends)
+            results['trends']['gfs'] = {'status': 'success', 'stations': len(gfs_trends)}
+        except Exception as e:
+            logger.error(f"GFS trend data fetch failed: {e}")
+            results['trends']['gfs'] = {'status': 'error', 'error': str(e)}
+
+        # Fetch AIFS trends
+        try:
+            logger.info("Fetching AIFS 6-hourly trend data...")
+            aifs_init_trends, aifs_trends = fetch_asos_forecasts_for_model('aifs', forecast_hours_trends, stations, init_hour)
+            store_asos_trend_run(aifs_init_trends, 'aifs', aifs_trends)
+            results['trends']['aifs'] = {'status': 'success', 'stations': len(aifs_trends)}
+        except Exception as e:
+            logger.error(f"AIFS trend data fetch failed: {e}")
+            results['trends']['aifs'] = {'status': 'error', 'error': str(e)}
+
+        # Fetch IFS trends
+        try:
+            logger.info("Fetching IFS 6-hourly trend data...")
+            ifs_init_trends, ifs_trends = fetch_asos_forecasts_for_model('ifs', forecast_hours_trends, stations, init_hour)
+            store_asos_trend_run(ifs_init_trends, 'ifs', ifs_trends)
+            results['trends']['ifs'] = {'status': 'success', 'stations': len(ifs_trends)}
+        except Exception as e:
+            logger.error(f"IFS trend data fetch failed: {e}")
+            results['trends']['ifs'] = {'status': 'error', 'error': str(e)}
+
+        # Fetch NWS trends
+        try:
+            logger.info("Fetching NWS 6-hourly trend data...")
+            # Use the same NWS raw data but transform for 6-hourly hours
+            nws_trends = nws_batch.transform_nws_to_asos_format(nws_raw, forecast_hours_trends, gfs_init)
+            store_asos_trend_run(gfs_init, 'nws', nws_trends)
+            results['trends']['nws'] = {'status': 'success', 'stations': len(nws_trends)}
+        except Exception as e:
+            logger.error(f"NWS trend data fetch failed: {e}")
+            results['trends']['nws'] = {'status': 'error', 'error': str(e)}
+
+        logger.info("Trend visualization data sync complete")
 
         return jsonify({
             "success": True,
@@ -4140,6 +5414,20 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 ifs_data = fetch_ifs_data(region, forecast_hours, init_hour)
                 broadcast_sync_log("IFS data fetched successfully", 'success')
 
+                # Update WeatherLink CSV files before fetching observations
+                broadcast_sync_log("Updating WeatherLink CSV files...", 'info')
+                try:
+                    import sys
+                    sys.path.insert(0, '/Users/kennypratt/Documents/Townhome_Weather/Weather_Data')
+                    import fetch_weather_data as wl_fetcher
+                    new_records = wl_fetcher.fetch_missing_data(silent=True)
+                    if new_records > 0:
+                        broadcast_sync_log(f"Updated WeatherLink data ({new_records} new records)", 'success')
+                    else:
+                        broadcast_sync_log("WeatherLink data already up to date", 'info')
+                except Exception as e:
+                    broadcast_sync_log(f"Warning: Could not update WeatherLink CSV: {e}", 'warning')
+
                 broadcast_sync_log("Fetching WeatherLink observations...", 'info')
                 observed = fetch_observations(gfs_data.get("times", []), location)
                 if observed:
@@ -4186,8 +5474,14 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
             ]
             broadcast_sync_log(f"Found {len(stations)} ASOS stations across CONUS", 'info')
 
-            # Define forecast hours (6-hourly up to 24h, then 24-hourly to 15 days)
-            forecast_hours = list(range(6, 25, 6)) + list(range(48, 361, 24))
+            # Define forecast hours for data fetching (all 6-hour increments)
+            all_forecast_hours = list(range(6, 361, 6))  # F006, F012, F018, ..., F360
+
+            # Define verification lead times (key hours for computing statistics)
+            verification_lead_times = list(range(6, 25, 6)) + list(range(48, 361, 24))
+
+            # Use all_forecast_hours for fetching model data
+            forecast_hours = all_forecast_hours
             asos_results = {}
 
             # Fetch GFS
@@ -4228,6 +5522,32 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 asos.store_asos_forecasts(ifs_init, forecast_hours, 'ifs', ifs_forecasts)
                 broadcast_sync_log(f"IFS ASOS data synced for {len(ifs_forecasts)} stations", 'success')
                 asos_results['ifs'] = {'status': 'synced', 'stations': len(ifs_forecasts)}
+
+            # Fetch NWS forecasts
+            try:
+                broadcast_sync_log("Fetching NWS forecasts for ASOS stations (batch mode with rate limiting)...", 'info')
+                nws_raw = nws_batch.fetch_nws_forecasts_batch_sync(stations)
+
+                # NWS forecasts only extend to ~7 days (168 hours), not 15 days
+                # Filter forecast_hours to only include hours <= 168
+                nws_forecast_hours = [h for h in forecast_hours if h <= 168]
+
+                # Transform to ASOS format
+                logger.info(f"Transforming NWS data with gfs_init={gfs_init} (type: {type(gfs_init)})")
+                nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init)
+
+                # Use GFS init time for NWS forecasts (aligns verification timing)
+                asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
+
+                success_count = sum(1 for f in nws_raw.values() if f is not None)
+                broadcast_sync_log(f"NWS forecasts synced for {success_count}/{len(stations)} stations", 'success')
+                asos_results['nws'] = {'status': 'synced', 'stations': success_count}
+            except Exception as e:
+                import traceback
+                broadcast_sync_log(f"NWS forecast fetch failed: {e}", 'warning')
+                logger.warning(f"NWS forecast fetch failed: {e}")
+                logger.warning(f"Full traceback: {traceback.format_exc()}")
+                asos_results['nws'] = {'status': 'error', 'error': str(e)}
 
             # Fetch observations
             broadcast_sync_log("Fetching ASOS observations from Iowa Environmental Mesonet...", 'info')

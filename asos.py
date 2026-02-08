@@ -28,7 +28,6 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 import json
-import concurrent.futures # Import for ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ def should_include_precip(fcst_val, obs_val) -> bool:
     return True
 
 # IEM Rate Limiter - 1 call per second
-iem_rate_limiter = RateLimiter(calls_per_second=1)
+iem_rate_limiter = RateLimiter(calls_per_second=3)  # IEM university server - moderate rate
 
 @iem_rate_limiter
 def _rate_limited_urlopen(*args, **kwargs):
@@ -168,18 +167,13 @@ def fetch_all_stations(force_refresh: bool = False) -> List[ASOSStation]:
     logger.info("Fetching ASOS stations from IEM...")
     all_stations = []
 
-    # Use ThreadPoolExecutor to fetch states concurrently
-    # The rate limiter on _rate_limited_urlopen will handle rate limiting
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        # Submit tasks for each state
-        future_to_state = {executor.submit(fetch_state_stations, state): state for state in US_STATES}
-        for future in concurrent.futures.as_completed(future_to_state):
-            state = future_to_state[future]
-            try:
-                stations = future.result()
-                all_stations.extend(stations)
-            except Exception as exc:
-                logger.warning(f"Failed to fetch stations for {state}: {exc}")
+    # Fetch states sequentially (rate limiter makes parallelization ineffective)
+    for state in US_STATES:
+        try:
+            stations = fetch_state_stations(state)
+            all_stations.extend(stations)
+        except Exception as exc:
+            logger.warning(f"Failed to fetch stations for {state}: {exc}")
 
     logger.info(f"Fetched {len(all_stations)} ASOS stations from IEM")
 
@@ -516,7 +510,7 @@ def accumulate_stats_from_run(
     cumulative_time_series = data["cumulative_stats"]["time_series"]
 
     # Initialize time series for each model if needed
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         if model not in cumulative_time_series:
             cumulative_time_series[model] = {}
         for var in ['temp', 'mslp', 'precip']:
@@ -533,7 +527,7 @@ def accumulate_stats_from_run(
     cumulative_by_lead_time = data["cumulative_stats"]["by_lead_time"]
 
     # Process each model
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_data = run_data.get(model)
         if not model_data:
             continue
@@ -616,7 +610,7 @@ def accumulate_stats_from_run(
                     cumulative_by_lead_time[model][var][lt_str]["count"] += 1
 
     # Accumulate time series data (daily errors by lead time)
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_data = run_data.get(model)
         if not model_data:
             continue
@@ -787,33 +781,24 @@ def fetch_and_store_observations():
 
     logger.info(f"Fetching ASOS observations from {min_time} to {max_time} for {len(times_to_fetch)} valid times")
 
-    # Fetch observations in chunks of stations concurrently
+    # Fetch observations in chunks of stations sequentially (rate limiter makes parallelization ineffective)
     station_ids = list(stations.keys())
-    chunk_size = 50 # Reduce chunk size to be more granular with rate limiting and concurrency
+    chunk_size = 50
     all_observations = {}
-    
-    # Using a smaller max_workers to avoid overwhelming the local system with too many open connections,
-    # while still allowing some concurrency. The iem_rate_limiter further paces requests.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = []
-        for i in range(0, len(station_ids), chunk_size):
-            chunk_ids = station_ids[i:i+chunk_size]
-            logger.info(f"Submitting observations fetch for stations {i+1}-{min(i+chunk_size, len(station_ids))} of {len(station_ids)}...")
-            future = executor.submit(
-                fetch_observations,
+
+    for i in range(0, len(station_ids), chunk_size):
+        chunk_ids = station_ids[i:i+chunk_size]
+        logger.info(f"Fetching observations for stations {i+1}-{min(i+chunk_size, len(station_ids))} of {len(station_ids)}...")
+        try:
+            obs_chunk = fetch_observations(
                 chunk_ids,
                 min_time,
                 max_time,
                 variables=['tmpf', 'alti', 'p01i']  # Use 'alti' (altimeter) instead of 'mslp'
             )
-            futures.append(future)
-        
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                obs_chunk = future.result()
-                all_observations.update(obs_chunk)
-            except Exception as exc:
-                logger.error(f"Observation fetch task generated an exception: {exc}")
+            all_observations.update(obs_chunk)
+        except Exception as exc:
+            logger.error(f"Observation fetch task generated an exception: {exc}")
 
     # Store observations keyed by station and valid time
     obs_count = 0
@@ -976,7 +961,7 @@ def store_asos_forecasts(
     Args:
         init_time: Model initialization time
         forecast_hours: List of forecast hours
-        model_name: Model name ('gfs', 'aifs', 'ifs')
+        model_name: Model name ('gfs', 'aifs', 'ifs', 'nws')
         station_forecasts: Dict mapping station_id to forecast data
             Each station dict has: temps, mslps, precips (lists aligned with forecast_hours)
     """
@@ -1017,7 +1002,7 @@ def get_verification_data(
     current runs to provide lifetime MAE and bias per station.
 
     Args:
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
         variable: Variable name ('temp', 'mslp', 'precip')
         lead_time_hours: Lead time in hours
 
@@ -1283,7 +1268,7 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
         raise ValueError("Station not found")
 
     now = datetime.now(timezone.utc)
-    models = [model.lower()] if model else ['gfs', 'aifs', 'ifs']
+    models = [model.lower()] if model else ['gfs', 'aifs', 'ifs', 'nws']
 
     # Collect all forecast hours (from current runs and cumulative stats)
     all_forecast_hours = set()
@@ -1435,7 +1420,7 @@ def get_cumulative_stats_summary() -> dict:
 
     # Get total sample counts by model
     model_totals = {}
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_data = cumulative_by_lead_time.get(model, {})
         total_count = 0
         for var in ['temp', 'mslp', 'precip']:
@@ -1446,7 +1431,7 @@ def get_cumulative_stats_summary() -> dict:
 
     # Get lead time coverage
     lead_times_per_model = {}
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_data = cumulative_by_lead_time.get(model, {})
         lead_times = set()
         for var in ['temp', 'mslp', 'precip']:
@@ -1473,7 +1458,7 @@ def get_verification_time_series(
     model, variable, and lead time.
 
     Args:
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
         variable: Variable name ('temp', 'mslp', 'precip')
         lead_time_hours: Lead time in hours
         days_back: Number of days to look back
@@ -1602,7 +1587,7 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
     current runs to provide lifetime mean MAE and bias.
 
     Args:
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
 
     Returns:
         Dict with structure:
@@ -1792,19 +1777,24 @@ def precompute_verification_cache() -> dict:
 
     now = datetime.now(timezone.utc)
 
-    # Collect all forecast hours
+    # Collect all forecast hours available in the data
     all_forecast_hours = set()
     for run_data in runs.values():
         all_forecast_hours.update(run_data.get("forecast_hours", []))
 
     # Also include lead times from cumulative stats
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_cumulative = cumulative_by_lead_time.get(model, {})
         for var in ['temp', 'mslp', 'precip']:
             var_stats = model_cumulative.get(var, {})
             all_forecast_hours.update(int(lt) for lt in var_stats.keys())
 
-    lead_times = sorted(list(all_forecast_hours))
+    # Define verification lead times (key hours for computing statistics)
+    # Only compute verification stats for these specific lead times to save computation
+    verification_lead_times = set(list(range(6, 25, 6)) + list(range(48, 361, 24)))
+
+    # Filter to only compute stats for verification lead times that exist in the data
+    lead_times = sorted([lt for lt in all_forecast_hours if lt in verification_lead_times])
 
     if not lead_times:
         logger.warning("No lead times available for verification cache")
@@ -1918,18 +1908,20 @@ def precompute_verification_cache() -> dict:
         station_stats[station_id] = {
             'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
             'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
-            'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+            'ifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+            'nws': {'temp': {}, 'mslp': {}, 'precip': {}}
         }
 
     # Structure: aggregated_stats[model][var][lt_str] = {sum_abs_errors, sum_errors, count}
     aggregated_stats = {
         'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
-        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'nws': {'temp': {}, 'mslp': {}, 'precip': {}}
     }
 
     # Initialize with zeros for all lead times
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         for var in ['temp', 'mslp', 'precip']:
             for lt in lead_times:
                 lt_str = str(lt)
@@ -1950,7 +1942,7 @@ def precompute_verification_cache() -> dict:
     # Load cumulative stats
     for station_id in stations:
         if station_id in cumulative_by_station:
-            for model in ['gfs', 'aifs', 'ifs']:
+            for model in ['gfs', 'aifs', 'ifs', 'nws']:
                 model_cumulative = cumulative_by_station[station_id].get(model, {})
                 for var in ['temp', 'mslp', 'precip']:
                     var_cumulative = model_cumulative.get(var, {})
@@ -1960,7 +1952,7 @@ def precompute_verification_cache() -> dict:
                             station_stats[station_id][model][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
                             station_stats[station_id][model][var][lt_str]['count'] += stats.get('count', 0)
 
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_cumulative = cumulative_by_lead_time.get(model, {})
         for var in ['temp', 'mslp', 'precip']:
             var_cumulative = model_cumulative.get(var, {})
@@ -1983,7 +1975,7 @@ def precompute_verification_cache() -> dict:
 
         forecast_hours = run_data.get("forecast_hours", [])
 
-        for model in ['gfs', 'aifs', 'ifs']:
+        for model in ['gfs', 'aifs', 'ifs', 'nws']:
             model_data = run_data.get(model)
             if not model_data:
                 continue
@@ -2040,7 +2032,7 @@ def precompute_verification_cache() -> dict:
     # Convert to final cache format - by_station
     for station_id in stations:
         cache_data["by_station"][station_id] = {}
-        for model in ['gfs', 'aifs', 'ifs']:
+        for model in ['gfs', 'aifs', 'ifs', 'nws']:
             cache_data["by_station"][station_id][model] = {}
             for lt in lead_times:
                 lt_str = str(lt)
@@ -2057,7 +2049,7 @@ def precompute_verification_cache() -> dict:
                         cache_data["by_station"][station_id][model][lt_str][var] = None
 
     # Convert to final cache format - by_lead_time
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         cache_data["by_lead_time"][model] = {}
         for lt in lead_times:
             lt_str = str(lt)
@@ -2153,18 +2145,19 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
     time_series = {
         'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
-        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'nws': {'temp': {}, 'mslp': {}, 'precip': {}}
     }
 
     # Initialize for all lead times
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         for var in ['temp', 'mslp', 'precip']:
             for lt in lead_times:
                 time_series[model][var][lt] = {}
 
     # Load cumulative time series data (historical data from deleted runs)
     logger.info("Loading cumulative time series data...")
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_cumulative = cumulative_time_series.get(model, {})
         for var in ['temp', 'mslp', 'precip']:
             var_cumulative = model_cumulative.get(var, {})
@@ -2188,7 +2181,7 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
 
         forecast_hours = run_data.get("forecast_hours", [])
 
-        for model in ['gfs', 'aifs', 'ifs']:
+        for model in ['gfs', 'aifs', 'ifs', 'nws']:
             model_data = run_data.get(model)
             if not model_data:
                 continue
@@ -2242,10 +2235,11 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
     result = {
         'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
-        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}}
+        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'nws': {'temp': {}, 'mslp': {}, 'precip': {}}
     }
 
-    for model in ['gfs', 'aifs', 'ifs']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
         for var in ['temp', 'mslp', 'precip']:
             for lt in lead_times:
                 errors_by_date = time_series[model][var][lt]
@@ -2348,7 +2342,7 @@ def get_verification_data_from_cache(
     Falls back to computing on-the-fly if cache doesn't exist.
 
     Args:
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
         variable: Variable name ('temp', 'mslp', 'precip')
         lead_time_hours: Lead time in hours
 
@@ -2460,7 +2454,7 @@ def rebuild_monthly_station_cache(days_back: int = 30) -> None:
         if not forecast_hours:
             continue
 
-        for model in ['gfs', 'aifs', 'ifs']:
+        for model in ['gfs', 'aifs', 'ifs', 'nws']:
             model_data = run_data.get(model)
             if not model_data:
                 continue
@@ -2518,7 +2512,7 @@ def get_mean_verification_from_cache(model: str) -> dict:
     Falls back to computing on-the-fly if cache doesn't exist.
 
     Args:
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
 
     Returns:
         Dict with mean verification data (same format as get_mean_verification_by_lead_time)
@@ -2562,7 +2556,7 @@ def get_mean_verification_from_monthly_cache(model: str) -> dict:
     Get mean verification for the last ~30 days from the monthly cache.
 
     Args:
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
     """
     db = load_asos_forecasts_db()
     monthly = db.get("cumulative_stats", {}).get("by_station_monthly", {})
@@ -2634,7 +2628,7 @@ def get_verification_time_series_from_cache(
     Falls back to computing on-the-fly if cache doesn't exist.
 
     Args:
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
         variable: Variable name ('temp', 'mslp', 'precip')
         lead_time_hours: Lead time in hours
         days_back: Number of days to include (default 30)
@@ -2717,7 +2711,7 @@ def _calculate_asos_mean_mae(
     Args:
         db: ASOS forecasts database
         run_time_str: Run time as ISO string (e.g., "2026-02-04T00:00:00")
-        model: Model name ('gfs', 'aifs', 'ifs')
+        model: Model name ('gfs', 'aifs', 'ifs', 'nws')
         variable: Variable name ('temp', 'mslp', 'precip')
         lead_time_hours: Lead time in hours
 

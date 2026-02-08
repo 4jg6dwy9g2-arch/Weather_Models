@@ -31,6 +31,28 @@
         padding: 0.25rem 1.75rem 0.25rem 0.5rem;
         font-size: 0.8rem;
     }
+
+    /* Compact verification table to fit on screen */
+    #asosVerificationTableBody {
+        font-size: 0.75rem;
+    }
+
+    #asosVerificationTableBody td,
+    #asosVerificationTableBody th {
+        padding: 0.3rem 0.4rem;
+        white-space: nowrap;
+    }
+
+    .table thead th {
+        font-size: 0.7rem;
+        padding: 0.4rem 0.3rem;
+        vertical-align: middle;
+    }
+
+    .table-responsive {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
 </style>
 {% endblock %}
 
@@ -86,6 +108,7 @@
                             <option value="gfs">GFS</option>
                             <option value="aifs">AIFS</option>
                             <option value="ifs">IFS</option>
+                            <option value="nws">NWS</option>
                         </select>
                         <select class="form-select form-select-sm" id="asosLeadTime" style="width: auto;">
                             <option value="6" selected>6h</option>
@@ -149,21 +172,24 @@
                                 </div>
                                 <div class="card-body p-0">
                                     <div class="table-responsive">
-                                        <table class="table table-hover mb-0">
+                                        <table class="table table-hover table-sm mb-0">
                                             <thead>
                                                 <tr>
-                                                    <th>Lead Time</th>
+                                                    <th>Lead</th>
                                                     <th>Days</th>
-                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Temperature</th>
-                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Temperature</th>
-                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Temperature</th>
-                                                    <th>Winner</th>
-                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Pressure</th>
-                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Pressure</th>
-                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Pressure</th>
-                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Precipitation</th>
-                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Precipitation</th>
-                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Precipitation</th>
+                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Temp (°F)</th>
+                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Temp (°F)</th>
+                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Temp (°F)</th>
+                                                    <th colspan="2" class="text-center bg-dark bg-opacity-10">NWS Temp (°F)</th>
+                                                    <th>Win</th>
+                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Pres (mb)</th>
+                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Pres (mb)</th>
+                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Pres (mb)</th>
+                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Precip (in)</th>
+                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Precip (in)</th>
+                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Precip (in)</th>
+                                                    <th colspan="2" class="text-center bg-dark bg-opacity-10">NWS Precip (in)</th>
+                                                    <th>Win</th>
                                                 </tr>
                                                 <tr>
                                                     <th></th>
@@ -174,6 +200,8 @@
                                                     <th class="text-center">Bias</th>
                                                     <th class="text-center">MAE</th>
                                                     <th class="text-center">Bias</th>
+                                                    <th class="text-center">MAE</th>
+                                                    <th class="text-center">Bias</th>
                                                     <th></th>
                                                     <th class="text-center">MAE</th>
                                                     <th class="text-center">Bias</th>
@@ -187,11 +215,12 @@
                                                     <th class="text-center">Bias</th>
                                                     <th class="text-center">MAE</th>
                                                     <th class="text-center">Bias</th>
+                                                    <th></th>
                                                 </tr>
                                             </thead>
                                             <tbody id="asosVerificationTableBody">
                                                 <tr>
-                                                    <td colspan="21" class="text-center text-muted">Loading...</td>
+                                                    <td colspan="26" class="text-center text-muted">Loading...</td>
                                                 </tr>
                                             </tbody>
                                         </table>
@@ -208,7 +237,6 @@
                                 <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
                                     <div>
                                         <i class="bi bi-graph-up"></i> Verification Trends Over Time
-                                        <span class="badge bg-secondary ms-2" id="timeSeriesInfo">7-day rolling average</span>
                                     </div>
                                     <div class="d-flex gap-2 flex-wrap">
                                         <select class="form-select form-select-sm" id="tsVariable" style="width: auto;">
@@ -241,6 +269,15 @@
                                     </div>
                                 </div>
                                 <div class="card-body">
+                                    <!-- Winner Tally -->
+                                    <div id="winnerTally" class="alert alert-light mb-3 d-none">
+                                        <strong><i class="bi bi-trophy"></i> Daily Winners (Lowest MAE):</strong>
+                                        <span class="ms-3"><span class="badge bg-primary">GFS</span> <span id="gfsWins">0</span> days</span>
+                                        <span class="ms-2"><span class="badge bg-info text-dark">AIFS</span> <span id="aifsWins">0</span> days</span>
+                                        <span class="ms-2"><span class="badge bg-success">IFS</span> <span id="ifsWins">0</span> days</span>
+                                        <span class="ms-2"><span class="badge bg-dark">NWS</span> <span id="nwsWins">0</span> days</span>
+                                        <span class="ms-2"><span class="badge bg-secondary">Tie</span> <span id="tieWins">0</span> days</span>
+                                    </div>
                                     <div class="chart-container" style="position: relative; height: 400px;">
                                         <canvas id="timeSeriesChart"></canvas>
                                     </div>
@@ -725,7 +762,7 @@ async function loadMeanAsosVerification(period = 'all') {
     } catch (error) {
         console.error('Error loading mean ASOS verification:', error);
         const tbody = document.getElementById('asosVerificationTableBody');
-        tbody.innerHTML = '<tr><td colspan="15" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="26" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
     }
 }
 
@@ -735,7 +772,7 @@ function renderAsosVerificationTable(v) {
     tbody.innerHTML = '';
 
     if (!v.lead_times || v.lead_times.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="21" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="26" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
         return;
     }
 
@@ -750,6 +787,8 @@ function renderAsosVerificationTable(v) {
         const aifsTempBias = v.aifs_temp_bias[i];
         const ifsTempMae = v.ifs_temp_mae ? v.ifs_temp_mae[i] : null;
         const ifsTempBias = v.ifs_temp_bias ? v.ifs_temp_bias[i] : null;
+        const nwsTempMae = v.nws_temp_mae ? v.nws_temp_mae[i] : null;
+        const nwsTempBias = v.nws_temp_bias ? v.nws_temp_bias[i] : null;
 
         // Pressure data
         const gfsMslpMae = v.gfs_mslp_mae[i];
@@ -766,24 +805,48 @@ function renderAsosVerificationTable(v) {
         const aifsPrecipBias = v.aifs_precip_bias ? v.aifs_precip_bias[i] : null;
         const ifsPrecipMae = v.ifs_precip_mae ? v.ifs_precip_mae[i] : null;
         const ifsPrecipBias = v.ifs_precip_bias ? v.ifs_precip_bias[i] : null;
+        const nwsPrecipMae = v.nws_precip_mae ? v.nws_precip_mae[i] : null;
+        const nwsPrecipBias = v.nws_precip_bias ? v.nws_precip_bias[i] : null;
 
         // Determine temperature winner
-        let winner = '--';
-        let winnerClass = 'badge bg-secondary';
+        let tempWinner = '--';
+        let tempWinnerClass = 'badge bg-secondary';
         const tempMaes = [
             { name: 'GFS', mae: gfsTempMae, class: 'badge bg-primary' },
             { name: 'AIFS', mae: aifsTempMae, class: 'badge bg-info text-dark' },
-            { name: 'IFS', mae: ifsTempMae, class: 'badge bg-success' }
+            { name: 'IFS', mae: ifsTempMae, class: 'badge bg-success' },
+            { name: 'NWS', mae: nwsTempMae, class: 'badge bg-dark' }
         ].filter(m => m.mae !== null && m.mae !== undefined);
 
         if (tempMaes.length > 0) {
             const minMae = Math.min(...tempMaes.map(m => m.mae));
             const winners = tempMaes.filter(m => m.mae === minMae);
             if (winners.length === 1) {
-                winner = winners[0].name;
-                winnerClass = winners[0].class;
+                tempWinner = winners[0].name;
+                tempWinnerClass = winners[0].class;
             } else {
-                winner = 'Tie';
+                tempWinner = 'Tie';
+            }
+        }
+
+        // Determine precipitation winner
+        let precipWinner = '--';
+        let precipWinnerClass = 'badge bg-secondary';
+        const precipMaes = [
+            { name: 'GFS', mae: gfsPrecipMae, class: 'badge bg-primary' },
+            { name: 'AIFS', mae: aifsPrecipMae, class: 'badge bg-info text-dark' },
+            { name: 'IFS', mae: ifsPrecipMae, class: 'badge bg-success' },
+            { name: 'NWS', mae: nwsPrecipMae, class: 'badge bg-dark' }
+        ].filter(m => m.mae !== null && m.mae !== undefined);
+
+        if (precipMaes.length > 0) {
+            const minMae = Math.min(...precipMaes.map(m => m.mae));
+            const winners = precipMaes.filter(m => m.mae === minMae);
+            if (winners.length === 1) {
+                precipWinner = winners[0].name;
+                precipWinnerClass = winners[0].class;
+            } else {
+                precipWinner = 'Tie';
             }
         }
 
@@ -791,25 +854,30 @@ function renderAsosVerificationTable(v) {
         row.innerHTML = `
             <td><strong>${formatLeadTime(lt)}</strong></td>
             <td>${days}</td>
-            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${ifsTempMae !== null && ifsTempMae !== undefined ? ifsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${ifsTempBias !== null && ifsTempBias !== undefined ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + '°F' : '--'}</td>
-            <td><span class="${winnerClass}">${winner}</span></td>
-            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${ifsMslpMae !== null && ifsMslpMae !== undefined ? ifsMslpMae.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${ifsMslpBias !== null && ifsMslpBias !== undefined ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${gfsPrecipMae !== null && gfsPrecipMae !== undefined ? gfsPrecipMae.toFixed(2) + ' in' : '--'}</td>
-            <td class="text-center">${gfsPrecipBias !== null && gfsPrecipBias !== undefined ? (gfsPrecipBias > 0 ? '+' : '') + gfsPrecipBias.toFixed(2) + ' in' : '--'}</td>
-            <td class="text-center">${aifsPrecipMae !== null && aifsPrecipMae !== undefined ? aifsPrecipMae.toFixed(2) + ' in' : '--'}</td>
-            <td class="text-center">${aifsPrecipBias !== null && aifsPrecipBias !== undefined ? (aifsPrecipBias > 0 ? '+' : '') + aifsPrecipBias.toFixed(2) + ' in' : '--'}</td>
-            <td class="text-center">${ifsPrecipMae !== null && ifsPrecipMae !== undefined ? ifsPrecipMae.toFixed(2) + ' in' : '--'}</td>
-            <td class="text-center">${ifsPrecipBias !== null && ifsPrecipBias !== undefined ? (ifsPrecipBias > 0 ? '+' : '') + ifsPrecipBias.toFixed(2) + ' in' : '--'}</td>
+            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) : '--'}</td>
+            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) : '--'}</td>
+            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) : '--'}</td>
+            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) : '--'}</td>
+            <td class="text-center">${ifsTempMae !== null && ifsTempMae !== undefined ? ifsTempMae.toFixed(1) : '--'}</td>
+            <td class="text-center">${ifsTempBias !== null && ifsTempBias !== undefined ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) : '--'}</td>
+            <td class="text-center">${nwsTempMae !== null && nwsTempMae !== undefined ? nwsTempMae.toFixed(1) : '--'}</td>
+            <td class="text-center">${nwsTempBias !== null && nwsTempBias !== undefined ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) : '--'}</td>
+            <td><span class="${tempWinnerClass}">${tempWinner}</span></td>
+            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) : '--'}</td>
+            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) : '--'}</td>
+            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) : '--'}</td>
+            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) : '--'}</td>
+            <td class="text-center">${ifsMslpMae !== null && ifsMslpMae !== undefined ? ifsMslpMae.toFixed(1) : '--'}</td>
+            <td class="text-center">${ifsMslpBias !== null && ifsMslpBias !== undefined ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) : '--'}</td>
+            <td class="text-center">${gfsPrecipMae !== null && gfsPrecipMae !== undefined ? gfsPrecipMae.toFixed(2) : '--'}</td>
+            <td class="text-center">${gfsPrecipBias !== null && gfsPrecipBias !== undefined ? (gfsPrecipBias > 0 ? '+' : '') + gfsPrecipBias.toFixed(2) : '--'}</td>
+            <td class="text-center">${aifsPrecipMae !== null && aifsPrecipMae !== undefined ? aifsPrecipMae.toFixed(2) : '--'}</td>
+            <td class="text-center">${aifsPrecipBias !== null && aifsPrecipBias !== undefined ? (aifsPrecipBias > 0 ? '+' : '') + aifsPrecipBias.toFixed(2) : '--'}</td>
+            <td class="text-center">${ifsPrecipMae !== null && ifsPrecipMae !== undefined ? ifsPrecipMae.toFixed(2) : '--'}</td>
+            <td class="text-center">${ifsPrecipBias !== null && ifsPrecipBias !== undefined ? (ifsPrecipBias > 0 ? '+' : '') + ifsPrecipBias.toFixed(2) : '--'}</td>
+            <td class="text-center">${nwsPrecipMae !== null && nwsPrecipMae !== undefined ? nwsPrecipMae.toFixed(2) : '--'}</td>
+            <td class="text-center">${nwsPrecipBias !== null && nwsPrecipBias !== undefined ? (nwsPrecipBias > 0 ? '+' : '') + nwsPrecipBias.toFixed(2) : '--'}</td>
+            <td><span class="${precipWinnerClass}">${precipWinner}</span></td>
         `;
         tbody.appendChild(row);
     }
@@ -980,15 +1048,24 @@ async function loadTimeSeriesChart() {
 function renderTimeSeriesChart(data, metric) {
     const ctx = document.getElementById('timeSeriesChart');
 
+    // Update winner tally (only show for MAE metric)
+    const winnerTally = document.getElementById('winnerTally');
+    if (metric === 'mae' && data.winner_counts) {
+        document.getElementById('gfsWins').textContent = data.winner_counts.GFS || 0;
+        document.getElementById('aifsWins').textContent = data.winner_counts.AIFS || 0;
+        document.getElementById('ifsWins').textContent = data.winner_counts.IFS || 0;
+        document.getElementById('nwsWins').textContent = data.winner_counts.NWS || 0;
+        document.getElementById('tieWins').textContent = data.winner_counts.Tie || 0;
+        winnerTally.classList.remove('d-none');
+    } else {
+        winnerTally.classList.add('d-none');
+    }
+
     // Get the appropriate data arrays based on metric
     const gfsData = metric === 'mae' ? data.gfs.mae : data.gfs.bias;
     const aifsData = metric === 'mae' ? data.aifs.mae : data.aifs.bias;
     const ifsData = metric === 'mae' ? data.ifs.mae : data.ifs.bias;
-
-    // Calculate 7-day rolling averages
-    const gfsRolling = calculateRollingAverage(gfsData);
-    const aifsRolling = calculateRollingAverage(aifsData);
-    const ifsRolling = calculateRollingAverage(ifsData);
+    const nwsData = data.nws ? (metric === 'mae' ? data.nws.mae : data.nws.bias) : null;
 
     // Format dates for display
     const labels = data.dates.map(d => {
@@ -1020,7 +1097,7 @@ function renderTimeSeriesChart(data, metric) {
             datasets: [
                 {
                     label: 'GFS',
-                    data: gfsRolling,
+                    data: gfsData,
                     borderColor: '#0d6efd',
                     backgroundColor: 'rgba(13, 110, 253, 0.1)',
                     borderWidth: 2,
@@ -1030,7 +1107,7 @@ function renderTimeSeriesChart(data, metric) {
                 },
                 {
                     label: 'AIFS',
-                    data: aifsRolling,
+                    data: aifsData,
                     borderColor: '#0dcaf0',
                     backgroundColor: 'rgba(13, 202, 240, 0.1)',
                     borderWidth: 2,
@@ -1040,14 +1117,24 @@ function renderTimeSeriesChart(data, metric) {
                 },
                 {
                     label: 'IFS',
-                    data: ifsRolling,
+                    data: ifsData,
                     borderColor: '#20c997',
                     backgroundColor: 'rgba(32, 201, 151, 0.1)',
                     borderWidth: 2,
                     tension: 0.3,
                     pointRadius: 1,
                     pointHoverRadius: 4
-                }
+                },
+                ...(nwsData ? [{
+                    label: 'NWS',
+                    data: nwsData,
+                    borderColor: '#000000',
+                    backgroundColor: 'rgba(0, 0, 0, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 1,
+                    pointHoverRadius: 4
+                }] : [])
             ]
         },
         options: {
