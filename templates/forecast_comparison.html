@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Forecast Comparison - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .forecast-tabs {
+        margin-bottom: 1rem;
+    }
+
+    .forecast-frame {
+        width: 100%;
+        border: none;
+        min-height: 80vh;
+        height: 1200px;
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+
+    .nav-tabs .nav-link {
+        font-weight: 600;
+    }
+
+    #asosForecasts {
+        padding: 0;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <div class="row align-items-center">
+        <div class="col-12">
+            <h1 class="mb-1"><i class="bi bi-cloud-sun"></i> Forecast Comparison</h1>
+            <p class="mb-0 opacity-75">Model and NWS forecasts for Fairfax and the ASOS network</p>
+        </div>
+    </div>
+</div>
+
+<ul class="nav nav-tabs forecast-tabs" id="forecastTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="nav-link active" id="fairfax-forecast-tab" data-bs-toggle="tab" data-bs-target="#fairfaxForecastPane" type="button" role="tab" aria-controls="fairfaxForecastPane" aria-selected="true">
+            Fairfax Site
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="asos-forecast-tab" data-bs-toggle="tab" data-bs-target="#asosForecastPane" type="button" role="tab" aria-controls="asosForecastPane" aria-selected="false">
+            ASOS Network
+        </button>
+    </li>
+</ul>
+
+<div class="tab-content" id="forecastTabContent">
+    <div class="tab-pane fade show active" id="fairfaxForecastPane" role="tabpanel" aria-labelledby="fairfax-forecast-tab">
+        <iframe class="forecast-frame" src="/run-forecast?embed=1" title="Fairfax Run Forecast"></iframe>
+    </div>
+    <div class="tab-pane fade" id="asosForecastPane" role="tabpanel" aria-labelledby="asos-forecast-tab">
+        <div id="asosForecasts">
+            {% include 'asos_forecast_map.html' %}
+        </div>
+    </div>
+</div>
+{% endblock %}

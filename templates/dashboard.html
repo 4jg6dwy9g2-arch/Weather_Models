@@ -72,8 +72,12 @@
     <div id="verificationSection" class="row mb-4" style="display: none;">
         <div class="col-12">
             <div class="card">
-                <div class="card-header">
-                    <i class="bi bi-check-circle"></i> Model Verification by Lead Time (vs Observed)
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div><i class="bi bi-check-circle"></i> Model Verification by Lead Time (vs Observed)</div>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" role="switch" id="fairfaxPeriodToggle">
+                        <label class="form-check-label" for="fairfaxPeriodToggle">Last 30 days</label>
+                    </div>
                 </div>
                 <div class="card-body p-0">
                     <div class="table-responsive">
@@ -429,9 +433,10 @@ async function loadForecast() {
 
     try {
         // Load from saved data, verification, and historical bias for both temp and MSLP
+        const verificationPeriod = document.getElementById('fairfaxPeriodToggle')?.checked ? 'monthly' : 'all';
         const [forecastResponse, verificationResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse, panguResponse, nwsResponse] = await Promise.all([
             fetch(`/api/latest-forecast?location=${encodeURIComponent(location)}`),
-            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`),
+            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=${verificationPeriod}`),
             fetch(`/api/temp-bias-history?location=${encodeURIComponent(location)}&lead_time=${tempLeadTime}&days_back=${tempTimeFrame}`),
             fetch(`/api/mslp-bias-history?location=${encodeURIComponent(location)}&lead_time=${mslpLeadTime}&days_back=${mslpTimeFrame}`),
             fetch(`/api/pangu-latest?location=${encodeURIComponent(location)}`),
@@ -479,6 +484,28 @@ async function loadForecast() {
         document.getElementById('loadingState').classList.add('d-none');
         document.getElementById('errorState').classList.remove('d-none');
         document.getElementById('errorMessage').textContent = error.message;
+    }
+}
+
+async function loadVerificationTable() {
+    const location = 'Fairfax, VA';
+    const period = document.getElementById('fairfaxPeriodToggle')?.checked ? 'monthly' : 'all';
+    try {
+        const response = await fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=${period}`);
+        const data = await response.json();
+        if (data.success && data.verification.lead_times.length > 0) {
+            renderVerificationTable(data.verification);
+            document.getElementById('verificationSection').style.display = '';
+        } else {
+            const tbody = document.getElementById('verificationTableBody');
+            tbody.innerHTML = '<tr><td colspan="18" class="text-center text-muted">No verification data available yet. Sync forecasts and wait for observations.</td></tr>';
+            document.getElementById('verificationSection').style.display = '';
+        }
+    } catch (error) {
+        console.error('Error loading verification table:', error);
+        const tbody = document.getElementById('verificationTableBody');
+        tbody.innerHTML = '<tr><td colspan="18" class="text-center text-muted">Unable to load verification data.</td></tr>';
+        document.getElementById('verificationSection').style.display = '';
     }
 }
 
@@ -868,6 +895,25 @@ function renderTempChart(data, tempHistoryData, panguData, nwsData) {
     const tempYMin = tempMin - tempPadding;
     const tempYMax = tempMax + tempPadding;
 
+    // Anchor points to keep tooltip active across the full x-range
+    const uniqueTimes = [...new Set(allDates.map(d => d.getTime()))].sort((a, b) => a - b);
+    const anchorY = isFinite(tempYMin) && isFinite(tempYMax)
+        ? tempYMin + (tempYMax - tempYMin) * 0.02
+        : 0;
+    const anchorData = uniqueTimes.map(ts => ({ x: new Date(ts), y: anchorY }));
+    tempDatasets.push({
+        label: 'Hover Anchor',
+        data: anchorData,
+        type: 'line',
+        borderColor: 'rgba(0,0,0,0)',
+        backgroundColor: 'rgba(0,0,0,0)',
+        pointRadius: 0,
+        pointHoverRadius: 0,
+        pointHitRadius: 60,
+        showLine: false,
+        order: 99
+    });
+
     // Render temperature chart
     if (tempChart) tempChart.destroy();
     tempChart = new Chart(document.getElementById('tempChart'), {
@@ -877,15 +923,25 @@ function renderTempChart(data, tempHistoryData, panguData, nwsData) {
             responsive: true,
             maintainAspectRatio: false,
             interaction: {
-                mode: 'index',
-                intersect: false
+                mode: 'nearest',
+                intersect: false,
+                axis: 'x',
+                radius: 120
+            },
+            hover: {
+                mode: 'nearest',
+                intersect: false,
+                axis: 'x'
             },
             plugins: {
                 legend: {
                     position: 'top',
                     labels: {
                         usePointStyle: true,
-                        padding: 15
+                        padding: 15,
+                        filter: function(item) {
+                            return item.text !== 'Hover Anchor';
+                        }
                     }
                 },
                 tooltip: {
@@ -894,6 +950,7 @@ function renderTempChart(data, tempHistoryData, panguData, nwsData) {
                         if (!hasData) return false;
 
                         const label = tooltipItem.dataset.label;
+                        if (label === 'Hover Anchor') return true;
                         const chart = tooltipItem.chart;
                         const hasHistoricalDataHere = chart.data.datasets.some(ds => {
                             const point = ds.data[tooltipItem.dataIndex];
@@ -908,6 +965,9 @@ function renderTempChart(data, tempHistoryData, panguData, nwsData) {
                     callbacks: {
                         label: function(context) {
                             const label = context.dataset.label || '';
+                            if (label === 'Hover Anchor') {
+                                return `Time: ${context.label}`;
+                            }
                             if (label.includes('Bias') && tempHistoryData) {
                                 const dataPoint = context.dataset.data[context.dataIndex];
                                 if (dataPoint && Array.isArray(dataPoint.y)) {
@@ -1165,6 +1225,26 @@ function renderMslpChart(data, mslpHistoryData, panguData) {
     const mslpYMin = mslpMin - mslpPadding;
     const mslpYMax = mslpMax + mslpPadding;
 
+    // Anchor points to keep tooltip active across the full x-range
+    const mslpAllDates = allDates;
+    const mslpUniqueTimes = [...new Set(mslpAllDates.map(d => d.getTime()))].sort((a, b) => a - b);
+    const mslpAnchorY = isFinite(mslpYMin) && isFinite(mslpYMax)
+        ? mslpYMin + (mslpYMax - mslpYMin) * 0.02
+        : 0;
+    const mslpAnchorData = mslpUniqueTimes.map(ts => ({ x: new Date(ts), y: mslpAnchorY }));
+    mslpDatasets.push({
+        label: 'Hover Anchor',
+        data: mslpAnchorData,
+        type: 'line',
+        borderColor: 'rgba(0,0,0,0)',
+        backgroundColor: 'rgba(0,0,0,0)',
+        pointRadius: 0,
+        pointHoverRadius: 0,
+        pointHitRadius: 60,
+        showLine: false,
+        order: 99
+    });
+
     // Render MSLP chart
     if (mslpChart) mslpChart.destroy();
     mslpChart = new Chart(document.getElementById('mslpChart'), {
@@ -1174,15 +1254,25 @@ function renderMslpChart(data, mslpHistoryData, panguData) {
             responsive: true,
             maintainAspectRatio: false,
             interaction: {
-                mode: 'index',
-                intersect: false
+                mode: 'nearest',
+                intersect: false,
+                axis: 'x',
+                radius: 120
+            },
+            hover: {
+                mode: 'nearest',
+                intersect: false,
+                axis: 'x'
             },
             plugins: {
                 legend: {
                     position: 'top',
                     labels: {
                         usePointStyle: true,
-                        padding: 15
+                        padding: 15,
+                        filter: function(item) {
+                            return item.text !== 'Hover Anchor';
+                        }
                     }
                 },
                 tooltip: {
@@ -1191,6 +1281,7 @@ function renderMslpChart(data, mslpHistoryData, panguData) {
                         if (!hasData) return false;
 
                         const label = tooltipItem.dataset.label;
+                        if (label === 'Hover Anchor') return true;
                         const chart = tooltipItem.chart;
                         const hasHistoricalDataHere = chart.data.datasets.some(ds => {
                             const point = ds.data[tooltipItem.dataIndex];
@@ -1205,6 +1296,9 @@ function renderMslpChart(data, mslpHistoryData, panguData) {
                     callbacks: {
                         label: function(context) {
                             const label = context.dataset.label || '';
+                            if (label === 'Hover Anchor') {
+                                return `Time: ${context.label}`;
+                            }
                             if (label.includes('Bias') && mslpHistoryData) {
                                 const dataPoint = context.dataset.data[context.dataIndex];
                                 if (dataPoint && Array.isArray(dataPoint.y)) {
@@ -1387,6 +1481,7 @@ function formatLeadTime(hours) {
 // Load verification data
 async function loadLeadTimeVerification() {
     const location = 'Fairfax, VA';
+    const period = document.getElementById('fairfaxPeriodToggle')?.checked ? 'monthly' : 'all';
 
     document.getElementById('loadingState').classList.remove('d-none');
     document.getElementById('verificationContent').classList.add('d-none');
@@ -1394,7 +1489,7 @@ async function loadLeadTimeVerification() {
 
     try {
         const [verificationResponse, runsResponse] = await Promise.all([
-            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}`),
+            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=${period}`),
             fetch(`/api/runs?location=${encodeURIComponent(location)}`)
         ]);
 
@@ -1774,11 +1869,16 @@ document.getElementById('tempBiasTimeFrame').addEventListener('change', updateTe
 // Event listeners for MSLP bias history controls
 document.getElementById('mslpBiasLeadTime').addEventListener('change', updateMslpChart);
 document.getElementById('mslpBiasTimeFrame').addEventListener('change', updateMslpChart);
+document.getElementById('fairfaxPeriodToggle').addEventListener('change', function() {
+    loadVerificationTable();
+    loadLeadTimeVerification();
+});
 
 // Initial load
 document.addEventListener('DOMContentLoaded', function() {
     loadForecast();
     loadLeadTimeVerification();
+    loadVerificationTable();
     loadFairfaxTimeSeriesChart();
 });
 
