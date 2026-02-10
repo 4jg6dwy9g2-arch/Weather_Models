@@ -48,6 +48,15 @@ import rossby_waves
 import nws_batch
 
 try:
+    import analog_metrics as _analog_metrics
+    _HAS_ANALOG_METRICS = True
+except Exception as _e:
+    _analog_metrics = None  # type: ignore
+    _HAS_ANALOG_METRICS = False
+    logger = logging.getLogger(__name__)
+    logger.warning("analog_metrics import failed – falling back to Pearson: %s", _e)
+
+try:
     from astral import LocationInfo, moon
     from astral.sun import sun
     from zoneinfo import ZoneInfo
@@ -66,6 +75,17 @@ ASOS_TRENDS_FILE = Path(__file__).parent / "asos_forecast_trends.json"
 
 # ERA5 analog forecast history (tracks predictions over time)
 ANALOG_HISTORY_FILE = Path(__file__).parent / "analog_forecast_history.json"
+
+# ---------------------------------------------------------------------------
+# ERA5 analog caches (populated lazily, persist for the lifetime of the process)
+# ---------------------------------------------------------------------------
+# Structure: {cache_key: {'climatology': dict, 'ds': xr.Dataset, ...}}
+# cache_key = frozenset of ERA5 file paths + overlap bounds
+_CLIMATOLOGY_CACHE: dict = {}
+
+# EOF cache (loaded/built in background thread)
+_EOF_CACHE: dict | None = None
+_EOF_CACHE_READY = threading.Event()
 
 if load_dotenv:
     load_dotenv()
@@ -3595,288 +3615,591 @@ def api_era5_500mb_map():
         return jsonify({"success": False, "error": str(e)})
 
 
-@app.route('/api/era5/analogs')
-def api_era5_analogs():
-    """
-    Find historical analog dates with similar 500mb height patterns using spatial correlation
-    of height anomalies. Anomalies are calculated as deviation from the zonal mean to remove
-    seasonal bias and focus on wave pattern similarity.
+def _find_analogs_core(top_n: int = 10, method: str = 'composite') -> dict:
+    """Shared pattern-matching core used by both analog endpoints.
 
-    Query params:
-        - top_n: Number of top analogs to return (default: 10)
+    Loads GFS z500, ERA5 z500, builds climatology (cached), computes
+    multi-metric similarity for every seasonal-window candidate, and
+    returns the top_n most diverse analogs.
 
-    Returns:
-        JSON with list of analog dates sorted by spatial pattern similarity
+    Parameters
+    ----------
+    top_n:
+        Number of analog dates to return (after diversity filtering).
+    method:
+        One of ``'pearson'``, ``'lat_pearson'``, or ``'composite'``.
+        - ``'pearson'``     – legacy unweighted Pearson (exact backward compat)
+        - ``'lat_pearson'`` – area-weighted Pearson only
+        - ``'composite'``   – weighted combination of lat_pearson + grad_corr + rmse_sim [+ eof_sim]
+
+    Returns
+    -------
+    dict with keys:
+        ``init_time``, ``current_date_str``, ``current_wave_num``,
+        ``ds``, ``pressure_coord``, ``lat_coord_name``, ``lon_coord_name``,
+        ``era5_lats_overlap``, ``era5_lons_overlap``,
+        ``current_z500``, ``current_anomaly``, ``climatology``,
+        ``top_analogs``
+    Raises on data errors (caller should catch and return JSON error).
     """
+    import xarray as xr
+    import numpy as np
+    import pandas as pd
+    from scipy.stats import pearsonr
+
+    # ------------------------------------------------------------------
+    # 1. Get current GFS z500 — live-fetch latest available init (any cycle)
+    # ------------------------------------------------------------------
+    gfs_model = GFSModel()
+    init_time = pd.Timestamp(gfs_model.get_latest_init_time())
+    current_date_str = init_time.isoformat()
+
+    logger.info(f"Analog matching: using GFS init {init_time.strftime('%Y-%m-%d %HZ')}")
+
+    global_region = Region("Global", (-180, 180, 20, 70))
+
     try:
-        import xarray as xr
-        import numpy as np
-        import pandas as pd
-        from scipy.stats import pearsonr
+        z500_da = gfs_model.fetch_data(Z500_GFS, init_time, 0, global_region)
+        current_z500_gfs = z500_da.values * 10.0  # dm → m (ERA5 stores z in metres)
+        current_lats_gfs = z500_da.latitude.values
+        current_lons_gfs = z500_da.longitude.values
 
-        top_n = int(request.args.get('top_n', 10))
+        # Compute wave number live
+        wave_result = rossby_waves.calculate_wave_number(z500_da, latitude=55.0)
+        current_wave_num = wave_result.get('wave_number')
 
-        # Load latest forecast data to get current pattern
+    except Exception as e:
+        logger.warning(f"Live GFS z500 fetch failed ({e}); falling back to stored DB")
+        # Fallback: read from forecasts.json
         db = load_forecasts_db()
         location_name = 'Fairfax, VA'
 
         if location_name not in db or not db[location_name].get('latest_run'):
-            return jsonify({"success": False, "error": "No forecast data available"})
+            raise ValueError("No forecast data available and live GFS fetch failed")
 
         latest_run = db[location_name]['latest_run']
         run_data = db[location_name]['runs'].get(latest_run)
 
         if not run_data or 'gfs' not in run_data:
-            return jsonify({"success": False, "error": "No GFS forecast data in latest run"})
+            raise ValueError("No GFS forecast data in latest run")
 
-        # Get initialization time (00Z)
-        init_time = pd.Timestamp(latest_run)
-        current_date_str = init_time.isoformat()
-
-        # Get current z500 field
         gfs_data = run_data['gfs']
         z500_field_data = gfs_data.get('z500_field')
 
         if not z500_field_data:
-            return jsonify({"success": False, "error": "No z500 field in current forecast. Please sync forecasts again to capture the field data."})
+            raise ValueError(
+                "No z500 field available. Live GFS fetch failed and no cached z500 found. "
+                "Please sync forecasts to cache z500 data."
+            )
 
-        # Extract current pattern (GFS data)
-        current_z500_gfs = np.array(z500_field_data['values'])
+        init_time = pd.Timestamp(latest_run)
+        current_date_str = init_time.isoformat()
+        current_z500_gfs = np.array(z500_field_data['values']) * 10.0  # dm → m to match ERA5
         current_lats_gfs = np.array(z500_field_data['latitude'])
         current_lons_gfs = np.array(z500_field_data['longitude'])
-
-        logger.info(f"GFS data contains NaN: {np.any(np.isnan(current_z500_gfs))}")
-        logger.info(f"GFS lat range: {current_lats_gfs.min():.1f} to {current_lats_gfs.max():.1f}")
-        logger.info(f"GFS lon range: {current_lons_gfs.min():.1f} to {current_lons_gfs.max():.1f}")
-
-        # Convert GFS longitudes from 0/360 to -180/180 convention to match ERA5
-        if current_lons_gfs.max() > 180:
-            logger.info("Converting GFS longitudes from 0/360 to -180/180 convention")
-            current_lons_gfs = np.where(current_lons_gfs > 180, current_lons_gfs - 360, current_lons_gfs)
-
-        # Get wave number for display
         current_waves = gfs_data.get('z500_waves', {})
         current_wave_num = current_waves.get('wave_number')
 
-        # Load ERA5 data
-        era5_path = Path("/Volumes/T7/Weather_Models/era5/global_500mb")
+    # ------------------------------------------------------------------
+    # 2. Load ERA5 z500
+    # ------------------------------------------------------------------
+    era5_path = Path("/Volumes/T7/Weather_Models/era5/global_500mb")
 
-        if not era5_path.exists():
-            return jsonify({"success": False, "error": f"ERA5 data directory not found: {era5_path}"})
+    if not era5_path.exists():
+        raise FileNotFoundError(f"ERA5 data directory not found: {era5_path}")
 
-        era5_files = list(era5_path.glob("era5_z500_NH_*.nc"))
+    era5_files = sorted(era5_path.glob("era5_z500_NH_*.nc"))
 
-        if not era5_files:
-            return jsonify({"success": False, "error": "No ERA5 data found"})
+    if not era5_files:
+        raise FileNotFoundError("No ERA5 data found")
 
-        # Load datasets
-        datasets = []
-        for f in era5_files:
-            try:
-                ds = xr.open_dataset(f)
-                datasets.append(ds)
-            except Exception as e:
-                logger.warning(f"Failed to load {f}: {e}")
+    datasets = []
+    for f in era5_files:
+        try:
+            ds = xr.open_dataset(f)
+            datasets.append(ds)
+        except Exception as e:
+            logger.warning(f"Failed to load {f}: {e}")
 
-        if not datasets:
-            return jsonify({"success": False, "error": "Failed to load ERA5 datasets"})
+    if not datasets:
+        raise RuntimeError("Failed to load ERA5 datasets")
 
-        # Combine and sort
-        ds = xr.concat(datasets, dim='time')
-        ds = ds.sortby('time')
+    ds = xr.concat(datasets, dim='time')
+    ds = ds.sortby('time')
 
-        # Check for pressure level coordinate
-        pressure_coord = None
-        for coord_name in ['pressure_level', 'level', 'plev', 'lev']:
-            if coord_name in ds.coords or coord_name in ds.dims:
-                pressure_coord = coord_name
-                break
+    pressure_coord = None
+    for coord_name in ['pressure_level', 'level', 'plev', 'lev']:
+        if coord_name in ds.coords or coord_name in ds.dims:
+            pressure_coord = coord_name
+            break
 
-        if pressure_coord is None:
-            return jsonify({"success": False, "error": "Could not find pressure level coordinate in dataset"})
+    if pressure_coord is None:
+        raise RuntimeError("Could not find pressure level coordinate in dataset")
 
-        # Get ERA5 coordinates for regridding
-        era5_lats = ds['latitude'].values if 'latitude' in ds.coords else ds['lat'].values
-        era5_lons = ds['longitude'].values if 'longitude' in ds.coords else ds['lon'].values
+    lat_coord_name = 'latitude' if 'latitude' in ds.coords else 'lat'
+    lon_coord_name = 'longitude' if 'longitude' in ds.coords else 'lon'
 
-        logger.info(f"ERA5 lat range: {era5_lats.min():.1f} to {era5_lats.max():.1f}")
-        logger.info(f"ERA5 lon range: {era5_lons.min():.1f} to {era5_lons.max():.1f}")
+    era5_lats = ds[lat_coord_name].values
+    era5_lons = ds[lon_coord_name].values
 
-        # Find overlapping latitude/longitude range to avoid NaNs
-        # ERA5 latitudes (find overlap with GFS)
-        era5_lat_min, era5_lat_max = min(era5_lats), max(era5_lats)
-        gfs_lat_min, gfs_lat_max = min(current_lats_gfs), max(current_lats_gfs)
-        overlap_lat_min = max(era5_lat_min, gfs_lat_min)
-        overlap_lat_max = min(era5_lat_max, gfs_lat_max)
+    # Overlapping lat range
+    overlap_lat_min = max(min(era5_lats), min(current_lats_gfs))
+    overlap_lat_max = min(max(era5_lats), max(current_lats_gfs))
 
-        # Filter ERA5 coordinates to overlapping region
-        lat_mask = (era5_lats >= overlap_lat_min) & (era5_lats <= overlap_lat_max)
-        era5_lats_overlap = era5_lats[lat_mask]
+    lat_mask = (era5_lats >= overlap_lat_min) & (era5_lats <= overlap_lat_max)
+    era5_lats_overlap = era5_lats[lat_mask]
+    era5_lons_overlap = era5_lons
 
-        # Use all longitudes (both should cover 0-360 or -180 to 180)
-        era5_lons_overlap = era5_lons
+    # Regrid GFS to ERA5 grid.
+    # Use assign_coords+sortby to convert 0→360 to -180→180 monotonically.
+    # np.where() alone produces a non-monotonic array that makes interp() return NaN.
+    gfs_da = xr.DataArray(
+        current_z500_gfs,
+        coords={'latitude': current_lats_gfs, 'longitude': current_lons_gfs},
+        dims=['latitude', 'longitude']
+    )
+    if gfs_da.longitude.values.max() > 180:
+        gfs_da = gfs_da.assign_coords(
+            longitude=(((gfs_da.longitude + 180) % 360) - 180)
+        ).sortby('longitude')
+    current_z500 = gfs_da.interp(
+        latitude=era5_lats_overlap,
+        longitude=era5_lons_overlap,
+        method='linear'
+    ).values
 
-        logger.info(f"Overlapping latitude range: {overlap_lat_min:.1f} to {overlap_lat_max:.1f}")
-        logger.info(f"Regridding GFS data from {current_z500_gfs.shape} to ERA5 grid {(len(era5_lats_overlap), len(era5_lons_overlap))}")
+    # ------------------------------------------------------------------
+    # 3. Build / retrieve climatology (cached by (files, overlap))
+    # ------------------------------------------------------------------
+    cache_key = (
+        tuple(str(f) for f in era5_files),
+        round(float(overlap_lat_min), 2),
+        round(float(overlap_lat_max), 2),
+    )
 
-        # Create xarray DataArray from GFS data
-        gfs_da = xr.DataArray(
-            current_z500_gfs,
-            coords={'latitude': current_lats_gfs, 'longitude': current_lons_gfs},
-            dims=['latitude', 'longitude']
-        )
-
-        # Interpolate to ERA5 grid (overlapping region only)
-        current_z500 = gfs_da.interp(latitude=era5_lats_overlap, longitude=era5_lons_overlap, method='linear').values
-        logger.info(f"Regridded GFS shape: {current_z500.shape}, contains NaN: {np.any(np.isnan(current_z500))}")
-
-        # Calculate climatology (day-of-year mean using 31-day window)
-        # Use 1990-2021 period for climatology (standard 30-year normal)
-        logger.info("Calculating climatology from ERA5 data (1990-2021)...")
-
-        # Filter to 1990-2021 and overlapping latitude range for climatology calculation
-        lat_coord_name = 'latitude' if 'latitude' in ds.coords else 'lat'
-        lon_coord_name = 'longitude' if 'longitude' in ds.coords else 'lon'
-
+    if cache_key not in _CLIMATOLOGY_CACHE:
+        logger.info("Calculating climatology from ERA5 data (1990-2021) – will cache for this session …")
         clim_ds = ds.sel(
             time=slice('1990-01-01', '2021-12-31'),
             **{lat_coord_name: era5_lats_overlap, lon_coord_name: era5_lons_overlap}
         )
-
-        # Group by day of year and calculate mean
         ds_with_doy = clim_ds.assign_coords(dayofyear=clim_ds.time.dt.dayofyear)
 
-        # Calculate climatology with 31-day smoothing window
-        climatology = {}
-        for doy in range(1, 367):  # 1-366 (leap years)
-            # Get window of +/- 15 days around this day of year
+        climatology: dict = {}
+        for doy in range(1, 367):
             window_days = [(doy + offset - 1) % 366 + 1 for offset in range(-15, 16)]
-
-            # Select all times matching these days of year
             mask = ds_with_doy.dayofyear.isin(window_days)
             if mask.sum() > 0:
                 window_data = ds_with_doy.where(mask, drop=True)
                 clim_z500 = window_data['z'].sel(**{pressure_coord: 500}).mean(dim='time')
                 climatology[doy] = clim_z500.values
 
-        # Calculate current pattern anomaly (relative to climatology)
-        current_doy = init_time.dayofyear
-        if current_doy in climatology:
-            current_clim = climatology[current_doy]
-            current_anomaly = current_z500 - current_clim
-        else:
-            logger.warning(f"No climatology for day {current_doy}, using zonal mean")
-            current_zonal_mean = np.mean(current_z500, axis=1, keepdims=True)
-            current_anomaly = current_z500 - current_zonal_mean
+        _CLIMATOLOGY_CACHE[cache_key] = climatology
+        logger.info("Climatology cached (%d DoY entries)", len(climatology))
+    else:
+        climatology = _CLIMATOLOGY_CACHE[cache_key]
+        logger.info("Using cached climatology (%d DoY entries)", len(climatology))
 
-        current_flat = current_anomaly.flatten()
-        logger.info(f"Current anomaly shape: {current_anomaly.shape}, finite values: {np.sum(np.isfinite(current_flat))}/{len(current_flat)}")
+    # ------------------------------------------------------------------
+    # 4. Current anomaly
+    # ------------------------------------------------------------------
+    current_doy = init_time.dayofyear
+    if current_doy in climatology:
+        current_clim = climatology[current_doy]
+        current_anomaly = current_z500 - current_clim
+    else:
+        logger.warning(f"No climatology for day {current_doy}, using zonal mean")
+        current_anomaly = current_z500 - np.mean(current_z500, axis=1, keepdims=True)
 
-        # Calculate spatial correlations with all historical dates
-        # Restrict to same season (±45 days) to avoid seasonal bias in weather outcomes
-        analogs = []
-        seasonal_window = 45  # days
+    current_flat = current_anomaly.flatten()
 
-        for t in ds.time.values:
-            try:
-                # Calculate anomaly (deviation from climatology for this date)
-                t_pd = pd.Timestamp(t)
-                historical_doy = t_pd.dayofyear
+    # Pre-compute weights and lat_weights for composite / lat_pearson modes
+    weights_flat = None
+    if _HAS_ANALOG_METRICS and method in ('composite', 'lat_pearson'):
+        w2d = _analog_metrics.build_lat_weights(era5_lats_overlap, current_anomaly.shape)
+        weights_flat = w2d.flatten()
 
-                # Filter to seasonal window: only use dates within ±45 days of current date
-                current_doy = init_time.dayofyear
-                # Handle year wraparound (e.g., Dec 31 to Jan 31)
-                doy_diff = min(
-                    abs(historical_doy - current_doy),
-                    abs(historical_doy - current_doy + 365),
-                    abs(historical_doy - current_doy - 365)
-                )
-                if doy_diff > seasonal_window:
-                    continue  # Skip dates outside seasonal window
+    # ------------------------------------------------------------------
+    # 5. Bulk-load seasonal-window candidates
+    # ------------------------------------------------------------------
+    seasonal_window = 45
 
-                # Get historical z500 (overlapping region only)
-                z500 = ds['z'].sel(
-                    time=t,
-                    **{pressure_coord: 500, lat_coord_name: era5_lats_overlap, lon_coord_name: era5_lons_overlap}
-                )
-                historical_z500 = z500.values
+    # Build a mask of candidate times (pd already imported at top of function)
+    all_times = ds.time.values
+    candidate_mask = []
+    for t in all_times:
+        t_pd = pd.Timestamp(t)
+        doy = t_pd.dayofyear
+        diff = min(
+            abs(doy - current_doy),
+            abs(doy - current_doy + 365),
+            abs(doy - current_doy - 365),
+        )
+        candidate_mask.append(diff <= seasonal_window)
 
-                if historical_doy in climatology:
-                    historical_clim = climatology[historical_doy]
-                    historical_anomaly = historical_z500 - historical_clim
-                else:
-                    # Fallback to zonal mean if no climatology
-                    historical_zonal_mean = np.mean(historical_z500, axis=1, keepdims=True)
-                    historical_anomaly = historical_z500 - historical_zonal_mean
+    candidate_times = all_times[np.array(candidate_mask)]
+    logger.info("Candidate analog times: %d of %d total", len(candidate_times), len(all_times))
 
-                historical_flat = historical_anomaly.flatten()
+    # Bulk load all candidate z500 slices in one xarray operation
+    z500_bulk = ds['z'].sel(
+        time=candidate_times,
+        **{pressure_coord: 500, lat_coord_name: era5_lats_overlap, lon_coord_name: era5_lons_overlap}
+    ).values  # shape: (n_candidates, n_lat, n_lon)
 
-                # Skip if different sizes (shouldn't happen but just in case)
-                min_size = min(len(current_flat), len(historical_flat))
-                if min_size == 0:
-                    continue
+    # ------------------------------------------------------------------
+    # 6. Score each candidate
+    # ------------------------------------------------------------------
+    analogs = []
 
-                current_subset = current_flat[:min_size]
-                historical_subset = historical_flat[:min_size]
+    for i, t in enumerate(candidate_times):
+        try:
+            t_pd = pd.Timestamp(t)
+            historical_doy = t_pd.dayofyear
+            historical_z500 = z500_bulk[i]  # (n_lat, n_lon)
 
-                # Calculate spatial correlation of climatological anomalies
-                # Use only finite values from both arrays
-                finite_mask = np.isfinite(current_subset) & np.isfinite(historical_subset)
-                n_finite = np.sum(finite_mask)
+            if historical_doy in climatology:
+                historical_anomaly = historical_z500 - climatology[historical_doy]
+            else:
+                historical_anomaly = historical_z500 - np.mean(historical_z500, axis=1, keepdims=True)
 
-                # Require at least 90% of points to be finite for valid correlation
-                if n_finite > 0.9 * len(current_subset):
-                    current_finite = current_subset[finite_mask]
-                    historical_finite = historical_subset[finite_mask]
+            historical_flat = historical_anomaly.flatten()
 
-                    correlation, _ = pearsonr(current_finite, historical_finite)
-
-                    # Calculate wave number for this date
-                    wave_result = rossby_waves.calculate_wave_number(z500, latitude=55.0)
-
-                    analogs.append({
-                        'date': str(t),
-                        'correlation': float(correlation),
-                        'wave_number': wave_result.get('wave_number')
-                    })
-
-            except Exception as e:
+            # Basic finite check
+            min_size = min(len(current_flat), len(historical_flat))
+            if min_size == 0:
                 continue
 
-        # Sort by correlation (highest first)
-        analogs.sort(key=lambda x: x['correlation'], reverse=True)
+            cur_sub = current_flat[:min_size]
+            hist_sub = historical_flat[:min_size]
+            finite_mask = np.isfinite(cur_sub) & np.isfinite(hist_sub)
+            n_finite = int(finite_mask.sum())
 
-        logger.info(f"Found {len(analogs)} total analogs")
-        if len(analogs) > 0:
-            logger.info(f"Top correlation: {analogs[0]['correlation']:.3f}")
+            if n_finite < 0.9 * min_size:
+                continue
 
-        # Get top N analogs with minimum separation to avoid clustering
-        # Ensure analogs are at least 7 days apart to get diverse patterns
-        top_analogs = []
-        min_separation_days = 7
+            # ---- Choose scoring method ----
+            if method == 'pearson' or not _HAS_ANALOG_METRICS:
+                # Legacy unweighted Pearson
+                cur_f = cur_sub[finite_mask]
+                hist_f = hist_sub[finite_mask]
+                correlation, _ = pearsonr(cur_f, hist_f)
+                record: dict = {
+                    'date': str(t),
+                    'correlation': float(correlation),
+                    'composite_score': float(correlation),
+                }
 
-        for analog in analogs:
-            # Check if this analog is too close to any already selected
-            analog_date = pd.Timestamp(analog['date'])
-            too_close = False
+            elif method == 'lat_pearson':
+                w_sub = (weights_flat[:min_size] if weights_flat is not None else np.ones(min_size))
+                lat_pearson = _analog_metrics.weighted_pearson(cur_sub, hist_sub, w_sub)
+                if not np.isfinite(lat_pearson):
+                    continue
+                record = {
+                    'date': str(t),
+                    'correlation': float(lat_pearson),
+                    'composite_score': float(lat_pearson),
+                }
 
-            for selected in top_analogs:
-                selected_date = pd.Timestamp(selected['date'])
-                days_apart = abs((analog_date - selected_date).days)
+            else:  # composite
+                # Weighted Pearson
+                w_sub = (weights_flat[:min_size] if weights_flat is not None else np.ones(min_size))
+                lat_pearson = _analog_metrics.weighted_pearson(cur_sub, hist_sub, w_sub)
 
-                if days_apart < min_separation_days:
-                    too_close = True
-                    break
+                # Gradient correlation
+                grad_corr = _analog_metrics.gradient_correlation(current_anomaly, historical_anomaly)
 
-            # If not too close to any selected analog, add it
-            if not too_close:
-                top_analogs.append(analog)
+                # RMSE similarity
+                rmse_sim = _analog_metrics.rmse_similarity(cur_sub, hist_sub)
 
-            # Stop once we have enough
-            if len(top_analogs) >= top_n:
+                # EOF similarity (if cache ready)
+                eof_sim = None
+                if _EOF_CACHE is not None:
+                    # Find the matching index in the EOF cache times array
+                    t_str = str(t)
+                    eof_times = _EOF_CACHE.get('times', [])
+                    idx_arr = np.where(eof_times == t_str)[0]
+                    if len(idx_arr) > 0:
+                        eof_sim = _analog_metrics.eof_similarity(current_anomaly, _EOF_CACHE, int(idx_arr[0]))
+
+                composite = _analog_metrics.compute_composite_score(lat_pearson, grad_corr, rmse_sim, eof_sim)
+                if not np.isfinite(composite):
+                    continue
+
+                record = {
+                    'date': str(t),
+                    'correlation': float(lat_pearson) if np.isfinite(lat_pearson) else 0.0,
+                    'composite_score': float(composite),
+                    'grad_corr': float(grad_corr) if np.isfinite(grad_corr) else None,
+                    'rmse_sim': float(rmse_sim) if np.isfinite(rmse_sim) else None,
+                }
+                if eof_sim is not None:
+                    record['eof_sim'] = float(eof_sim) if np.isfinite(eof_sim) else None
+
+            # Wave number for point-analog display
+            hist_z_da = ds['z'].sel(
+                time=t,
+                **{pressure_coord: 500, lat_coord_name: era5_lats_overlap, lon_coord_name: era5_lons_overlap}
+            )
+            wave_result = rossby_waves.calculate_wave_number(hist_z_da, latitude=55.0)
+            record['wave_number'] = wave_result.get('wave_number')
+
+            analogs.append(record)
+
+        except Exception:
+            continue
+
+    # ------------------------------------------------------------------
+    # 7. Sort and pick diverse top-N
+    # ------------------------------------------------------------------
+    analogs.sort(key=lambda x: x['composite_score'], reverse=True)
+    logger.info("Found %d candidate analogs; selecting top %d with ≥7-day separation", len(analogs), top_n)
+
+    top_analogs = []
+    min_sep = 7
+
+    for analog in analogs:
+        analog_date = pd.Timestamp(analog['date'])
+        too_close = any(
+            abs((analog_date - pd.Timestamp(sel['date'])).days) < min_sep
+            for sel in top_analogs
+        )
+        if not too_close:
+            top_analogs.append(analog)
+        if len(top_analogs) >= top_n:
+            break
+
+    return {
+        'init_time': init_time,
+        'current_date_str': current_date_str,
+        'current_wave_num': current_wave_num,
+        'ds': ds,
+        'pressure_coord': pressure_coord,
+        'lat_coord_name': lat_coord_name,
+        'lon_coord_name': lon_coord_name,
+        'era5_lats_overlap': era5_lats_overlap,
+        'era5_lons_overlap': era5_lons_overlap,
+        'current_z500': current_z500,
+        'current_anomaly': current_anomaly,
+        'climatology': climatology,
+        'top_analogs': top_analogs,
+        'method': method,
+    }
+
+
+@app.route('/api/era5/analog-compare-map')
+def api_era5_analog_compare_map():
+    """
+    Generate a side-by-side comparison of a historical ERA5 500mb pattern
+    (analog date) vs the current GFS 500mb pattern.
+
+    Query params:
+        - date: Analog date (YYYY-MM-DD)
+
+    Returns base64 PNG comparison image.
+    """
+    try:
+        import xarray as xr
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        from io import BytesIO
+        import base64
+        import pandas as pd
+        from datetime import datetime as _dt
+
+        date_str = request.args.get('date')
+        if not date_str:
+            return jsonify({"success": False, "error": "date parameter required (YYYY-MM-DD)"})
+
+        target_date = _dt.fromisoformat(date_str)
+
+        # ---- Load ERA5 data ----
+        era5_files = sorted(Path("/Volumes/T7/Weather_Models/era5/global_500mb").glob("era5_z500_NH_*.nc"))
+        if not era5_files:
+            return jsonify({"success": False, "error": "No ERA5 data found"})
+
+        datasets = []
+        for f in era5_files:
+            try:
+                datasets.append(xr.open_dataset(f))
+            except Exception:
+                pass
+
+        if not datasets:
+            return jsonify({"success": False, "error": "Failed to load ERA5 datasets"})
+
+        ds = xr.concat(datasets, dim='time').sortby('time')
+
+        pressure_coord = None
+        for c in ['pressure_level', 'level', 'plev', 'lev']:
+            if c in ds.coords or c in ds.dims:
+                pressure_coord = c
                 break
+        if pressure_coord is None:
+            return jsonify({"success": False, "error": "Could not find pressure level coordinate"})
 
-        logger.info(f"Selected {len(top_analogs)} diverse analogs (min {min_separation_days} days apart)")
+        lat_coord = 'latitude' if 'latitude' in ds.coords else 'lat'
+        lon_coord = 'longitude' if 'longitude' in ds.coords else 'lon'
+
+        # Select nearest ERA5 timestep to requested date
+        analog_slice = ds.sel(time=target_date, method='nearest')
+        analog_time  = pd.Timestamp(analog_slice.time.values)
+        era5_z500    = analog_slice['z'].sel(**{pressure_coord: 500})
+        era5_lats    = era5_z500[lat_coord].values
+        era5_lons    = era5_z500[lon_coord].values
+        era5_heights = era5_z500.values / 9.80665  # → dam
+
+        # Climatology for ERA5 (shared between both panels)
+        target_doy  = analog_time.dayofyear
+        clim_ds     = ds.sel(time=slice('1990-01-01', '2021-12-31'))
+        ds_doy      = clim_ds.assign_coords(dayofyear=clim_ds.time.dt.dayofyear)
+        window_days = [(target_doy + o - 1) % 366 + 1 for o in range(-15, 16)]
+        mask        = ds_doy.dayofyear.isin(window_days)
+        if mask.sum() > 0:
+            clim_z500_raw = ds_doy.where(mask, drop=True)['z'].sel(**{pressure_coord: 500}).mean(dim='time')
+            clim_heights  = clim_z500_raw.values / 9.80665
+        else:
+            clim_heights  = np.mean(era5_heights, axis=1, keepdims=True) * np.ones_like(era5_heights)
+
+        era5_anom = era5_heights - clim_heights
+
+        # Climatology for GFS panel (use current DOY)
+        gfs_model   = GFSModel()
+        gfs_init    = pd.Timestamp(gfs_model.get_latest_init_time())
+        current_doy = gfs_init.dayofyear
+        gfs_window  = [(current_doy + o - 1) % 366 + 1 for o in range(-15, 16)]
+        gfs_mask    = ds_doy.dayofyear.isin(gfs_window)
+        if gfs_mask.sum() > 0:
+            gfs_clim_raw  = ds_doy.where(gfs_mask, drop=True)['z'].sel(**{pressure_coord: 500}).mean(dim='time')
+            gfs_clim_vals = gfs_clim_raw.values / 9.80665
+        else:
+            gfs_clim_vals = None  # fallback handled below
+
+        # ---- Live-fetch GFS z500 ----
+        global_region = Region("Global", (-180, 180, 20, 70))
+        gfs_z500_da   = gfs_model.fetch_data(Z500_GFS, gfs_init.to_pydatetime(), 0, global_region)
+
+        gfs_lats_raw = gfs_z500_da.latitude.values
+        gfs_vals_raw = gfs_z500_da.values  # already in dm (fetch_data applies gpm→dm conversion)
+
+        # Regrid GFS to ERA5 grid for anomaly computation.
+        # Use assign_coords+sortby to ensure monotonic longitude for interp().
+        # np.where() alone produces non-monotonic arrays that cause interp() to return NaN.
+        gfs_da_tmp = xr.DataArray(
+            gfs_vals_raw,
+            coords={'latitude': gfs_lats_raw, 'longitude': gfs_z500_da.longitude.values},
+            dims=['latitude', 'longitude'],
+        )
+        if gfs_da_tmp.longitude.values.max() > 180:
+            gfs_da_tmp = gfs_da_tmp.assign_coords(
+                longitude=(((gfs_da_tmp.longitude + 180) % 360) - 180)
+            ).sortby('longitude')
+        gfs_da_regrid = gfs_da_tmp.interp(latitude=era5_lats, longitude=era5_lons, method='linear')
+        gfs_heights = gfs_da_regrid.values  # dm, no further division needed
+
+        if gfs_clim_vals is not None:
+            gfs_anom = gfs_heights - gfs_clim_vals
+        else:
+            gfs_anom = gfs_heights - np.nanmean(gfs_heights, axis=1, keepdims=True)
+
+        # Wave numbers
+        era5_wave = rossby_waves.calculate_wave_number(era5_z500, latitude=55.0)
+        gfs_wave  = rossby_waves.calculate_wave_number(gfs_z500_da, latitude=55.0)
+
+        # ---- Build figure ----
+        proj = ccrs.NorthPolarStereo(central_longitude=-100)
+        fig, axes = plt.subplots(1, 2, figsize=(22, 9),
+                                  subplot_kw={'projection': proj})
+
+        anom_levels  = np.arange(-30, 31, 2)
+        height_levels = np.arange(460, 620, 6)
+        cmap = 'RdBu_r'
+
+        panel_data = [
+            (axes[0], era5_heights, era5_anom,
+             f"ERA5  |  {analog_time.strftime('%Y-%m-%d')}",
+             era5_wave, era5_lons, era5_lats),
+            (axes[1], gfs_heights, gfs_anom,
+             f"GFS  |  {gfs_init.strftime('%Y-%m-%d %HZ')}  (current)",
+             gfs_wave,  era5_lons, era5_lats),
+        ]
+
+        cf_last = None
+        for ax, heights, anom, title, wave_res, lons, lats in panel_data:
+            ax.set_extent([-180, 180, 20, 90], crs=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.5)
+            ax.gridlines(draw_labels=False, linewidth=0.5, color='gray',
+                         alpha=0.4, linestyle='--')
+
+            cf = ax.contourf(lons, lats, anom, levels=anom_levels, cmap=cmap,
+                             transform=ccrs.PlateCarree(), extend='both')
+            cs = ax.contour(lons, lats, heights, levels=height_levels[::2],
+                            colors='black', linewidths=0.8,
+                            transform=ccrs.PlateCarree(), alpha=0.7)
+            ax.clabel(cs, inline=True, fontsize=7, fmt='%d')
+
+            wn  = wave_res.get('wave_number', '?')
+            ax.set_title(f"{title}\nWave #{wn}", fontsize=11, fontweight='bold')
+            cf_last = cf
+
+        # Shared colorbar
+        cbar = fig.colorbar(cf_last, ax=axes, orientation='horizontal',
+                            pad=0.04, shrink=0.6, fraction=0.03)
+        cbar.set_label('500mb Height Anomaly (dam)', fontsize=10)
+
+        fig.suptitle('Pattern Comparison: Analog vs Current GFS', fontsize=13,
+                     fontweight='bold', y=1.01)
+
+        buf = BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=110)
+        buf.seek(0)
+        img_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        plt.close(fig)
+
+        return jsonify({
+            "success": True,
+            "map_image": img_b64,
+            "analog_date": analog_time.strftime('%Y-%m-%d'),
+            "gfs_init":    gfs_init.strftime('%Y-%m-%d %HZ'),
+            "analog_wave": era5_wave.get('wave_number'),
+            "current_wave": gfs_wave.get('wave_number'),
+        })
+
+    except Exception as e:
+        logger.error(f"Error generating analog comparison map: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/era5/analogs')
+def api_era5_analogs():
+    """
+    Find historical analog dates with similar 500mb height patterns.
+
+    Query params:
+        - top_n:  Number of top analogs to return (default: 10)
+        - method: 'composite' (default), 'lat_pearson', or 'pearson' (legacy)
+
+    Returns:
+        JSON with analog dates sorted by composite pattern similarity
+    """
+    try:
+        import xarray as xr
+        import numpy as np
+        import pandas as pd
+
+        top_n = int(request.args.get('top_n', 10))
+        method = request.args.get('method', 'composite')
+
+        # Run the shared pattern-matching core
+        core = _find_analogs_core(top_n=top_n, method=method)
+
+        top_analogs     = core['top_analogs']
+        init_time       = core['init_time']
+        current_date_str = core['current_date_str']
+        current_wave_num = core['current_wave_num']
 
         # Load Fairfax weather data to calculate analog outcomes
         weather_path = Path("/Volumes/T7/Weather_Models/era5/Fairfax/reanalysis-era5-single-levels-timeseries-sfc1zs15i59.nc")
@@ -3888,128 +4211,412 @@ def api_era5_analogs():
                 for analog in top_analogs:
                     try:
                         analog_date = pd.Timestamp(analog['date'])
-                        # Calculate 14 days after analog date
                         end_date = analog_date + pd.Timedelta(days=14)
 
-                        # Select precipitation for next 14 days
-                        precip_subset = weather_ds['tp'].sel(
-                            valid_time=slice(analog_date, end_date)
-                        )
-
-                        # Sum precipitation (convert from m to inches: 1m = 39.3701 inches)
-                        # ERA5 tp is in meters of water equivalent
+                        precip_subset = weather_ds['tp'].sel(valid_time=slice(analog_date, end_date))
                         total_precip_m = float(precip_subset.sum().values)
-                        total_precip_in = total_precip_m * 39.3701
-                        analog['precip_14d'] = round(total_precip_in, 2)
+                        analog['precip_14d'] = round(total_precip_m * 39.3701, 2)
 
-                        # Select temperature for next 14 days
-                        temp_subset = weather_ds['t2m'].sel(
-                            valid_time=slice(analog_date, end_date)
-                        )
-
-                        # Calculate average temperature (convert from Kelvin to Fahrenheit)
+                        temp_subset = weather_ds['t2m'].sel(valid_time=slice(analog_date, end_date))
                         avg_temp_k = float(temp_subset.mean().values)
-                        avg_temp_f = (avg_temp_k - 273.15) * 9/5 + 32
-                        analog['temp_14d'] = round(avg_temp_f, 1)
+                        analog['temp_14d'] = round((avg_temp_k - 273.15) * 9/5 + 32, 1)
 
                     except Exception as e:
                         logger.warning(f"Could not get weather data for analog {analog['date']}: {e}")
                         analog['precip_14d'] = None
                         analog['temp_14d'] = None
 
-                # Calculate average precipitation across all analogs
                 precip_values = [a['precip_14d'] for a in top_analogs if a.get('precip_14d') is not None]
                 avg_precip = round(np.mean(precip_values), 2) if precip_values else None
 
-                # Calculate average temperature across all analogs
                 temp_values = [a['temp_14d'] for a in top_analogs if a.get('temp_14d') is not None]
                 avg_temp = round(np.mean(temp_values), 1) if temp_values else None
 
-                # Calculate climatological normals for current time of year
                 try:
                     current_month = init_time.month
-                    current_day = init_time.day
-
-                    # Get all years of data for this approximate time of year
-                    climatology_precip = []
-                    climatology_temp = []
+                    current_day   = init_time.day
+                    climatology_precip: list = []
+                    climatology_temp: list = []
 
                     for year in range(1940, 2026):
                         try:
                             start_date = pd.Timestamp(year=year, month=current_month, day=current_day)
-                            end_date = start_date + pd.Timedelta(days=14)
+                            end_date   = start_date + pd.Timedelta(days=14)
 
-                            # Precipitation climatology
-                            clim_precip = weather_ds['tp'].sel(
-                                valid_time=slice(start_date, end_date)
-                            )
-                            total_precip_m = float(clim_precip.sum().values)
-                            if not np.isnan(total_precip_m):
-                                total_precip_in = total_precip_m * 39.3701
-                                climatology_precip.append(total_precip_in)
+                            cp_sum = float(weather_ds['tp'].sel(valid_time=slice(start_date, end_date)).sum().values)
+                            if not np.isnan(cp_sum):
+                                climatology_precip.append(cp_sum * 39.3701)
 
-                            # Temperature climatology
-                            clim_temp = weather_ds['t2m'].sel(
-                                valid_time=slice(start_date, end_date)
-                            )
-                            avg_temp_k = float(clim_temp.mean().values)
-                            if not np.isnan(avg_temp_k):
-                                avg_temp_f = (avg_temp_k - 273.15) * 9/5 + 32
-                                climatology_temp.append(avg_temp_f)
-
-                        except:
+                            ct_mean = float(weather_ds['t2m'].sel(valid_time=slice(start_date, end_date)).mean().values)
+                            if not np.isnan(ct_mean):
+                                climatology_temp.append((ct_mean - 273.15) * 9/5 + 32)
+                        except Exception:
                             continue
 
                     climatology_normal_precip = round(np.mean(climatology_precip), 2) if climatology_precip else None
-                    climatology_normal_temp = round(np.mean(climatology_temp), 1) if climatology_temp else None
+                    climatology_normal_temp   = round(np.mean(climatology_temp), 1)   if climatology_temp   else None
 
                 except Exception as e:
                     logger.warning(f"Could not calculate climatology: {e}")
                     climatology_normal_precip = None
-                    climatology_normal_temp = None
+                    climatology_normal_temp   = None
 
             except Exception as e:
                 logger.warning(f"Could not load Fairfax weather data: {e}")
-                avg_precip = None
-                avg_temp = None
-                climatology_normal_precip = None
-                climatology_normal_temp = None
+                avg_precip = avg_temp = None
+                climatology_normal_precip = climatology_normal_temp = None
         else:
             logger.warning(f"Fairfax weather data not found at {weather_path}")
-            avg_precip = None
-            avg_temp = None
-            climatology_normal_precip = None
-            climatology_normal_temp = None
+            avg_precip = avg_temp = None
+            climatology_normal_precip = climatology_normal_temp = None
 
         # Save prediction to history
         if avg_precip is not None and avg_temp is not None:
-            # Calculate average correlation from top analogs
-            avg_correlation = sum(a['correlation'] for a in top_analogs) / len(top_analogs) if top_analogs else 0
-
+            avg_correlation = (sum(a['correlation'] for a in top_analogs) / len(top_analogs)) if top_analogs else 0
             save_analog_prediction(
                 target_date=current_date_str,
                 analog_precip=avg_precip,
                 analog_temp=avg_temp,
-                climatology_precip=climatology_normal_precip if climatology_normal_precip else 0,
-                climatology_temp=climatology_normal_temp if climatology_normal_temp else 0,
+                climatology_precip=climatology_normal_precip or 0,
+                climatology_temp=climatology_normal_temp or 0,
                 top_analogs=[{'date': a['date'], 'correlation': a['correlation']} for a in top_analogs],
-                avg_correlation=avg_correlation
+                avg_correlation=avg_correlation,
             )
 
-        # Return top N
         return jsonify({
             "success": True,
             "current_date": current_date_str,
             "current_wave_number": current_wave_num,
+            "method": method,
             "analogs": top_analogs,
             "avg_precip_14d": avg_precip,
             "avg_temp_14d": avg_temp,
             "climatology_precip_14d": climatology_normal_precip,
-            "climatology_temp_14d": climatology_normal_temp
+            "climatology_temp_14d": climatology_normal_temp,
         })
 
     except Exception as e:
         logger.error(f"Error finding analogs: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)})
+
+
+def load_conus_precip_for_dates(dates, days=14):
+    """
+    Load ERA5 CONUS precipitation for specified date ranges.
+
+    Args:
+        dates: List of pd.Timestamp objects
+        days: Number of days to include after each date
+
+    Returns:
+        xarray.Dataset with precipitation data
+    """
+    import glob
+    import xarray as xr
+    from pathlib import Path
+
+    conus_precip_dir = Path("/Volumes/T7/Weather_Models/era5/conus_daily_precip")
+
+    # Find all needed files
+    all_files = sorted(glob.glob(str(conus_precip_dir / "era5_tp_daily_CONUS_*_M*.nc")))
+
+    if not all_files:
+        raise FileNotFoundError(f"No CONUS precipitation files found in {conus_precip_dir}")
+
+    # Load with xarray
+    ds = xr.open_mfdataset(all_files, combine='by_coords', parallel=True, engine='netcdf4')
+
+    return ds
+
+
+def load_conus_temp_for_dates(dates, days=14):
+    """
+    Load ERA5 CONUS 2m temperature for specified date ranges.
+
+    Args:
+        dates: List of pd.Timestamp objects
+        days: Number of days to include after each date
+
+    Returns:
+        xarray.Dataset with temperature data
+    """
+    import glob
+    import xarray as xr
+    from pathlib import Path
+
+    conus_temp_dir = Path("/Volumes/T7/Weather_Models/era5/conus_daily_temp")
+
+    # Find all needed files
+    all_files = sorted(glob.glob(str(conus_temp_dir / "era5_t2m_daily_CONUS_*_M*.nc")))
+
+    if not all_files:
+        raise FileNotFoundError(f"No CONUS temperature files found in {conus_temp_dir}. Please download temperature data using: python3 era5_bulk_download.py --dataset temp --start-year 1990 --end-year 2020 --chunk-months 1")
+
+    # Load with xarray
+    ds = xr.open_mfdataset(all_files, combine='by_coords', parallel=True, engine='netcdf4')
+
+    return ds
+
+
+def load_conus_climatology(variable, cache={}):
+    """
+    Load and cache climatology files.
+
+    Args:
+        variable: 'precip' or 'temp'
+        cache: Dictionary for caching loaded datasets
+
+    Returns:
+        xarray.Dataset with climatology data
+    """
+    import xarray as xr
+    from pathlib import Path
+
+    if variable in cache:
+        return cache[variable]
+
+    clim_dir = Path("/Volumes/T7/Weather_Models/era5")
+
+    if variable == 'precip':
+        clim_file = clim_dir / 'conus_precip_climatology_14day.nc'
+    elif variable == 'temp':
+        clim_file = clim_dir / 'conus_temp_climatology_14day.nc'
+    else:
+        raise ValueError(f"Unknown variable: {variable}")
+
+    if not clim_file.exists():
+        raise FileNotFoundError(
+            f"Climatology file not found: {clim_file}. "
+            f"Please compute climatology using: "
+            f"python3 era5_bulk_download.py --dataset climatology --start-year 1990 --end-year 2020"
+        )
+
+    ds = xr.open_dataset(clim_file)
+    cache[variable] = ds
+
+    return ds
+
+
+def compute_analog_grid(ds, dates, variable_name, days=14, aggregation='sum'):
+    """
+    Compute 14-day windows for all analogs and return averaged grid.
+
+    Args:
+        ds: xarray.Dataset with the variable data
+        dates: List of analog dates (pd.Timestamp objects)
+        variable_name: Name of variable in dataset ('tp' or 't2m')
+        days: Number of days in window (default 14)
+        aggregation: 'sum' for precipitation, 'mean' for temperature
+
+    Returns:
+        numpy array with shape (lat, lon) containing averaged analog values
+    """
+    import pandas as pd
+    import numpy as np
+
+    analog_grids = []
+
+    for analog_date in dates:
+        try:
+            end_date = analog_date + pd.Timedelta(days=days - 1)  # 14 days inclusive
+
+            # Select the time window
+            window_data = ds[variable_name].sel(time=slice(analog_date, end_date))
+
+            # Check if we have enough data
+            if len(window_data.time) < 10:  # Require at least 10 days
+                logger.warning(f"Insufficient data for analog date {analog_date}: only {len(window_data.time)} days")
+                continue
+
+            # Aggregate
+            if aggregation == 'sum':
+                analog_value = window_data.sum(dim='time')
+            else:  # mean
+                analog_value = window_data.mean(dim='time')
+
+            analog_grids.append(analog_value.values)
+
+        except Exception as e:
+            logger.warning(f"Failed to process analog date {analog_date}: {e}")
+            continue
+
+    if not analog_grids:
+        raise ValueError("No valid analog grids computed")
+
+    # Average across all analogs
+    avg_grid = np.mean(analog_grids, axis=0)
+
+    return avg_grid
+
+
+@app.route('/api/era5/analogs-conus')
+def api_era5_analogs_conus():
+    """
+    Find historical analog dates (reuse existing logic) and compute
+    14-day precipitation and temperature outcomes for entire CONUS grid.
+
+    Query params:
+        - top_n: Number of analogs (default 10)
+        - variable: 'precip', 'temp', or 'both' (default 'both')
+
+    Returns:
+        JSON with gridded analog and climatology data
+    """
+    try:
+        import xarray as xr
+        import numpy as np
+        import pandas as pd
+
+        top_n = int(request.args.get('top_n', 10))
+        variable_filter = request.args.get('variable', 'both')
+        method = request.args.get('method', 'composite')
+
+        # ========== STEP 1: PATTERN MATCHING (shared core) ==========
+        core = _find_analogs_core(top_n=top_n, method=method)
+
+        top_analogs      = core['top_analogs']
+        init_time        = core['init_time']
+        current_date_str = core['current_date_str']
+        current_wave_num = core['current_wave_num']
+        current_doy      = init_time.dayofyear
+
+        analog_dates     = [pd.Timestamp(a['date']) for a in top_analogs]
+        analog_date_strs = [a['date'] for a in top_analogs]
+
+        # Build analog_correlations list for UI display
+        analog_correlations = [
+            {
+                'date': a['date'],
+                'correlation': a.get('correlation'),
+                'composite_score': a.get('composite_score'),
+            }
+            for a in top_analogs
+        ]
+
+        # ========== STEP 2: LOAD CONUS DATA AND COMPUTE GRIDS ==========
+
+        result = {
+            "success": True,
+            "current_date": current_date_str,
+            "current_wave_number": current_wave_num,
+            "method": method,
+            "analog_dates": analog_date_strs,
+            "analog_correlations": analog_correlations,
+            "grid": {},
+            "precip": None,
+            "temp": None,
+        }
+
+        # Process precipitation if requested
+        if variable_filter in ['precip', 'both']:
+            try:
+                logger.info("Loading CONUS precipitation data...")
+                precip_ds = load_conus_precip_for_dates(analog_dates)
+
+                logger.info("Computing precipitation analog grid...")
+                avg_precip_grid = compute_analog_grid(precip_ds, analog_dates, 'tp', days=14, aggregation='sum')
+
+                logger.info("Loading precipitation climatology...")
+                precip_clim_ds = load_conus_climatology('precip')
+                clim_precip = precip_clim_ds['precip_14d_clim'].sel(doy=current_doy).values
+
+                # Calculate anomalies
+                anomaly_precip = avg_precip_grid - clim_precip
+
+                # Avoid division by zero, use small epsilon
+                clim_precip_safe = np.where(clim_precip > 0.1, clim_precip, np.nan)
+                anomaly_percent = 100 * (avg_precip_grid - clim_precip) / clim_precip_safe
+
+                # Convert mm to inches (1 mm = 1/25.4 inches)
+                avg_precip_grid_in = avg_precip_grid / 25.4
+                clim_precip_in = clim_precip / 25.4
+                anomaly_precip_in = anomaly_precip / 25.4
+
+                # Store grid coordinates (same for both variables)
+                if not result['grid']:
+                    result['grid'] = {
+                        'latitudes': precip_ds.latitude.values.tolist(),
+                        'longitudes': precip_ds.longitude.values.tolist()
+                    }
+
+                result['precip'] = {
+                    'analog_mm': avg_precip_grid.tolist(),
+                    'climatology_mm': clim_precip.tolist(),
+                    'anomaly_mm': anomaly_precip.tolist(),
+                    'analog_in': avg_precip_grid_in.tolist(),
+                    'climatology_in': clim_precip_in.tolist(),
+                    'anomaly_in': anomaly_precip_in.tolist(),
+                    'anomaly_percent': np.where(np.isfinite(anomaly_percent), anomaly_percent, 0).tolist()
+                }
+
+                logger.info(f"Precipitation grid computed: {avg_precip_grid.shape}")
+
+                # Cleanup
+                precip_ds.close()
+                precip_clim_ds.close()
+
+            except Exception as e:
+                logger.error(f"Failed to process precipitation: {e}", exc_info=True)
+                result['precip_error'] = str(e)
+
+        # Process temperature if requested
+        if variable_filter in ['temp', 'both']:
+            try:
+                logger.info("Loading CONUS temperature data...")
+                temp_ds = load_conus_temp_for_dates(analog_dates)
+
+                logger.info("Computing temperature analog grid...")
+                avg_temp_grid = compute_analog_grid(temp_ds, analog_dates, 't2m', days=14, aggregation='mean')
+
+                logger.info("Loading temperature climatology...")
+                temp_clim_ds = load_conus_climatology('temp')
+                clim_temp = temp_clim_ds['temp_14d_clim'].sel(doy=current_doy).values
+
+                # Calculate anomalies
+                anomaly_temp = avg_temp_grid - clim_temp
+
+                # Convert Celsius to Fahrenheit (°F = °C * 9/5 + 32)
+                avg_temp_grid_f = avg_temp_grid * 9/5 + 32
+                clim_temp_f = clim_temp * 9/5 + 32
+                anomaly_temp_f = anomaly_temp * 9/5  # Anomaly doesn't need +32 offset
+
+                # For temperature, percent anomaly is less meaningful, but calculate anyway
+                # Use absolute zero in Celsius (-273.15) offset to avoid division issues
+                temp_absolute = avg_temp_grid + 273.15
+                clim_absolute = clim_temp + 273.15
+                anomaly_percent_temp = 100 * (temp_absolute - clim_absolute) / clim_absolute
+
+                # Store grid coordinates if not already stored
+                if not result['grid']:
+                    result['grid'] = {
+                        'latitudes': temp_ds.latitude.values.tolist(),
+                        'longitudes': temp_ds.longitude.values.tolist()
+                    }
+
+                result['temp'] = {
+                    'analog_c': avg_temp_grid.tolist(),
+                    'climatology_c': clim_temp.tolist(),
+                    'anomaly_c': anomaly_temp.tolist(),
+                    'analog_f': avg_temp_grid_f.tolist(),
+                    'climatology_f': clim_temp_f.tolist(),
+                    'anomaly_f': anomaly_temp_f.tolist(),
+                    'anomaly_percent': np.where(np.isfinite(anomaly_percent_temp), anomaly_percent_temp, 0).tolist()
+                }
+
+                logger.info(f"Temperature grid computed: {avg_temp_grid.shape}")
+
+                # Cleanup
+                temp_ds.close()
+                temp_clim_ds.close()
+
+            except Exception as e:
+                logger.error(f"Failed to process temperature: {e}", exc_info=True)
+                result['temp_error'] = str(e)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error in CONUS analogs: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)})
 
 
@@ -4093,6 +4700,12 @@ def asos_verification_page():
 def rossby_page():
     """Rossby Wave Analysis page - shows wave patterns and predictability."""
     return render_template('rossby.html')
+
+
+@app.route('/single-run-bias')
+def single_run_bias_page():
+    """Single run bias map page - shows model bias for a specific forecast run."""
+    return render_template('single_run_bias.html')
 
 
 @app.route('/api/observations')
@@ -4994,39 +5607,33 @@ def api_asos_station_verification():
 
     try:
         if period == 'monthly':
+            # get_station_detail_monthly returns a flat structure with pre-computed arrays
             raw_result = asos.get_station_detail_monthly(station_id, model, days_back=30)
+            if "error" in raw_result:
+                return jsonify({"success": False, "error": raw_result["error"]}), 404
+
+            verification_data = {
+                "lead_times": raw_result["lead_times"],
+                "temp_mae": raw_result["temp_mae"],
+                "temp_bias": raw_result["temp_bias"],
+                "precip_mae": raw_result["precip_mae"],
+                "precip_bias": raw_result["precip_bias"],
+            }
         else:
-            raw_result = asos.get_station_detail(station_id, model)
+            # Use the precomputed verification cache which uses composite observation matching.
+            # This correctly finds temperature (from :56 METARs) even when MSLP-only
+            # reports at :00 are the single-nearest observation.
+            raw_result = asos.get_station_detail_from_cache(station_id, model)
+            if "error" in raw_result:
+                return jsonify({"success": False, "error": raw_result["error"]}), 404
 
-        if "error" in raw_result:
-            return jsonify({"success": False, "error": raw_result["error"]}), 404
-
-        lead_times = raw_result.get("lead_times", [])
-        data_by_lead_time = raw_result.get("data", {})
-
-        temp_mae = []
-        temp_bias = []
-        mslp_mae = []
-        mslp_bias = []
-
-        for lt in lead_times:
-            model_data = data_by_lead_time.get(lt, {}).get(model, {})
-            
-            temp_metrics = model_data.get("temp")
-            temp_mae.append(temp_metrics["mae"] if temp_metrics else None)
-            temp_bias.append(temp_metrics["bias"] if temp_metrics else None)
-
-            mslp_metrics = model_data.get("mslp")
-            mslp_mae.append(mslp_metrics["mae"] if mslp_metrics else None)
-            mslp_bias.append(mslp_metrics["bias"] if mslp_metrics else None)
-        
-        verification_data = {
-            "lead_times": lead_times,
-            "temp_mae": temp_mae,
-            "temp_bias": temp_bias,
-            "mslp_mae": mslp_mae,
-            "mslp_bias": mslp_bias,
-        }
+            verification_data = {
+                "lead_times": raw_result["lead_times"],
+                "temp_mae": raw_result["temp_mae"],
+                "temp_bias": raw_result["temp_bias"],
+                "precip_mae": raw_result["precip_mae"],
+                "precip_bias": raw_result["precip_bias"],
+            }
 
         return jsonify({
             "success": True,
@@ -5794,6 +6401,306 @@ def api_asos_status():
         return jsonify({"success": False, "error": str(e)})
 
 
+@app.route('/api/asos/available-runs')
+def api_asos_available_runs():
+    """Get list of available forecast runs for single run bias analysis."""
+    try:
+        # Load ASOS forecasts database
+        db = asos.load_asos_forecasts_db()
+
+        if not db or 'runs' not in db:
+            return jsonify({"success": False, "error": "No forecast data available"})
+
+        runs = db['runs']
+
+        # Convert to sorted list (most recent first)
+        run_list = [{"run_time": rt} for rt in sorted(runs.keys(), reverse=True)]
+
+        return jsonify({
+            "success": True,
+            "runs": run_list[:50]  # Limit to 50 most recent runs
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting available runs: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/asos/available-valid-times')
+def api_asos_available_valid_times():
+    """Get list of available observation/valid times for single run bias analysis.
+    Only returns synoptic times (00Z, 06Z, 12Z, 18Z) where we have observation data."""
+    try:
+        # Load ASOS forecasts database
+        db = asos.load_asos_forecasts_db()
+
+        if not db or 'observations' not in db:
+            return jsonify({"success": False, "error": "No observation data available"})
+
+        observations = db['observations']
+
+        # Collect synoptic times (00Z, 06Z, 12Z, 18Z) where we have observations
+        valid_times_set = set()
+
+        for station_id, station_obs in observations.items():
+            for obs_time_str in station_obs.keys():
+                obs_time = datetime.fromisoformat(obs_time_str)
+
+                # Only include synoptic times (00Z, 06Z, 12Z, 18Z)
+                if obs_time.hour in [0, 6, 12, 18] and obs_time.minute <= 5:
+                    # Round to exact synoptic hour
+                    synoptic_time = obs_time.replace(minute=0, second=0, microsecond=0)
+                    valid_times_set.add(synoptic_time.isoformat())
+
+        # Convert to sorted list (most recent first)
+        valid_times = sorted(valid_times_set, reverse=True)
+
+        return jsonify({
+            "success": True,
+            "valid_times": valid_times[:100]  # Limit to 100 most recent synoptic times
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting available valid times: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/asos/single-run-bias')
+def api_asos_single_run_bias():
+    """
+    Get bias data for a specific observation time and forecast lead time.
+
+    Query parameters:
+    - valid_time: ISO format datetime of the observation/valid time (required)
+    - lead_time: Forecast lead time in hours (required)
+    - variable: Variable to analyze ('temp', 'mslp', or 'precip', default 'temp')
+
+    Example: valid_time=2026-02-07T12:00:00Z, lead_time=12
+    This will use the forecast from 2026-02-07T00:00:00Z at F+12 hours
+    """
+    try:
+        valid_time_str = request.args.get('valid_time')
+        lead_time_str = request.args.get('lead_time')
+        variable = request.args.get('variable', 'temp')
+
+        if not valid_time_str or not lead_time_str:
+            return jsonify({"success": False, "error": "Missing required parameters"})
+
+        # Parse parameters
+        valid_time = datetime.fromisoformat(valid_time_str.replace('Z', '+00:00'))
+        lead_time = int(lead_time_str)
+
+        # Calculate run time (valid_time - lead_time)
+        run_time = valid_time - timedelta(hours=lead_time)
+
+        # Load ASOS forecasts database
+        db = asos.load_asos_forecasts_db()
+
+        if not db or 'runs' not in db or 'stations' not in db or 'observations' not in db:
+            return jsonify({"success": False, "error": "No forecast data available"})
+
+        runs = db['runs']
+        stations_meta = db['stations']
+        observations = db['observations']
+
+        # Check if this run exists
+        run_key = run_time.isoformat()
+        if run_key not in runs:
+            return jsonify({"success": False, "error": f"No forecast data for run {run_time.strftime('%Y-%m-%d %HZ')}"})
+
+        run_data = runs[run_key]
+
+        # Get forecast hours for this run
+        forecast_hours = run_data.get('forecast_hours', [])
+        if lead_time not in forecast_hours:
+            return jsonify({"success": False, "error": f"Lead time {lead_time}h not available for this run"})
+
+        # Find the index of this lead time
+        try:
+            lead_idx = forecast_hours.index(lead_time)
+        except ValueError:
+            return jsonify({"success": False, "error": f"Lead time {lead_time}h not found"})
+
+        # Variable name mapping
+        var_name_map = {
+            'temp': 'temps',
+            'mslp': 'mslps',
+            'precip': 'precips'
+        }
+        var_key = var_name_map.get(variable, variable + 's')
+
+        # Collect bias data for all stations
+        stations_data = {}
+        all_biases = {'gfs': [], 'aifs': [], 'ifs': [], 'nws': []}
+
+        # Helper function to get observation near valid time
+        # Uses composite observation matching to handle ASOS stations that report
+        # different variables at different times (MSLP every 5min, temp/precip hourly at :56)
+        def get_observation(station_id, valid_time):
+            if station_id not in observations:
+                return None
+
+            station_obs = observations[station_id]
+            max_delta = timedelta(minutes=30)
+
+            # Find nearest observation for each variable separately
+            best = {
+                'temp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
+                'mslp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
+                'precip': {'value': None, 'delta': max_delta + timedelta(seconds=1)}
+            }
+
+            # Search through all observations to find nearest for each variable
+            for obs_time_str, obs_data in station_obs.items():
+                try:
+                    obs_time = datetime.fromisoformat(obs_time_str)
+                    delta = abs(obs_time - valid_time)
+
+                    if delta > max_delta:
+                        continue
+
+                    # Check each variable and update if this observation is closer
+                    if obs_data.get('temp') is not None and delta < best['temp']['delta']:
+                        best['temp']['value'] = obs_data['temp']
+                        best['temp']['delta'] = delta
+
+                    if obs_data.get('mslp') is not None and delta < best['mslp']['delta']:
+                        best['mslp']['value'] = obs_data['mslp']
+                        best['mslp']['delta'] = delta
+
+                    if obs_data.get('precip') is not None and delta < best['precip']['delta']:
+                        best['precip']['value'] = obs_data['precip']
+                        best['precip']['delta'] = delta
+
+                except (ValueError, AttributeError):
+                    continue
+
+            # Build composite observation from nearest source for each variable
+            if all(best[v]['value'] is None for v in ['temp', 'mslp', 'precip']):
+                return None
+
+            return {
+                'temp': best['temp']['value'],
+                'mslp': best['mslp']['value'],
+                'precip': best['precip']['value']
+            }
+
+        # Process each station
+        for station_id, station_meta in stations_meta.items():
+            station_info = {
+                'name': station_meta['name'],
+                'lat': station_meta['lat'],
+                'lon': station_meta['lon']
+            }
+
+            # Get observation for this valid time
+            obs = get_observation(station_id, valid_time)
+            if not obs or variable not in obs or obs[variable] is None:
+                continue
+
+            observed_value = obs[variable]
+
+            # Get forecast for each model
+            for model in ['gfs', 'aifs', 'ifs', 'nws']:
+                if model not in run_data:
+                    continue
+
+                model_stations = run_data[model]
+                if station_id not in model_stations:
+                    continue
+
+                station_fcst = model_stations[station_id]
+                if var_key not in station_fcst:
+                    continue
+
+                forecast_values = station_fcst[var_key]
+                if not forecast_values or len(forecast_values) <= lead_idx:
+                    continue
+
+                forecast_value = forecast_values[lead_idx]
+                if forecast_value is None:
+                    continue
+
+                # Calculate bias (forecast - observed)
+                bias = forecast_value - observed_value
+
+                # Add to station data
+                if station_id not in stations_data:
+                    stations_data[station_id] = station_info.copy()
+
+                stations_data[station_id][model] = {
+                    'bias': bias,
+                    'forecast': forecast_value,
+                    'observed': observed_value
+                }
+
+                all_biases[model].append(bias)
+
+        if not stations_data:
+            return jsonify({"success": False, "error": "No matching data for this run and lead time"})
+
+        # Calculate min/max for color scale (symmetric around 0 for bias)
+        all_bias_values = []
+        for model_biases in all_biases.values():
+            all_bias_values.extend(model_biases)
+
+        # Set color scale ranges based on variable
+        if variable == 'temp':
+            # Fixed scale for temperature for consistency across runs
+            min_value = -10.0
+            max_value = 10.0
+        elif variable == 'precip':
+            # Dynamic scale for precipitation (small values)
+            if all_bias_values:
+                max_abs = max(abs(min(all_bias_values)), abs(max(all_bias_values)))
+                max_abs = max(max_abs, 0.5)  # Minimum ±0.5 inches
+                min_value = -max_abs
+                max_value = max_abs
+            else:
+                min_value = -1.0
+                max_value = 1.0
+        else:
+            # Dynamic scale for pressure
+            if all_bias_values:
+                max_abs = max(abs(min(all_bias_values)), abs(max(all_bias_values)))
+                max_abs = max(max_abs, 5.0)  # Minimum ±5 mb
+                min_value = -max_abs
+                max_value = max_abs
+            else:
+                min_value = -10.0
+                max_value = 10.0
+
+        # Calculate summary statistics for each model
+        summary = {}
+        for model in ['gfs', 'aifs', 'ifs', 'nws']:
+            if all_biases[model]:
+                biases = np.array(all_biases[model])
+                summary[model] = {
+                    'mean': float(np.mean(biases)),
+                    'median': float(np.median(biases)),
+                    'std': float(np.std(biases)),
+                    'count': len(biases)
+                }
+
+        return jsonify({
+            "success": True,
+            "stations": stations_data,
+            "min_value": min_value,
+            "max_value": max_value,
+            "summary": summary,
+            "run_time": run_time.isoformat(),
+            "valid_time": valid_time.isoformat(),
+            "lead_time": lead_time,
+            "variable": variable
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting single run bias: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)})
+
+
 @app.route('/shutdown', methods=['POST'])
 def shutdown():
     """Shutdown the Flask server."""
@@ -5807,6 +6714,101 @@ def shutdown():
     else:
         func()
     return jsonify({"success": True, "message": "Server shutting down..."})
+
+
+def _eof_precompute_thread():
+    """Background thread that builds/loads the EOF cache at startup."""
+    global _EOF_CACHE
+
+    try:
+        if not _HAS_ANALOG_METRICS:
+            logger.info("EOF pre-compute skipped: analog_metrics unavailable")
+            return
+
+        era5_path = Path("/Volumes/T7/Weather_Models/era5/global_500mb")
+        if not era5_path.exists():
+            logger.info("EOF pre-compute skipped: ERA5 path not found")
+            return
+
+        era5_files = sorted(era5_path.glob("era5_z500_NH_*.nc"))
+        if not era5_files:
+            logger.info("EOF pre-compute skipped: no ERA5 files")
+            return
+
+        # Try loading from disk first
+        cache = _analog_metrics.load_eof_cache(era5_files=era5_files)
+
+        if cache is None:
+            logger.info("EOF cache stale or missing – rebuild not triggered automatically at startup")
+            logger.info("Tip: POST /api/era5/rebuild-eof-cache to rebuild")
+        else:
+            _EOF_CACHE = cache
+            logger.info("EOF cache loaded successfully (%d timesteps)", len(cache['times']))
+
+    except Exception as e:
+        logger.warning("EOF precompute thread error: %s", e)
+    finally:
+        _EOF_CACHE_READY.set()
+
+
+# Start EOF precompute in background when module loads (non-blocking)
+_eof_thread = threading.Thread(target=_eof_precompute_thread, daemon=True, name="eof-precompute")
+_eof_thread.start()
+
+
+@app.route('/api/era5/rebuild-eof-cache', methods=['POST'])
+def api_rebuild_eof_cache():
+    """Trigger an EOF cache rebuild in a background thread (long-running)."""
+    global _EOF_CACHE
+
+    if not _HAS_ANALOG_METRICS:
+        return jsonify({"success": False, "error": "analog_metrics module not available"})
+
+    def _rebuild():
+        global _EOF_CACHE
+        try:
+            import xarray as xr
+            import pandas as pd
+
+            era5_path  = Path("/Volumes/T7/Weather_Models/era5/global_500mb")
+            era5_files = sorted(era5_path.glob("era5_z500_NH_*.nc"))
+
+            datasets = [xr.open_dataset(f) for f in era5_files]
+            ds = xr.concat(datasets, dim='time').sortby('time')
+
+            # Need climatology for anomaly calculation
+            # Use _CLIMATOLOGY_CACHE if available; otherwise build a minimal one
+            cache_key = (
+                tuple(str(f) for f in era5_files),
+            )
+            # Find any cached climatology that uses these files
+            matched_clim = None
+            for k, v in _CLIMATOLOGY_CACHE.items():
+                if k[0] == tuple(str(f) for f in era5_files):
+                    matched_clim = v
+                    break
+
+            if matched_clim is None:
+                logger.info("EOF rebuild: no climatology cache found; skipping EOF build")
+                return
+
+            pressure_coord = None
+            for c in ['pressure_level', 'level', 'plev', 'lev']:
+                if c in ds.coords or c in ds.dims:
+                    pressure_coord = c
+                    break
+
+            _analog_metrics.build_eof_cache(ds, matched_clim, pressure_coord=pressure_coord)
+            new_cache = _analog_metrics.load_eof_cache(force_rebuild=False)
+            if new_cache:
+                _EOF_CACHE = new_cache
+                logger.info("EOF cache rebuilt and loaded")
+        except Exception as e:
+            logger.error("EOF rebuild failed: %s", e, exc_info=True)
+
+    t = threading.Thread(target=_rebuild, daemon=True, name="eof-rebuild")
+    t.start()
+    return jsonify({"success": True, "message": "EOF cache rebuild started in background"})
 
 
 if __name__ == '__main__':
