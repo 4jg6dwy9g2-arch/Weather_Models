@@ -239,6 +239,11 @@
                     500mb Heights
                 </button>
             </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="conus-analogs-tab" data-bs-toggle="tab" data-bs-target="#conusAnalogsPane" type="button" role="tab" aria-controls="conusAnalogsPane" aria-selected="false">
+                    CONUS Analogs
+                </button>
+            </li>
         </ul>
 
         <div class="tab-content" id="eraSubContent">
@@ -305,14 +310,24 @@
                                 <strong>Current Pattern:</strong> <span id="analog-current-date">--</span>
                                 <small class="text-muted ms-2">(Latest 00Z forecast initialization)</small>
                             </div>
-                            <div class="mb-3">
-                                <label class="form-label">Number of analogs to find:</label>
-                                <select class="form-select form-select-sm" id="analog-count" style="width: auto;">
-                                    <option value="5">Top 5</option>
-                                    <option value="10" selected>Top 10</option>
-                                    <option value="20">Top 20</option>
-                                    <option value="50">Top 50</option>
-                                </select>
+                            <div class="mb-3 d-flex align-items-end gap-3 flex-wrap">
+                                <div>
+                                    <label class="form-label">Number of analogs:</label>
+                                    <select class="form-select form-select-sm" id="analog-count" style="width: auto;">
+                                        <option value="5">Top 5</option>
+                                        <option value="10" selected>Top 10</option>
+                                        <option value="20">Top 20</option>
+                                        <option value="50">Top 50</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="form-label">Scoring method:</label>
+                                    <select class="form-select form-select-sm" id="analog-method" style="width: auto;">
+                                        <option value="composite" selected>Composite (recommended)</option>
+                                        <option value="lat_pearson">Lat-weighted Pearson</option>
+                                        <option value="pearson">Legacy Pearson</option>
+                                    </select>
+                                </div>
                             </div>
                             <button class="btn btn-primary" onclick="loadAnalogs()">
                                 <i class="bi bi-search"></i> Find Analogs
@@ -363,15 +378,17 @@
                                         </div>
                                     </div>
                                 </div>
-                                <h6>Most Similar Historical Dates:</h6>
+                                <h6>Most Similar Historical Dates: <small class="text-muted fw-normal">click a date to compare its 500mb pattern vs. today's GFS</small></h6>
                                 <div class="table-responsive">
                                     <table class="table table-sm table-hover">
                                         <thead>
                                             <tr>
                                                 <th>Rank</th>
                                                 <th>Date</th>
-                                                <th>Similarity</th>
-                                                <th>Wave Number</th>
+                                                <th>Score</th>
+                                                <th title="Latitude-weighted spatial Pearson correlation of z500 anomalies">Pattern</th>
+                                                <th title="Spatial gradient field correlation – captures ridge/trough positions">Circulation</th>
+                                                <th>Wave #</th>
                                                 <th>14-Day Precip</th>
                                                 <th>14-Day Avg Temp</th>
                                                 <th>Days Ago</th>
@@ -381,11 +398,31 @@
                                         </tbody>
                                     </table>
                                 </div>
+
+                                <!-- Pattern comparison card (shown on date click) -->
+                                <div id="analog-compare-card" class="card mt-3" style="display:none;">
+                                    <div class="card-header d-flex justify-content-between align-items-center">
+                                        <span><i class="bi bi-map"></i> Pattern Comparison: <span id="analog-compare-title" class="fw-semibold">--</span></span>
+                                        <button class="btn btn-sm btn-outline-secondary" onclick="closeAnalogCompare()"><i class="bi bi-x"></i></button>
+                                    </div>
+                                    <div class="card-body">
+                                        <div id="analog-compare-loading" class="text-center py-4" style="display:none;">
+                                            <div class="spinner-border text-primary" role="status"></div>
+                                            <p class="mt-2 text-muted">Fetching ERA5 &amp; live GFS data…</p>
+                                        </div>
+                                        <div id="analog-compare-error" class="alert alert-warning" style="display:none;"></div>
+                                        <div id="analog-compare-img-wrap" style="display:none; text-align:center;">
+                                            <img id="analog-compare-img" src="" alt="Pattern comparison" style="max-width:100%; border-radius:8px;">
+                                            <p class="text-muted small mt-2" id="analog-compare-caption"></p>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                             <div class="alert alert-info mt-3 mb-0">
                                 <strong>About Analog Forecasting:</strong> This tool finds historical dates with similar 500mb height patterns
-                                to the current forecast. Similar patterns often lead to similar weather outcomes, making analogs useful for
-                                understanding possible future scenarios. Pattern similarity is measured using spatial correlation.
+                                to the current forecast. Similar patterns often lead to similar weather outcomes. The <strong>Composite</strong>
+                                method combines area-weighted pattern correlation (<em>Pattern</em>), gradient-field correlation (<em>Circulation</em>),
+                                and amplitude similarity — giving a more physically meaningful match than plain Pearson.
                             </div>
                         </div>
                     </div>
@@ -451,6 +488,114 @@
                     </div>
                 </div>
             </div><!-- End 500mb Heights subtab -->
+
+            <!-- CONUS Analogs subtab -->
+            <div class="tab-pane fade" id="conusAnalogsPane" role="tabpanel" aria-labelledby="conus-analogs-tab">
+                <!-- Control Panel -->
+                <div class="card mb-4">
+                    <div class="card-body">
+                        <div class="row align-items-end">
+                            <div class="col-md-3">
+                                <label for="conus-analog-count" class="form-label">Number of Analogs</label>
+                                <select class="form-select" id="conus-analog-count">
+                                    <option value="5">Top 5</option>
+                                    <option value="10" selected>Top 10</option>
+                                    <option value="20">Top 20</option>
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <label for="conus-analog-variable" class="form-label">Variable</label>
+                                <select class="form-select" id="conus-analog-variable">
+                                    <option value="precip" selected>Precipitation</option>
+                                    <option value="temp">Temperature</option>
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <button id="load-conus-analogs-btn" class="btn btn-primary w-100">
+                                    <i class="bi bi-search"></i> Find CONUS Analogs
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Loading/Error States -->
+                <div id="conus-analog-loading" class="text-center py-5" style="display: none;">
+                    <div class="spinner-border text-primary" role="status"></div>
+                    <p class="mt-2">Computing CONUS analog patterns (this may take 20-30 seconds)...</p>
+                </div>
+                <div id="conus-analog-error" class="alert alert-danger" style="display: none;"></div>
+
+                <!-- Summary Stats -->
+                <div class="row mb-3" id="conus-summary-stats" style="display:none;">
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6 class="text-muted mb-1">CONUS Avg Anomaly</h6>
+                                <h4 id="conus-avg-anomaly" class="mb-0">--</h4>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6 class="text-muted mb-1">Above Normal</h6>
+                                <h4 id="conus-pct-above" class="mb-0">--</h4>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6 class="text-muted mb-1">Below Normal</h6>
+                                <h4 id="conus-pct-below" class="mb-0">--</h4>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6 class="text-muted mb-1">Current Wave #</h6>
+                                <h4 id="conus-wave-number" class="mb-0">--</h4>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Heatmap Container -->
+                <div class="card mb-4" id="conus-heatmap-card" style="display:none;">
+                    <div class="card-header">
+                        <i class="bi bi-map"></i> <span id="conus-heatmap-title">14-Day Precipitation Analog</span>
+                    </div>
+                    <div class="card-body">
+                        <div id="conus-analog-heatmap" style="height: 600px;"></div>
+                    </div>
+                </div>
+
+                <!-- Analog Date Table -->
+                <div class="card" id="conus-analog-table-card" style="display:none;">
+                    <div class="card-header">
+                        <i class="bi bi-calendar-check"></i> Analog Dates
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-sm" id="conus-analog-table">
+                                <thead>
+                                    <tr>
+                                        <th>Rank</th>
+                                        <th>Date</th>
+                                        <th>Correlation</th>
+                                        <th>Days Ago</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="conus-analog-table-body">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+            </div><!-- End CONUS Analogs subtab -->
         </div><!-- End ERA subtab content -->
     </div><!-- End ERA Reanalysis tab -->
 </div><!-- End tab-content -->
@@ -1184,13 +1329,14 @@ function loadEraData() {
 let mapLoadInProgress = false;
 
 function loadAnalogs() {
-    const count = document.getElementById('analog-count').value;
+    const count  = document.getElementById('analog-count').value;
+    const method = document.getElementById('analog-method')?.value || 'composite';
 
     document.getElementById('analog-loading').style.display = 'block';
     document.getElementById('analog-error').style.display = 'none';
     document.getElementById('analog-results').style.display = 'none';
 
-    fetch(`/api/era5/analogs?top_n=${count}`)
+    fetch(`/api/era5/analogs?top_n=${count}&method=${method}`)
         .then(response => {
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
@@ -1309,11 +1455,38 @@ function loadAnalogs() {
                     ? `${analog.temp_14d.toFixed(1)}°F`
                     : 'N/A';
 
+                // Primary score badge
+                const score = analog.composite_score != null
+                    ? analog.composite_score
+                    : analog.correlation;
+                const scorePct = (score * 100).toFixed(1);
+                const scoreColor = score >= 0.7 ? 'bg-success' : score >= 0.55 ? 'bg-warning text-dark' : 'bg-secondary';
+
+                // Sub-scores (Pattern = lat_pearson via correlation field, Circulation = grad_corr)
+                const patternStr = analog.correlation != null
+                    ? `<small class="text-muted">${(analog.correlation * 100).toFixed(1)}%</small>`
+                    : '<small class="text-muted">—</small>';
+                const circStr = analog.grad_corr != null
+                    ? `<small class="text-muted">${(analog.grad_corr * 100).toFixed(1)}%</small>`
+                    : '<small class="text-muted">—</small>';
+
+                // Date string for compare endpoint (YYYY-MM-DD)
+                const analogDateStr = analogDate.toISOString().split('T')[0];
+
                 const row = document.createElement('tr');
                 row.innerHTML = `
                     <td>${index + 1}</td>
-                    <td><strong>${analogDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}</strong></td>
-                    <td><span class="badge bg-success">${(analog.correlation * 100).toFixed(1)}%</span></td>
+                    <td>
+                        <a href="#" class="fw-semibold text-decoration-none analog-date-link"
+                           onclick="loadAnalogCompare('${analogDateStr}'); return false;"
+                           title="Click to compare 500mb pattern vs current GFS">
+                            ${analogDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
+                            <i class="bi bi-map ms-1 text-muted" style="font-size:0.75rem;"></i>
+                        </a>
+                    </td>
+                    <td><span class="badge ${scoreColor}">${scorePct}%</span></td>
+                    <td>${patternStr}</td>
+                    <td>${circStr}</td>
                     <td>${analog.wave_number || 'N/A'}</td>
                     <td>${precipText}</td>
                     <td>${tempText}</td>
@@ -1570,6 +1743,251 @@ function loadAnalogHistory() {
             console.error('Error loading analog history:', error);
         });
 }
+
+// ========== Analog Pattern Comparison ==========
+
+function loadAnalogCompare(dateStr) {
+    const card    = document.getElementById('analog-compare-card');
+    const loading = document.getElementById('analog-compare-loading');
+    const errDiv  = document.getElementById('analog-compare-error');
+    const imgWrap = document.getElementById('analog-compare-img-wrap');
+    const img     = document.getElementById('analog-compare-img');
+    const caption = document.getElementById('analog-compare-caption');
+    const title   = document.getElementById('analog-compare-title');
+
+    // Show card in loading state
+    card.style.display = 'block';
+    loading.style.display = 'block';
+    errDiv.style.display  = 'none';
+    imgWrap.style.display = 'none';
+    title.textContent = dateStr + ' vs current GFS';
+
+    // Scroll the card into view
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+    fetch(`/api/era5/analog-compare-map?date=${dateStr}`)
+        .then(r => r.json())
+        .then(data => {
+            loading.style.display = 'none';
+            if (!data.success) {
+                errDiv.textContent = data.error || 'Unknown error';
+                errDiv.style.display = 'block';
+                return;
+            }
+            img.src = data.map_image;
+            title.textContent = `${data.analog_date} (Wave #${data.analog_wave ?? '?'}) vs ${data.gfs_init} (Wave #${data.current_wave ?? '?'})`;
+            caption.textContent = 'Left: ERA5 historical pattern  |  Right: Current GFS pattern  |  Shading = anomaly vs 1990–2021 climatology';
+            imgWrap.style.display = 'block';
+        })
+        .catch(err => {
+            loading.style.display = 'none';
+            errDiv.textContent = 'Error loading comparison: ' + err;
+            errDiv.style.display = 'block';
+        });
+}
+
+function closeAnalogCompare() {
+    document.getElementById('analog-compare-card').style.display = 'none';
+}
+
+// ========== CONUS Analog Functions ==========
+
+async function loadConusAnalogs() {
+    const topN = document.getElementById('conus-analog-count').value;
+    const variable = document.getElementById('conus-analog-variable').value;
+
+    // Show loading spinner
+    document.getElementById('conus-analog-loading').style.display = 'block';
+    document.getElementById('conus-analog-error').style.display = 'none';
+    document.getElementById('conus-summary-stats').style.display = 'none';
+    document.getElementById('conus-heatmap-card').style.display = 'none';
+    document.getElementById('conus-analog-table-card').style.display = 'none';
+
+    try {
+        const response = await fetch(`/api/era5/analogs-conus?top_n=${topN}&variable=${variable}`);
+        const data = await response.json();
+
+        document.getElementById('conus-analog-loading').style.display = 'none';
+
+        if (!data.success) {
+            document.getElementById('conus-analog-error').textContent = data.error || 'Unknown error occurred';
+            document.getElementById('conus-analog-error').style.display = 'block';
+            return;
+        }
+
+        // Update summary stats
+        updateConusSummaryStats(data, variable);
+
+        // Render heatmap
+        renderConusHeatmap(data, variable);
+
+        // Update analog table
+        updateConusAnalogTable(data);
+
+        // Show all sections
+        document.getElementById('conus-summary-stats').style.display = 'flex';
+        document.getElementById('conus-heatmap-card').style.display = 'block';
+        document.getElementById('conus-analog-table-card').style.display = 'block';
+
+    } catch (error) {
+        document.getElementById('conus-analog-loading').style.display = 'none';
+        document.getElementById('conus-analog-error').textContent = 'Error loading CONUS analogs: ' + error;
+        document.getElementById('conus-analog-error').style.display = 'block';
+        console.error('Error:', error);
+    }
+}
+
+function updateConusSummaryStats(data, variable) {
+    const varData = variable === 'precip' ? data.precip : data.temp;
+
+    if (!varData) {
+        console.warn('No data for variable:', variable);
+        return;
+    }
+
+    // Flatten the grid to calculate statistics (use US units)
+    const flatData = varData.anomaly_in ? varData.anomaly_in.flat() : varData.anomaly_f.flat();
+    const flatPercent = varData.anomaly_percent.flat();
+
+    // Filter out NaN values
+    const validData = flatData.filter(val => isFinite(val));
+    const validPercent = flatPercent.filter(val => isFinite(val));
+
+    // Calculate mean anomaly
+    const meanAnomaly = validData.reduce((sum, val) => sum + val, 0) / validData.length;
+
+    // Calculate percent above/below normal
+    const aboveNormal = validPercent.filter(val => val > 5).length;
+    const belowNormal = validPercent.filter(val => val < -5).length;
+    const pctAbove = (aboveNormal / validPercent.length * 100).toFixed(1);
+    const pctBelow = (belowNormal / validPercent.length * 100).toFixed(1);
+
+    // Update DOM with US units
+    if (variable === 'precip') {
+        document.getElementById('conus-avg-anomaly').textContent = `${meanAnomaly.toFixed(2)}"`;
+        document.getElementById('conus-pct-above').textContent = `${pctAbove}% wetter`;
+        document.getElementById('conus-pct-below').textContent = `${pctBelow}% drier`;
+    } else {
+        document.getElementById('conus-avg-anomaly').textContent = `${meanAnomaly.toFixed(1)}°F`;
+        document.getElementById('conus-pct-above').textContent = `${pctAbove}% warmer`;
+        document.getElementById('conus-pct-below').textContent = `${pctBelow}% cooler`;
+    }
+
+    document.getElementById('conus-wave-number').textContent = data.current_wave_number || 'N/A';
+}
+
+function renderConusHeatmap(data, variable) {
+    const varData = variable === 'precip' ? data.precip : data.temp;
+
+    if (!varData) {
+        console.warn('No data for variable:', variable);
+        return;
+    }
+
+    const zData = varData.anomaly_percent;
+    const units = variable === 'precip' ? 'inches' : '°F';
+    const title = variable === 'precip' ? '14-Day Precipitation Analog' : '14-Day Temperature Analog';
+
+    // Update card title
+    document.getElementById('conus-heatmap-title').textContent = title;
+
+    // Create Plotly heatmap
+    const trace = {
+        type: 'heatmap',
+        x: data.grid.longitudes,
+        y: data.grid.latitudes,
+        z: zData,
+        colorscale: variable === 'precip' ? [
+            [0.0, '#8B4513'],  // Brown (very dry)
+            [0.3, '#F4A460'],  // Sandy brown (dry)
+            [0.5, '#FFFFFF'],  // White (normal)
+            [0.7, '#90EE90'],  // Light green (wet)
+            [1.0, '#006400']   // Dark green (very wet)
+        ] : [
+            [0.0, '#0000FF'],  // Blue (cold)
+            [0.3, '#87CEEB'],  // Sky blue (cool)
+            [0.5, '#FFFFFF'],  // White (normal)
+            [0.7, '#FFA500'],  // Orange (warm)
+            [1.0, '#FF0000']   // Red (hot)
+        ],
+        zmid: 0,
+        zmin: -100,
+        zmax: 100,
+        colorbar: {
+            title: 'Anomaly (%)',
+            len: 0.8
+        },
+        hovertemplate:
+            'Lat: %{y:.2f}°<br>' +
+            'Lon: %{x:.2f}°<br>' +
+            'Anomaly: %{z:.1f}%<br>' +
+            '<extra></extra>'
+    };
+
+    const layout = {
+        title: `${title} - Percent Anomaly from 1990-2020 Normal`,
+        xaxis: {
+            title: 'Longitude',
+            range: [-125, -66]
+        },
+        yaxis: {
+            title: 'Latitude',
+            range: [24, 49]
+        },
+        height: 600,
+        margin: { l: 50, r: 50, t: 80, b: 50 }
+    };
+
+    const config = {
+        responsive: true,
+        displayModeBar: true,
+        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+        displaylogo: false
+    };
+
+    Plotly.newPlot('conus-analog-heatmap', [trace], layout, config);
+}
+
+function updateConusAnalogTable(data) {
+    const tbody = document.getElementById('conus-analog-table-body');
+    tbody.innerHTML = '';
+
+    const currentDate = new Date(data.current_date);
+    // analog_correlations is a list of {date, correlation, composite_score}
+    const corrMap = {};
+    (data.analog_correlations || []).forEach(item => { corrMap[item.date] = item; });
+
+    data.analog_dates.forEach((dateStr, index) => {
+        const analogDate = new Date(dateStr);
+        const daysAgo = Math.floor((currentDate - analogDate) / (1000 * 60 * 60 * 24));
+
+        const item = corrMap[dateStr] || {};
+        const score = item.composite_score != null ? item.composite_score : item.correlation;
+        const scoreCell = score != null
+            ? `<span class="badge bg-success">${(score * 100).toFixed(1)}%</span>`
+            : '--';
+
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>${index + 1}</td>
+            <td>${analogDate.toLocaleDateString()}</td>
+            <td>${scoreCell}</td>
+            <td>${daysAgo} days</td>
+        `;
+        tbody.appendChild(row);
+    });
+}
+
+// Event listeners for CONUS Analogs
+document.getElementById('load-conus-analogs-btn')?.addEventListener('click', loadConusAnalogs);
+document.getElementById('conus-analog-variable')?.addEventListener('change', function() {
+    // Re-render if data already loaded
+    if (document.getElementById('conus-heatmap-card').style.display !== 'none') {
+        loadConusAnalogs();
+    }
+});
+
+// ========== End CONUS Analog Functions ==========
 
 document.addEventListener('DOMContentLoaded', function() {
     initCharts();
