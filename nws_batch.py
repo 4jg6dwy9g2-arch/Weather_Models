@@ -19,7 +19,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Paths
-NWS_GRID_CACHE_PATH = Path(__file__).resolve().parent / "nws_grid_cache.json"
+NWS_GRID_CACHE_PATH = Path(__file__).resolve().parent / "data" / "nws_grid_cache.json"
 
 # NWS API configuration
 NWS_API = "https://api.weather.gov"
@@ -133,51 +133,79 @@ async def fetch_hourly_forecast(session: aiohttp.ClientSession,
             temp_values = props.get("temperature", {}).get("values", [])
             qpf_values = props.get("quantitativePrecipitation", {}).get("values", [])
 
-            # Parse time intervals and create hourly forecast
-            forecast = []
-            for temp_entry in temp_values[:168]:  # Limit to ~7 days
-                valid_time_str = temp_entry["validTime"]
-                temp_c = temp_entry["value"]
-
-                # Parse ISO8601 duration: "2026-02-07T20:00:00+00:00/PT1H"
+            # Build union of hourly timestamps from temp + QPF
+            temp_by_time = {}
+            for temp_entry in temp_values:
+                valid_time_str = temp_entry.get("validTime")
+                if not valid_time_str:
+                    continue
                 if "/" in valid_time_str:
-                    start_str, duration_str = valid_time_str.split("/")
-                    start_time = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                    start_str, dur_str = valid_time_str.split("/")
                 else:
-                    start_time = datetime.fromisoformat(valid_time_str.replace("Z", "+00:00"))
+                    start_str = valid_time_str
+                    dur_str = "PT1H"
+                try:
+                    start_time = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                temp_c = temp_entry.get("value")
+                # Fill temperature for every hour within the period duration.
+                # NWS uses variable-duration periods (PT2H, PT3H, PT4H, etc.) and
+                # 6-hour forecast targets can fall inside these periods. Without this,
+                # QPF expansion adds hourly timestamps with temp=None that become the
+                # nearest match, causing gaps in the chart.
+                dur_match = re.search(r'PT(\d+)H', dur_str)
+                dur_hours = int(dur_match.group(1)) if dur_match else 1
+                for h_offset in range(dur_hours):
+                    temp_by_time[start_time + timedelta(hours=h_offset)] = temp_c
 
-                # Convert temperature from C to F
+            # Parse QPF windows
+            qpf_windows = []
+            for qpf_entry in qpf_values:
+                qpf_time_str = qpf_entry.get("validTime")
+                if not qpf_time_str or "/" not in qpf_time_str:
+                    continue
+                qpf_start_str, qpf_duration_str = qpf_time_str.split("/")
+                try:
+                    qpf_start = datetime.fromisoformat(qpf_start_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+
+                import re
+                duration_match = re.search(r'PT(\d+)H', qpf_duration_str)
+                if not duration_match:
+                    continue
+                duration_hours = int(duration_match.group(1))
+                qpf_end = qpf_start + timedelta(hours=duration_hours)
+                qpf_windows.append((qpf_start, qpf_end, qpf_entry.get("value") or 0, duration_hours))
+
+            # Collect all hourly timestamps from temp and QPF windows
+            all_times = set(temp_by_time.keys())
+            for start, end, total_mm, dur in qpf_windows:
+                t = start
+                while t < end:
+                    all_times.add(t)
+                    t += timedelta(hours=1)
+
+            # Build hourly forecast from union of times
+            forecast = []
+            for start_time in sorted(all_times)[:168]:
+                temp_c = temp_by_time.get(start_time)
                 temp_f = (temp_c * 9/5) + 32 if temp_c is not None else None
 
-                # Find matching precipitation for this time
-                precip_mm = 0
-                for qpf_entry in qpf_values:
-                    qpf_time_str = qpf_entry["validTime"]
-                    if "/" in qpf_time_str:
-                        qpf_start_str, qpf_duration_str = qpf_time_str.split("/")
-                        qpf_start = datetime.fromisoformat(qpf_start_str.replace("Z", "+00:00"))
-
-                        # Parse duration (PT6H = 6 hours, PT1H = 1 hour)
-                        import re
-                        duration_match = re.search(r'PT(\d+)H', qpf_duration_str)
-                        if duration_match:
-                            duration_hours = int(duration_match.group(1))
-                            qpf_end = qpf_start + timedelta(hours=duration_hours)
-
-                            # Check if start_time falls within this QPF period
-                            if qpf_start <= start_time < qpf_end:
-                                # Distribute precipitation evenly over the period
-                                total_precip_mm = qpf_entry.get("value") or 0
-                                precip_mm = total_precip_mm / duration_hours
-                                break
-
-                # Convert mm to inches
-                precip_inches = precip_mm / 25.4 if precip_mm else 0
+                # Use None when no QPF window covers this hour so that hours
+                # beyond the NWS QPF issuance window (typically ~3 days for some
+                # offices) render as gaps in the chart rather than false zeros.
+                precip_inches = None
+                for qpf_start, qpf_end, total_mm, duration_hours in qpf_windows:
+                    if qpf_start <= start_time < qpf_end:
+                        precip_inches = round((total_mm / duration_hours) / 25.4, 3)
+                        break
 
                 forecast.append({
                     "datetime": start_time.isoformat(),
                     "temperature": round(temp_f) if temp_f is not None else None,
-                    "precipitation": round(precip_inches, 3)  # In inches to match ASOS format
+                    "precipitation": precip_inches  # None = no QPF issued; 0.0 = QPF says dry
                 })
 
             return forecast[:168]  # Limit to 7 days
@@ -383,17 +411,20 @@ def transform_nws_to_asos_format(
                 # Precipitation: Accumulate 6-hour total ending at this forecast hour
                 # For F006, sum F001-F006; for F012, sum F007-F012, etc.
                 precip_6hr = 0.0
-                precip_count = 0
+                found_any = False
 
                 for h in range(hour - 5, hour + 1):  # 6 hours ending at 'hour'
                     if h > 0 and h in forecast_by_hour:  # Skip h=0 (init time has no precip)
-                        hourly_precip = forecast_by_hour[h].get('precipitation', 0)
-                        if hourly_precip is not None:
-                            precip_6hr += hourly_precip
-                            precip_count += 1
+                        hourly_precip = forecast_by_hour[h].get('precipitation')
+                        if hourly_precip is None:
+                            continue  # Hour not covered by any QPF window — skip
+                        precip_6hr += hourly_precip
+                        found_any = True
 
-                # Only assign if we have at least 4 of 6 hours (66% coverage, same as ASOS obs)
-                if precip_count >= 4:
+                # Only store a value when at least one hour in the window has QPF data.
+                # Hours entirely outside the NWS QPF issuance window stay None so the
+                # chart shows a gap rather than a misleading flat zero.
+                if found_any:
                     precips[i] = precip_6hr
 
         result[station_id] = {

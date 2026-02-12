@@ -432,7 +432,7 @@
                 <div class="card">
                     <div class="card-header">
                         <i class="bi bi-graph-up"></i> Analog Forecast History
-                        <small class="text-muted ms-2">Track predictions and pattern similarity over time</small>
+                        <small class="text-muted ms-2">Track anomalies and pattern similarity over time</small>
                     </div>
                     <div class="card-body">
                         <p class="text-muted small mb-2">
@@ -1328,6 +1328,150 @@ function loadEraData() {
 
 let mapLoadInProgress = false;
 
+function displayAnalogData(data) {
+    if (!data.success) {
+        document.getElementById('analog-error').textContent = data.error;
+        document.getElementById('analog-error').style.display = 'block';
+        return;
+    }
+
+    // Update current date and wave number
+    const currentDate = new Date(data.current_date);
+    const waveText = `${currentDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })} (Wave ${data.current_wave_number})`;
+    document.getElementById('analog-current-date').textContent = waveText;
+
+    // Update average precipitation
+    const avgPrecip = data.avg_precip_14d;
+    const climPrecip = data.climatology_precip_14d;
+
+    if (avgPrecip !== null && avgPrecip !== undefined) {
+        document.getElementById('analog-avg-precip').textContent = `${avgPrecip}"`;
+    } else {
+        document.getElementById('analog-avg-precip').textContent = 'N/A';
+    }
+
+    // Update climatology precipitation
+    if (climPrecip !== null && climPrecip !== undefined) {
+        document.getElementById('analog-climatology-precip').textContent = `${climPrecip}"`;
+    } else {
+        document.getElementById('analog-climatology-precip').textContent = 'N/A';
+    }
+
+    // Update average temperature
+    const avgTemp = data.avg_temp_14d;
+    const climTemp = data.climatology_temp_14d;
+
+    if (avgTemp !== null && avgTemp !== undefined) {
+        document.getElementById('analog-avg-temp').textContent = `${avgTemp.toFixed(1)}°F`;
+    } else {
+        document.getElementById('analog-avg-temp').textContent = 'N/A';
+    }
+
+    // Update climatology temperature
+    if (climTemp !== null && climTemp !== undefined) {
+        document.getElementById('analog-climatology-temp').textContent = `${climTemp.toFixed(1)}°F`;
+    } else {
+        document.getElementById('analog-climatology-temp').textContent = 'N/A';
+    }
+
+    // Show precipitation comparison
+    if (avgPrecip !== null && climPrecip !== null) {
+        const diff = avgPrecip - climPrecip;
+        const pctDiff = ((diff / climPrecip) * 100).toFixed(0);
+        const comparisonDiv = document.getElementById('analog-precip-comparison');
+        const comparisonText = document.getElementById('analog-precip-comparison-text');
+
+        comparisonDiv.className = 'alert alert-success';
+        if (diff > 0.1) {
+            comparisonText.textContent = `Analogs show ${diff.toFixed(2)}" more than normal (${pctDiff > 0 ? '+' : ''}${pctDiff}% above average)`;
+        } else if (diff < -0.1) {
+            comparisonText.textContent = `Analogs show ${Math.abs(diff).toFixed(2)}" less than normal (${pctDiff}% below average)`;
+        } else {
+            comparisonText.textContent = `Analogs show near-normal precipitation`;
+        }
+        comparisonDiv.style.display = 'block';
+    } else {
+        document.getElementById('analog-precip-comparison').style.display = 'none';
+    }
+
+    // Show temperature comparison
+    if (avgTemp !== null && climTemp !== null) {
+        const diff = avgTemp - climTemp;
+        const pctDiff = climTemp !== 0 ? ((diff / Math.abs(climTemp)) * 100).toFixed(0) : 0;
+        const comparisonDiv = document.getElementById('analog-temp-comparison');
+        const comparisonText = document.getElementById('analog-temp-comparison-text');
+
+        comparisonDiv.className = 'alert alert-warning';
+        if (diff > 1) {
+            comparisonText.textContent = `Analogs show ${diff.toFixed(1)}°F warmer than normal (${pctDiff > 0 ? '+' : ''}${pctDiff}% above average)`;
+        } else if (diff < -1) {
+            comparisonText.textContent = `Analogs show ${Math.abs(diff).toFixed(1)}°F cooler than normal (${pctDiff}% below average)`;
+        } else {
+            comparisonText.textContent = `Analogs show near-normal temperatures`;
+        }
+        comparisonDiv.style.display = 'block';
+    } else {
+        document.getElementById('analog-temp-comparison').style.display = 'none';
+    }
+
+    // Populate table
+    const tbody = document.getElementById('analog-table-body');
+    tbody.innerHTML = '';
+
+    data.analogs.forEach((analog, index) => {
+        const analogDate = new Date(analog.date);
+        const daysAgo = Math.round((currentDate - analogDate) / (1000 * 60 * 60 * 24));
+        const precipText = analog.precip_14d !== null && analog.precip_14d !== undefined
+            ? `${analog.precip_14d}"`
+            : 'N/A';
+        const tempText = analog.temp_14d !== null && analog.temp_14d !== undefined
+            ? `${analog.temp_14d.toFixed(1)}°F`
+            : 'N/A';
+
+        // Primary score badge
+        const score = analog.composite_score != null
+            ? analog.composite_score
+            : analog.correlation;
+        const scorePct = (score * 100).toFixed(1);
+        const scoreColor = score >= 0.7 ? 'bg-success' : score >= 0.55 ? 'bg-warning text-dark' : 'bg-secondary';
+
+        // Sub-scores (Pattern = lat_pearson via correlation field, Circulation = grad_corr)
+        const patternStr = analog.correlation != null
+            ? `<small class="text-muted">${(analog.correlation * 100).toFixed(1)}%</small>`
+            : '<small class="text-muted">—</small>';
+        const circStr = analog.grad_corr != null
+            ? `<small class="text-muted">${(analog.grad_corr * 100).toFixed(1)}%</small>`
+            : '<small class="text-muted">—</small>';
+
+        // Date string for compare endpoint (YYYY-MM-DD)
+        const analogDateStr = analogDate.toISOString().split('T')[0];
+
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>${index + 1}</td>
+            <td>
+                <a href="#" class="fw-semibold text-decoration-none analog-date-link"
+                   onclick="loadAnalogCompare('${analogDateStr}'); return false;"
+                   title="Click to compare 500mb pattern vs current GFS">
+                    ${analogDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
+                    <i class="bi bi-map ms-1 text-muted" style="font-size:0.75rem;"></i>
+                </a>
+            </td>
+            <td><span class="badge ${scoreColor}">${scorePct}%</span></td>
+            <td>${patternStr}</td>
+            <td>${circStr}</td>
+            <td>${analog.wave_number || 'N/A'}</td>
+            <td>${precipText}</td>
+            <td>${tempText}</td>
+            <td>${daysAgo > 0 ? daysAgo + ' days ago' : 'Today'}</td>
+        `;
+        tbody.appendChild(row);
+    });
+
+    document.getElementById('analog-results').style.display = 'block';
+    loadAnalogHistory();
+}
+
 function loadAnalogs() {
     const count  = document.getElementById('analog-count').value;
     const method = document.getElementById('analog-method')?.value || 'composite';
@@ -1355,156 +1499,41 @@ function loadAnalogs() {
         })
         .then(data => {
             document.getElementById('analog-loading').style.display = 'none';
-
-            if (!data.success) {
-                document.getElementById('analog-error').textContent = data.error;
-                document.getElementById('analog-error').style.display = 'block';
-                return;
-            }
-
-            // Update current date and wave number
-            const currentDate = new Date(data.current_date);
-            const waveText = `${currentDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })} (Wave ${data.current_wave_number})`;
-            document.getElementById('analog-current-date').textContent = waveText;
-
-            // Update average precipitation
-            const avgPrecip = data.avg_precip_14d;
-            const climPrecip = data.climatology_precip_14d;
-
-            if (avgPrecip !== null && avgPrecip !== undefined) {
-                document.getElementById('analog-avg-precip').textContent = `${avgPrecip}"`;
-            } else {
-                document.getElementById('analog-avg-precip').textContent = 'N/A';
-            }
-
-            // Update climatology precipitation
-            if (climPrecip !== null && climPrecip !== undefined) {
-                document.getElementById('analog-climatology-precip').textContent = `${climPrecip}"`;
-            } else {
-                document.getElementById('analog-climatology-precip').textContent = 'N/A';
-            }
-
-            // Update average temperature
-            const avgTemp = data.avg_temp_14d;
-            const climTemp = data.climatology_temp_14d;
-
-            if (avgTemp !== null && avgTemp !== undefined) {
-                document.getElementById('analog-avg-temp').textContent = `${avgTemp.toFixed(1)}°F`;
-            } else {
-                document.getElementById('analog-avg-temp').textContent = 'N/A';
-            }
-
-            // Update climatology temperature
-            if (climTemp !== null && climTemp !== undefined) {
-                document.getElementById('analog-climatology-temp').textContent = `${climTemp.toFixed(1)}°F`;
-            } else {
-                document.getElementById('analog-climatology-temp').textContent = 'N/A';
-            }
-
-            // Show precipitation comparison
-            if (avgPrecip !== null && climPrecip !== null) {
-                const diff = avgPrecip - climPrecip;
-                const pctDiff = ((diff / climPrecip) * 100).toFixed(0);
-                const comparisonDiv = document.getElementById('analog-precip-comparison');
-                const comparisonText = document.getElementById('analog-precip-comparison-text');
-
-                comparisonDiv.className = 'alert alert-success';
-                if (diff > 0.1) {
-                    comparisonText.textContent = `Analogs show ${diff.toFixed(2)}" more than normal (${pctDiff > 0 ? '+' : ''}${pctDiff}% above average)`;
-                } else if (diff < -0.1) {
-                    comparisonText.textContent = `Analogs show ${Math.abs(diff).toFixed(2)}" less than normal (${pctDiff}% below average)`;
-                } else {
-                    comparisonText.textContent = `Analogs show near-normal precipitation`;
-                }
-                comparisonDiv.style.display = 'block';
-            } else {
-                document.getElementById('analog-precip-comparison').style.display = 'none';
-            }
-
-            // Show temperature comparison
-            if (avgTemp !== null && climTemp !== null) {
-                const diff = avgTemp - climTemp;
-                const pctDiff = climTemp !== 0 ? ((diff / Math.abs(climTemp)) * 100).toFixed(0) : 0;
-                const comparisonDiv = document.getElementById('analog-temp-comparison');
-                const comparisonText = document.getElementById('analog-temp-comparison-text');
-
-                comparisonDiv.className = 'alert alert-warning';
-                if (diff > 1) {
-                    comparisonText.textContent = `Analogs show ${diff.toFixed(1)}°F warmer than normal (${pctDiff > 0 ? '+' : ''}${pctDiff}% above average)`;
-                } else if (diff < -1) {
-                    comparisonText.textContent = `Analogs show ${Math.abs(diff).toFixed(1)}°F cooler than normal (${pctDiff}% below average)`;
-                } else {
-                    comparisonText.textContent = `Analogs show near-normal temperatures`;
-                }
-                comparisonDiv.style.display = 'block';
-            } else {
-                document.getElementById('analog-temp-comparison').style.display = 'none';
-            }
-
-            // Populate table
-            const tbody = document.getElementById('analog-table-body');
-            tbody.innerHTML = '';
-
-            data.analogs.forEach((analog, index) => {
-                const analogDate = new Date(analog.date);
-                const daysAgo = Math.round((currentDate - analogDate) / (1000 * 60 * 60 * 24));
-                const precipText = analog.precip_14d !== null && analog.precip_14d !== undefined
-                    ? `${analog.precip_14d}"`
-                    : 'N/A';
-                const tempText = analog.temp_14d !== null && analog.temp_14d !== undefined
-                    ? `${analog.temp_14d.toFixed(1)}°F`
-                    : 'N/A';
-
-                // Primary score badge
-                const score = analog.composite_score != null
-                    ? analog.composite_score
-                    : analog.correlation;
-                const scorePct = (score * 100).toFixed(1);
-                const scoreColor = score >= 0.7 ? 'bg-success' : score >= 0.55 ? 'bg-warning text-dark' : 'bg-secondary';
-
-                // Sub-scores (Pattern = lat_pearson via correlation field, Circulation = grad_corr)
-                const patternStr = analog.correlation != null
-                    ? `<small class="text-muted">${(analog.correlation * 100).toFixed(1)}%</small>`
-                    : '<small class="text-muted">—</small>';
-                const circStr = analog.grad_corr != null
-                    ? `<small class="text-muted">${(analog.grad_corr * 100).toFixed(1)}%</small>`
-                    : '<small class="text-muted">—</small>';
-
-                // Date string for compare endpoint (YYYY-MM-DD)
-                const analogDateStr = analogDate.toISOString().split('T')[0];
-
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td>${index + 1}</td>
-                    <td>
-                        <a href="#" class="fw-semibold text-decoration-none analog-date-link"
-                           onclick="loadAnalogCompare('${analogDateStr}'); return false;"
-                           title="Click to compare 500mb pattern vs current GFS">
-                            ${analogDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
-                            <i class="bi bi-map ms-1 text-muted" style="font-size:0.75rem;"></i>
-                        </a>
-                    </td>
-                    <td><span class="badge ${scoreColor}">${scorePct}%</span></td>
-                    <td>${patternStr}</td>
-                    <td>${circStr}</td>
-                    <td>${analog.wave_number || 'N/A'}</td>
-                    <td>${precipText}</td>
-                    <td>${tempText}</td>
-                    <td>${daysAgo > 0 ? daysAgo + ' days ago' : 'Today'}</td>
-                `;
-                tbody.appendChild(row);
-            });
-
-            document.getElementById('analog-results').style.display = 'block';
-
-            // Reload the history chart to include the new prediction
-            loadAnalogHistory();
+            // Remove any auto-load note since we're doing a fresh computation
+            const note = document.getElementById('analog-auto-note');
+            if (note) note.remove();
+            displayAnalogData(data);
         })
         .catch(error => {
             document.getElementById('analog-loading').style.display = 'none';
             document.getElementById('analog-error').textContent = 'Error loading analogs: ' + error;
             document.getElementById('analog-error').style.display = 'block';
         });
+}
+
+function loadLatestAnalogResult() {
+    fetch('/api/era5/latest-analog-result')
+        .then(response => response.json())
+        .then(data => {
+            if (!data.success) return;
+            displayAnalogData(data);
+
+            // Insert a subtle note next to the Find Analogs button
+            const btn = document.querySelector('button[onclick="loadAnalogs()"]');
+            if (btn && data.computed_at && !document.getElementById('analog-auto-note')) {
+                const computedAt = new Date(data.computed_at);
+                const hoursAgo = Math.round((Date.now() - computedAt) / (1000 * 60 * 60));
+                const timeStr = hoursAgo < 1 ? 'just now'
+                              : hoursAgo === 1 ? '1 hr ago'
+                              : `${hoursAgo} hrs ago`;
+                const note = document.createElement('small');
+                note.id = 'analog-auto-note';
+                note.className = 'text-muted ms-2';
+                note.textContent = `Auto-loaded from last sync (${timeStr}) · Recompute ↑`;
+                btn.parentNode.insertBefore(note, btn.nextSibling);
+            }
+        })
+        .catch(() => { /* silently ignore — sync may not have run yet */ });
 }
 
 function loadHeightMap() {
@@ -1612,11 +1641,19 @@ function loadAnalogHistory() {
                 return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
             });
 
-            const precipValues = predictions.map(p => p.analog_precip);
-            const precipNormals = predictions.map(p => p.climatology_precip);
-            const tempValues = predictions.map(p => p.analog_temp);
-            const tempNormals = predictions.map(p => p.climatology_temp);
             const correlations = predictions.map(p => p.avg_correlation || 0);
+            const precipAnomalies = predictions.map(p => {
+                if (p.analog_precip == null || p.climatology_precip == null) {
+                    return null;
+                }
+                return p.analog_precip - p.climatology_precip;
+            });
+            const tempAnomalies = predictions.map(p => {
+                if (p.analog_temp == null || p.climatology_temp == null) {
+                    return null;
+                }
+                return p.analog_temp - p.climatology_temp;
+            });
 
             // Create chart
             const ctx = document.getElementById('analogHistoryChart').getContext('2d');
@@ -1631,8 +1668,8 @@ function loadAnalogHistory() {
                     labels: dates,
                     datasets: [
                         {
-                            label: 'Analog Precip (14-day)',
-                            data: precipValues,
+                            label: 'Precip Anomaly (14-day)',
+                            data: precipAnomalies,
                             borderColor: '#22c55e',
                             backgroundColor: 'rgba(34, 197, 94, 0.1)',
                             tension: 0.3,
@@ -1640,32 +1677,12 @@ function loadAnalogHistory() {
                             yAxisID: 'y-precip'
                         },
                         {
-                            label: 'Normal Precip',
-                            data: precipNormals,
-                            borderColor: '#86efac',
-                            borderDash: [5, 5],
-                            borderWidth: 2,
-                            tension: 0.3,
-                            fill: false,
-                            yAxisID: 'y-precip'
-                        },
-                        {
-                            label: 'Analog Temp (14-day avg)',
-                            data: tempValues,
+                            label: 'Temp Anomaly (14-day avg)',
+                            data: tempAnomalies,
                             borderColor: '#ffc107',
                             backgroundColor: 'rgba(255, 193, 7, 0.1)',
                             tension: 0.3,
                             fill: true,
-                            yAxisID: 'y-temp'
-                        },
-                        {
-                            label: 'Normal Temp',
-                            data: tempNormals,
-                            borderColor: '#fde68a',
-                            borderDash: [5, 5],
-                            borderWidth: 2,
-                            tension: 0.3,
-                            fill: false,
                             yAxisID: 'y-temp'
                         }
                     ]
@@ -1688,10 +1705,15 @@ function loadAnalogHistory() {
                                     if (label) {
                                         label += ': ';
                                     }
+                                    const value = context.parsed.y;
+                                    if (value == null || Number.isNaN(value)) {
+                                        return label + 'N/A';
+                                    }
+                                    const sign = value > 0 ? '+' : '';
                                     if (context.dataset.yAxisID === 'y-precip') {
-                                        label += context.parsed.y.toFixed(2) + '"';
+                                        label += sign + value.toFixed(2) + '"';
                                     } else {
-                                        label += context.parsed.y.toFixed(1) + '°F';
+                                        label += sign + value.toFixed(1) + '°F';
                                     }
                                     return label;
                                 },
@@ -1713,7 +1735,7 @@ function loadAnalogHistory() {
                             position: 'left',
                             title: {
                                 display: true,
-                                text: 'Precipitation (inches)'
+                                text: 'Precip Anomaly (inches)'
                             },
                             grid: {
                                 color: '#e0e0e0'
@@ -1724,7 +1746,7 @@ function loadAnalogHistory() {
                             position: 'right',
                             title: {
                                 display: true,
-                                text: 'Temperature (°F)'
+                                text: 'Temp Anomaly (°F)'
                             },
                             grid: {
                                 drawOnChartArea: false
@@ -1993,7 +2015,8 @@ document.addEventListener('DOMContentLoaded', function() {
     initCharts();
     loadData();
     initEraCharts();
-    loadAnalogHistory();  // Load analog prediction history chart
+    loadAnalogHistory();        // Load analog prediction history chart
+    loadLatestAnalogResult();   // Auto-populate analog card from last sync cache
 
     // Set default ERA5 dates (last 30 days)
     setEraDateRange(30);

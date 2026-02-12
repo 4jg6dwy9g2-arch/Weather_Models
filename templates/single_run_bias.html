@@ -1,0 +1,493 @@
+{% extends "base.html" %}
+
+{% block title %}Single Run Bias - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    #biasMap {
+        background-color: #e8e8e8;
+    }
+
+    #biasMapContainer {
+        background-color: #f5f5f5;
+    }
+
+    .leaflet-tooltip {
+        background-color: white;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        padding: 6px 10px;
+        font-size: 13px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+    }
+
+    .leaflet-tooltip strong {
+        color: #333;
+    }
+
+    .card-header .form-select-sm {
+        padding: 0.25rem 1.75rem 0.25rem 0.5rem;
+        font-size: 0.8rem;
+    }
+
+    .model-toggle {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+    }
+
+    .model-toggle .btn {
+        min-width: 60px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <div class="row align-items-center">
+        <div class="col-12">
+            <h1 class="mb-1"><i class="bi bi-bullseye"></i> Single Run Bias Map</h1>
+            <p class="mb-0 opacity-75">
+                View model bias (forecast - observation) for a specific forecast run across all ASOS stations
+            </p>
+        </div>
+    </div>
+</div>
+
+<div id="loadingState" class="loading-spinner">
+    <div class="text-center">
+        <div class="spinner-border text-primary" role="status"></div>
+        <p class="mt-2 text-muted">Loading data...</p>
+    </div>
+</div>
+
+<div id="errorState" class="alert alert-warning d-none">
+    <i class="bi bi-exclamation-triangle"></i>
+    <span id="errorMessage">No data available.</span>
+</div>
+
+<div id="biasContent" class="d-none">
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div>
+                        <i class="bi bi-map"></i> ASOS Station Bias
+                        <span class="badge bg-secondary ms-2" id="biasStationCount">-- stations</span>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap align-items-center">
+                        <label class="form-label mb-0 me-1 small">Observation Time:</label>
+                        <select class="form-select form-select-sm" id="validTime" style="width: auto; min-width: 200px;">
+                            <option value="">Loading...</option>
+                        </select>
+                        <label class="form-label mb-0 me-1 small">Forecast Lead:</label>
+                        <select class="form-select form-select-sm" id="leadTime" style="width: auto;">
+                            <option value="6">6h</option>
+                            <option value="12" selected>12h</option>
+                            <option value="18">18h</option>
+                            <option value="24">24h</option>
+                            <option value="48">48h</option>
+                            <option value="72">72h</option>
+                            <option value="120">5d</option>
+                            <option value="168">7d</option>
+                            <option value="240">10d</option>
+                        </select>
+                        <select class="form-select form-select-sm" id="variable" style="width: auto;">
+                            <option value="temp" selected>Temperature</option>
+                            <option value="mslp">Pressure</option>
+                            <option value="precip">Precipitation</option>
+                        </select>
+                        <div class="model-toggle" role="group" id="modelToggle">
+                            <button type="button" class="btn btn-sm btn-primary active" data-model="gfs">GFS</button>
+                            <button type="button" class="btn btn-sm btn-outline-info" data-model="aifs">AIFS</button>
+                            <button type="button" class="btn btn-sm btn-outline-success" data-model="ifs">IFS</button>
+                            <button type="button" class="btn btn-sm btn-outline-dark" data-model="nws">NWS</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="card-body p-0">
+                    <div id="biasMapContainer" style="height: 550px; position: relative;">
+                        <div id="biasMap" style="height: 100%; width: 100%;"></div>
+                        <div id="biasMapLoading" class="position-absolute top-50 start-50 translate-middle text-center" style="z-index: 1000;">
+                            <div class="spinner-border text-primary" role="status"></div>
+                            <p class="mt-2 text-muted">Loading station data...</p>
+                        </div>
+                        <div id="biasMapEmpty" class="position-absolute top-50 start-50 translate-middle text-center d-none" style="z-index: 1000;">
+                            <i class="bi bi-info-circle fs-1 text-muted"></i>
+                            <p class="mt-2 text-muted">No data available for this selection.</p>
+                        </div>
+                    </div>
+
+                    <!-- Color Scale Legend -->
+                    <div class="d-flex align-items-center justify-content-center gap-3 py-3 border-top bg-light">
+                        <span id="biasLabelMin" class="text-muted small"><strong>Cold Bias</strong></span>
+                        <span id="biasColorMin" class="text-muted small">-10</span>
+                        <div id="biasColorScale" style="width: 300px; height: 15px; border-radius: 4px; background: linear-gradient(to right, #0000FF, #FFFFFF, #FF0000);"></div>
+                        <span id="biasColorMax" class="text-muted small">+10</span>
+                        <span id="biasLabelMax" class="text-muted small"><strong>Warm Bias</strong></span>
+                        <span id="biasUnits" class="text-muted small ms-2">(°F)</span>
+                    </div>
+
+                    <!-- Summary Statistics -->
+                    <div class="card-body border-top">
+                        <h5 class="card-title mb-3">Summary Statistics</h5>
+                        <div class="row">
+                            <div class="col-md-3">
+                                <div class="card h-100 border-primary">
+                                    <div class="card-body text-center">
+                                        <h6 class="text-primary"><i class="bi bi-wind"></i> GFS</h6>
+                                        <p class="mb-1"><strong>Mean Bias:</strong> <span id="gfsMeanBias">--</span></p>
+                                        <p class="mb-1"><strong>Median:</strong> <span id="gfsMedianBias">--</span></p>
+                                        <p class="mb-0"><strong>Std Dev:</strong> <span id="gfsStdBias">--</span></p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card h-100 border-info">
+                                    <div class="card-body text-center">
+                                        <h6 class="text-info"><i class="bi bi-robot"></i> AIFS</h6>
+                                        <p class="mb-1"><strong>Mean Bias:</strong> <span id="aifsMeanBias">--</span></p>
+                                        <p class="mb-1"><strong>Median:</strong> <span id="aifsMedianBias">--</span></p>
+                                        <p class="mb-0"><strong>Std Dev:</strong> <span id="aifsStdBias">--</span></p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card h-100 border-success">
+                                    <div class="card-body text-center">
+                                        <h6 class="text-success"><i class="bi bi-globe"></i> IFS</h6>
+                                        <p class="mb-1"><strong>Mean Bias:</strong> <span id="ifsMeanBias">--</span></p>
+                                        <p class="mb-1"><strong>Median:</strong> <span id="ifsMedianBias">--</span></p>
+                                        <p class="mb-0"><strong>Std Dev:</strong> <span id="ifsStdBias">--</span></p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card h-100 border-dark">
+                                    <div class="card-body text-center">
+                                        <h6 class="text-dark"><i class="bi bi-cloud-sun"></i> NWS</h6>
+                                        <p class="mb-1"><strong>Mean Bias:</strong> <span id="nwsMeanBias">--</span></p>
+                                        <p class="mb-1"><strong>Median:</strong> <span id="nwsMedianBias">--</span></p>
+                                        <p class="mb-0"><strong>Std Dev:</strong> <span id="nwsStdBias">--</span></p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let biasMap = null;
+let biasMarkers = [];
+let currentModel = 'gfs';
+
+// Initialize map
+function initBiasMap() {
+    if (biasMap) return;
+
+    biasMap = L.map('biasMap', {
+        center: [39.5, -98.5],
+        zoom: 4,
+        minZoom: 3,
+        maxZoom: 10
+    });
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 19
+    }).addTo(biasMap);
+}
+
+// Color interpolation for Bias with fixed scales
+function getBiasColor(value, minVal, maxVal, variable) {
+    // Use fixed scales based on variable type
+    const fixedMax = (variable === 'precip') ? 1 : 10;
+
+    // Clamp value between -fixedMax and +fixedMax
+    const clampedValue = Math.max(-fixedMax, Math.min(fixedMax, value));
+
+    // Normalize to [-1, 1] range
+    const ratio = clampedValue / fixedMax;
+
+    // Map ratio from [-1, 1] to [0, 1] for gradient
+    const gradientRatio = (ratio + 1) / 2;
+
+    // Different color schemes for precipitation vs temperature/pressure
+    if (variable === 'precip') {
+        // Precipitation: Brown (dry/negative bias) -> White -> Green (wet/positive bias)
+        if (gradientRatio < 0.5) {
+            // Brown to White (negative bias - drier)
+            const t = gradientRatio * 2;  // 0 to 1
+            const r = Math.round(139 + t * (255 - 139));  // 139 to 255
+            const g = Math.round(69 + t * (255 - 69));    // 69 to 255
+            const b = Math.round(19 + t * (255 - 19));    // 19 to 255
+            return `rgb(${r}, ${g}, ${b})`;
+        } else {
+            // White to Green (positive bias - wetter)
+            const t = (gradientRatio - 0.5) * 2;  // 0 to 1
+            const r = Math.round(255 - t * (255 - 34));   // 255 to 34
+            const g = Math.round(255 - t * (255 - 139));  // 255 to 139
+            const b = Math.round(255 - t * (255 - 34));   // 255 to 34
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+    } else {
+        // Temperature/Pressure: Blue (cold/low bias) -> White -> Red (warm/high bias)
+        if (gradientRatio < 0.5) {
+            // Blue to White (negative bias)
+            const t = gradientRatio * 2;  // 0 to 1
+            const r = Math.round(0 + t * 255);
+            const g = Math.round(0 + t * 255);
+            const b = 255;
+            return `rgb(${r}, ${g}, ${b})`;
+        } else {
+            // White to Red (positive bias)
+            const t = (gradientRatio - 0.5) * 2;  // 0 to 1
+            const r = 255;
+            const g = Math.round(255 - t * 255);
+            const b = Math.round(255 - t * 255);
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+    }
+}
+
+// Clear all markers
+function clearBiasMarkers() {
+    for (const marker of biasMarkers) {
+        biasMap.removeLayer(marker);
+    }
+    biasMarkers = [];
+}
+
+// Load available valid times (observation times)
+async function loadValidTimes() {
+    try {
+        const response = await fetch('/api/asos/available-valid-times');
+        const data = await response.json();
+
+        if (!data.success || !data.valid_times || data.valid_times.length === 0) {
+            console.error('No valid times available');
+            return;
+        }
+
+        const select = document.getElementById('validTime');
+        select.innerHTML = '';
+
+        // Add options (most recent first)
+        for (const valid_time of data.valid_times) {
+            const date = new Date(valid_time);
+            const label = date.toLocaleString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                timeZoneName: 'short'
+            });
+            const option = document.createElement('option');
+            option.value = valid_time;
+            option.textContent = label;
+            select.appendChild(option);
+        }
+
+        // Load bias for first valid time
+        loadBiasMap();
+
+    } catch (error) {
+        console.error('Error loading valid times:', error);
+    }
+}
+
+// Update color scale with fixed ranges
+function updateColorScale(variable, minVal, maxVal) {
+    const unitsSpan = document.getElementById('biasUnits');
+    const minSpan = document.getElementById('biasColorMin');
+    const maxSpan = document.getElementById('biasColorMax');
+    const colorScale = document.getElementById('biasColorScale');
+    const labelMin = document.getElementById('biasLabelMin');
+    const labelMax = document.getElementById('biasLabelMax');
+
+    const units = {
+        'temp': '(°F)',
+        'mslp': '(mb)',
+        'precip': '(in)'
+    };
+    unitsSpan.textContent = units[variable] || '';
+
+    // Use fixed scales based on variable type
+    if (variable === 'precip') {
+        minSpan.textContent = '-1.0';
+        maxSpan.textContent = '+1.0';
+        labelMin.innerHTML = '<strong>Dry Bias</strong>';
+        labelMax.innerHTML = '<strong>Wet Bias</strong>';
+        // Brown -> White -> Green gradient for precipitation
+        colorScale.style.background = 'linear-gradient(to right, rgb(139, 69, 19), rgb(255, 255, 255), rgb(34, 139, 34))';
+    } else {
+        minSpan.textContent = '-10.0';
+        maxSpan.textContent = '+10.0';
+        labelMin.innerHTML = '<strong>Cold Bias</strong>';
+        labelMax.innerHTML = '<strong>Warm Bias</strong>';
+        // Blue -> White -> Red gradient for temperature/pressure
+        colorScale.style.background = 'linear-gradient(to right, #0000FF, #FFFFFF, #FF0000)';
+    }
+}
+
+// Update summary statistics
+function updateStats(data) {
+    const variable = document.getElementById('variable').value;
+    const units = { 'temp': '°F', 'mslp': 'mb', 'precip': 'in' };
+    const unit = units[variable] || '';
+    const decimals = variable === 'precip' ? 3 : 2;
+
+    for (const model of ['gfs', 'aifs', 'ifs', 'nws']) {
+        const stats = data.summary[model];
+        if (stats) {
+            document.getElementById(`${model}MeanBias`).textContent =
+                (stats.mean >= 0 ? '+' : '') + stats.mean.toFixed(decimals) + ' ' + unit;
+            document.getElementById(`${model}MedianBias`).textContent =
+                (stats.median >= 0 ? '+' : '') + stats.median.toFixed(decimals) + ' ' + unit;
+            document.getElementById(`${model}StdBias`).textContent =
+                stats.std.toFixed(decimals) + ' ' + unit;
+        } else {
+            document.getElementById(`${model}MeanBias`).textContent = '--';
+            document.getElementById(`${model}MedianBias`).textContent = '--';
+            document.getElementById(`${model}StdBias`).textContent = '--';
+        }
+    }
+}
+
+// Load bias map
+async function loadBiasMap() {
+    if (!biasMap) {
+        initBiasMap();
+    }
+
+    const validTime = document.getElementById('validTime').value;
+    const leadTime = document.getElementById('leadTime').value;
+    const variable = document.getElementById('variable').value;
+
+    if (!validTime) return;
+
+    document.getElementById('biasMapLoading').classList.remove('d-none');
+    document.getElementById('biasMapEmpty').classList.add('d-none');
+
+    try {
+        const response = await fetch(
+            `/api/asos/single-run-bias?valid_time=${encodeURIComponent(validTime)}&lead_time=${leadTime}&variable=${variable}`
+        );
+        const data = await response.json();
+
+        document.getElementById('biasMapLoading').classList.add('d-none');
+        document.getElementById('loadingState').classList.add('d-none');
+        document.getElementById('biasContent').classList.remove('d-none');
+        biasMap.invalidateSize();
+
+        if (!data.success || !data.stations) {
+            document.getElementById('biasMapEmpty').classList.remove('d-none');
+            clearBiasMarkers();
+            return;
+        }
+
+        // Update station count
+        const stationCount = Object.values(data.stations).filter(s => s[currentModel]).length;
+        document.getElementById('biasStationCount').textContent = `${stationCount} stations`;
+
+        // Update color scale
+        updateColorScale(variable, data.min_value, data.max_value);
+
+        // Update summary statistics
+        updateStats(data);
+
+        // Clear existing markers
+        clearBiasMarkers();
+
+        // Add new markers
+        for (const [stationId, stationData] of Object.entries(data.stations)) {
+            const modelData = stationData[currentModel];
+            if (!modelData || modelData.bias === null) continue;
+
+            const color = getBiasColor(modelData.bias, data.min_value, data.max_value, variable);
+
+            // Scale marker size proportional to bias magnitude (3-5.25px)
+            const maxScale = (variable === 'precip') ? 1 : 10;
+            const absValue = Math.abs(modelData.bias);
+            const normalized = Math.min(absValue / maxScale, 1);
+            const radius = 3 + normalized * 2.25;  // 3 to 5.25
+
+            const marker = L.circleMarker([stationData.lat, stationData.lon], {
+                radius: radius,
+                fillColor: color,
+                color: '#333',
+                weight: 1,
+                opacity: 0.8,
+                fillOpacity: 0.9
+            });
+
+            const units = { 'temp': '°F', 'mslp': 'mb', 'precip': 'in' };
+            const unit = units[variable] || '';
+            const decimals = variable === 'precip' ? 2 : 1;
+
+            const tooltipContent = `
+                <strong>${stationData.name}</strong> (${stationId})<br>
+                ${currentModel.toUpperCase()} Bias: ${(modelData.bias >= 0 ? '+' : '') + modelData.bias.toFixed(decimals)}${unit}<br>
+                Forecast: ${modelData.forecast.toFixed(decimals)}${unit}<br>
+                Observed: ${modelData.observed.toFixed(decimals)}${unit}
+            `;
+
+            marker.bindTooltip(tooltipContent, {
+                direction: 'top',
+                offset: [0, -5]
+            });
+
+            marker.addTo(biasMap);
+            biasMarkers.push(marker);
+        }
+
+    } catch (error) {
+        console.error('Error loading bias map:', error);
+        document.getElementById('biasMapLoading').classList.add('d-none');
+        document.getElementById('biasMapEmpty').classList.remove('d-none');
+    }
+}
+
+// Model toggle buttons
+document.getElementById('modelToggle').addEventListener('click', function(e) {
+    if (e.target.matches('button[data-model]')) {
+        // Update button states
+        this.querySelectorAll('button').forEach(btn => {
+            btn.classList.remove('active', 'btn-primary', 'btn-info', 'btn-success', 'btn-dark');
+            const model = btn.dataset.model;
+            const colorClass = model === 'gfs' ? 'primary' : model === 'aifs' ? 'info' : model === 'ifs' ? 'success' : 'dark';
+            btn.classList.add(`btn-outline-${colorClass}`);
+        });
+
+        const model = e.target.dataset.model;
+        const colorClass = model === 'gfs' ? 'primary' : model === 'aifs' ? 'info' : model === 'ifs' ? 'success' : 'dark';
+        e.target.classList.add('active');
+        e.target.classList.remove(`btn-outline-${colorClass}`);
+        e.target.classList.add(`btn-${colorClass}`);
+
+        currentModel = model;
+        loadBiasMap();
+    }
+});
+
+// Event listeners
+document.getElementById('validTime').addEventListener('change', loadBiasMap);
+document.getElementById('leadTime').addEventListener('change', loadBiasMap);
+document.getElementById('variable').addEventListener('change', loadBiasMap);
+
+// Initial load
+document.addEventListener('DOMContentLoaded', function() {
+    initBiasMap();
+    setTimeout(loadValidTimes, 50);
+});
+
+</script>
+{% endblock %}

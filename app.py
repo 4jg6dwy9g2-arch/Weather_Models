@@ -19,6 +19,7 @@ import math
 import hmac
 import hashlib
 import collections
+import re
 
 try:
     from dotenv import load_dotenv
@@ -42,7 +43,17 @@ from nws_forecast import (
     IDEAL_TEMP_RANGE
 )
 
-NWS_CACHE_PATH = Path(__file__).resolve().parent / "nws_forecast_cache.json"
+NWS_API = "https://api.weather.gov"
+NWS_HEADERS = {
+    "User-Agent": "(Weather Models App, contact@example.com)",
+    "Accept": "application/geo+json"
+}
+
+NWS_CACHE_PATH = Path(__file__).resolve().parent / "data" / "nws_forecast_cache.json"
+VERIF_TS_CACHE_PATH = Path(__file__).resolve().parent / "data" / "verification_time_series_cache.json"
+VERIF_LEAD_CACHE_PATH = Path(__file__).resolve().parent / "data" / "verification_lead_time_cache.json"
+COCORAHs_CACHE_PATH = Path(__file__).resolve().parent / "data" / "cocorahs_daily_cache.json"
+BIAS_HISTORY_CACHE_PATH = Path(__file__).resolve().parent / "data" / "bias_history_cache.json"
 import asos
 import rossby_waves
 import nws_batch
@@ -68,13 +79,15 @@ except Exception:  # pragma: no cover - optional dependency
 from pangu_integration import pangu_bp, cleanup_database, load_runs_db
 
 # Single JSON file for storing all forecast data
-FORECASTS_FILE = Path(__file__).parent / "forecasts.json"
+FORECASTS_FILE = Path(__file__).parent / "data" / "forecasts.json"
 
 # ASOS forecast trends storage file (last 2 runs with 6-hourly data)
-ASOS_TRENDS_FILE = Path(__file__).parent / "asos_forecast_trends.json"
+ASOS_TRENDS_FILE = Path(__file__).parent / "data" / "asos_forecast_trends.json"
 
 # ERA5 analog forecast history (tracks predictions over time)
-ANALOG_HISTORY_FILE = Path(__file__).parent / "analog_forecast_history.json"
+ANALOG_HISTORY_FILE = Path(__file__).parent / "data" / "analog_forecast_history.json"
+# Full cached result from the most recent auto-sync (allows instant UI load)
+ANALOG_LATEST_FILE = Path(__file__).parent / "data" / "analog_latest_result.json"
 
 # ---------------------------------------------------------------------------
 # ERA5 analog caches (populated lazily, persist for the lifetime of the process)
@@ -82,6 +95,12 @@ ANALOG_HISTORY_FILE = Path(__file__).parent / "analog_forecast_history.json"
 # Structure: {cache_key: {'climatology': dict, 'ds': xr.Dataset, ...}}
 # cache_key = frozenset of ERA5 file paths + overlap bounds
 _CLIMATOLOGY_CACHE: dict = {}
+
+# ---------------------------------------------------------------------------
+# In-memory cache for forecasts.json (invalidated when file mtime changes)
+# ---------------------------------------------------------------------------
+_forecasts_db_cache: dict | None = None
+_forecasts_db_mtime: float | None = None
 
 # EOF cache (loaded/built in background thread)
 _EOF_CACHE: dict | None = None
@@ -94,6 +113,8 @@ if load_dotenv:
 WEATHERLINK_API_KEY = os.getenv("WEATHERLINK_API_KEY")
 WEATHERLINK_API_SECRET = os.getenv("WEATHERLINK_API_SECRET")
 WEATHERLINK_STATION_ID = os.getenv("WEATHERLINK_STATION_ID", "117994")
+COCORAHs_STATION_ID = os.getenv("COCORAHs_STATION_ID", "VA-FX-121")
+COCORAHs_ACIS_SID = os.getenv("COCORAHs_ACIS_SID")
 
 # Default location: Fairfax, VA (matches Workout_Data)
 DEFAULT_LAT = 38.8419
@@ -119,16 +140,22 @@ except Exception:
 
 
 def load_forecasts_db():
-    """Load the forecasts database from JSON file."""
-    if FORECASTS_FILE.exists():
-        try:
-            with open(FORECASTS_FILE) as f:
-                data = json.load(f)
-                # Migrate old format to new format if needed
-                return migrate_db_format(data)
-        except Exception as e:
-            logger.warning(f"Error loading forecasts.json: {e}")
-    return {}
+    """Load the forecasts database from JSON file, with in-memory mtime cache."""
+    global _forecasts_db_cache, _forecasts_db_mtime
+    if not FORECASTS_FILE.exists():
+        return {}
+    try:
+        current_mtime = FORECASTS_FILE.stat().st_mtime
+        if _forecasts_db_cache is not None and _forecasts_db_mtime == current_mtime:
+            return _forecasts_db_cache
+        with open(FORECASTS_FILE) as f:
+            data = json.load(f)
+        _forecasts_db_cache = migrate_db_format(data)
+        _forecasts_db_mtime = current_mtime
+        return _forecasts_db_cache
+    except Exception as e:
+        logger.warning(f"Error loading forecasts.json: {e}")
+        return {}
 
 
 def load_nws_cache():
@@ -148,6 +175,168 @@ def load_nws_cache():
     return {}
 
 
+def load_cocorahs_cache():
+    """Load cached CoCoRaHS daily precipitation data."""
+    if COCORAHs_CACHE_PATH.exists():
+        try:
+            with open(COCORAHs_CACHE_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading CoCoRaHS cache: {e}")
+    return {}
+
+
+def save_cocorahs_cache(payload: dict):
+    """Save CoCoRaHS daily precipitation cache."""
+    try:
+        with open(COCORAHs_CACHE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Error saving CoCoRaHS cache: {e}")
+
+
+def _normalize_cocorahs_station_id(station_id: str) -> str | None:
+    """
+    Normalize a CoCoRaHS station ID like "VA-FX-121" -> "VAFX0121".
+    Returns None if format isn't recognized.
+    """
+    if not station_id:
+        return None
+    cleaned = station_id.strip().upper()
+    # Normalize any non-alphanumeric separators to a dash
+    cleaned = re.sub(r"[^A-Z0-9]+", "-", cleaned).strip("-")
+
+    match = re.match(r"^([A-Z]{2})-([A-Z]{2})-(\d+)$", cleaned)
+    if not match:
+        match = re.match(r"^([A-Z]{2})([A-Z]{2})(\d+)$", cleaned)
+    if not match:
+        return None
+    state, county, num = match.groups()
+    return f"{state}{county}{int(num):04d}"
+
+
+def _parse_cocorahs_value(val):
+    if isinstance(val, (list, tuple)) and val:
+        val = val[0]
+    if val in ("M", "NA", "", None, "--", "**", "*"):
+        return None
+    if val == "T":
+        return 0.001
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def fetch_cocorahs_daily_precip(station_id: str, start_date: str, end_date: str) -> dict:
+    """
+    Fetch daily precipitation from ACIS for a CoCoRaHS station.
+
+    Returns:
+        Dict of date -> precip (inches)
+    """
+    # Cache lookup
+    cache = load_cocorahs_cache()
+    station_cache = cache.get(station_id, {})
+    cached_data = station_cache.get("data", {})
+    last_fetched = station_cache.get("last_fetched")
+
+    # Check if cache covers requested range and is recent (<12 hours)
+    def _covers_range():
+        try:
+            start_dt = datetime.fromisoformat(start_date).date()
+            end_dt = datetime.fromisoformat(end_date).date()
+        except Exception:
+            return False
+        d = start_dt
+        while d <= end_dt:
+            if d.isoformat() not in cached_data:
+                return False
+            d += timedelta(days=1)
+        return True
+
+    if last_fetched and _covers_range():
+        try:
+            last_dt = datetime.fromisoformat(last_fetched)
+            if datetime.now(timezone.utc) - last_dt < timedelta(hours=12):
+                return cached_data
+        except Exception:
+            pass
+
+    # Fetch from ACIS - try multiple station id formats
+    normalized = _normalize_cocorahs_station_id(station_id)
+    sid_candidates = [station_id]
+    if COCORAHs_ACIS_SID:
+        sid_candidates.insert(0, COCORAHs_ACIS_SID)
+    if normalized and normalized not in sid_candidates:
+        # ACIS CoCoRaHS type code is 10 (8-char id like VAFX0121)
+        sid_candidates.append(normalized)
+        sid_candidates.append(f"{normalized} 10")
+        sid_candidates.append(f"US1{normalized}")
+
+    data = None
+    for sid in sid_candidates:
+        params = {
+            "sid": sid,
+            "sdate": start_date,
+            "edate": end_date,
+            "elems": [{"name": "pcpn", "interval": "dly", "duration": "dly", "add": "f"}],
+            "meta": "name"
+        }
+        try:
+            response = requests.post("https://data.rcc-acis.org/StnData", json=params, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            if payload and not payload.get("error") and payload.get("data"):
+                data = payload
+                break
+        except Exception as e:
+            logger.warning(f"Error fetching CoCoRaHS data for {sid}: {e}")
+            continue
+
+    if not data:
+        logger.warning(f"No CoCoRaHS data returned for {station_id} ({sid_candidates})")
+        return cached_data
+
+    results = {}
+    for row in data.get("data", []):
+        if not row or len(row) < 2:
+            continue
+        date_str = row[0]
+        val = row[1]
+        results[date_str] = _parse_cocorahs_value(val)
+
+    # Merge into cache
+    cached_data.update(results)
+    cache[station_id] = {
+        "last_fetched": datetime.now(timezone.utc).isoformat(),
+        "data": cached_data
+    }
+    save_cocorahs_cache(cache)
+    return cached_data
+
+
+def get_asos_data_span_days() -> int:
+    """Return the span of available ASOS run data in days."""
+    db = asos.load_asos_forecasts_db()
+    runs = db.get("runs", {})
+    if not runs:
+        return 0
+    times = []
+    for run_id in runs.keys():
+        try:
+            dt = datetime.fromisoformat(run_id)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            times.append(dt)
+        except Exception:
+            continue
+    if not times:
+        return 0
+    span = max(times) - min(times)
+    return int(span.total_seconds() / 86400)
+
+
 def save_nws_cache(payload: dict):
     """Save NWS forecast data to cache."""
     try:
@@ -155,6 +344,101 @@ def save_nws_cache(payload: dict):
             json.dump(payload, f, indent=2)
     except Exception as e:
         logger.warning(f"Error saving NWS cache: {e}")
+
+
+def load_verif_ts_cache() -> dict:
+    if VERIF_TS_CACHE_PATH.exists():
+        try:
+            with open(VERIF_TS_CACHE_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading verification time series cache: {e}")
+    return {"entries": {}}
+
+
+def save_verif_ts_cache(payload: dict):
+    try:
+        with open(VERIF_TS_CACHE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Error saving verification time series cache: {e}")
+
+
+def load_verif_lead_cache() -> dict:
+    if VERIF_LEAD_CACHE_PATH.exists():
+        try:
+            with open(VERIF_LEAD_CACHE_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading verification lead-time cache: {e}")
+    return {"entries": {}}
+
+
+def save_verif_lead_cache(payload: dict):
+    try:
+        with open(VERIF_LEAD_CACHE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Error saving verification lead-time cache: {e}")
+
+
+def load_bias_history_cache() -> dict:
+    if BIAS_HISTORY_CACHE_PATH.exists():
+        try:
+            with open(BIAS_HISTORY_CACHE_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading bias history cache: {e}")
+    return {"entries": {}}
+
+
+def save_bias_history_cache(payload: dict):
+    try:
+        with open(BIAS_HISTORY_CACHE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Error saving bias history cache: {e}")
+
+
+def _get_verif_ts_source_mtimes() -> dict:
+    def _mtime(path: Path):
+        try:
+            return path.stat().st_mtime
+        except Exception:
+            return None
+
+    return {
+        "forecasts": _mtime(FORECASTS_FILE),
+        "nws": _mtime(NWS_CACHE_PATH),
+        "cocorahs": _mtime(COCORAHs_CACHE_PATH)
+    }
+
+
+def precompute_verif_time_series_cache(location_name: str, configs: list[dict]):
+    """
+    Precompute verification time series cache entries for fast first-load.
+    configs: list of dicts with keys: variable, lead_time, days_back
+    """
+    cache = load_verif_ts_cache()
+    entries = cache.get("entries", {})
+    source_mtimes = _get_verif_ts_source_mtimes()
+
+    for cfg in configs:
+        variable = cfg.get("variable", "temp")
+        lead_time = int(cfg.get("lead_time", 24))
+        days_back = int(cfg.get("days_back", 30))
+        cache_key = f"{location_name}|{variable}|{lead_time}|{days_back}"
+        result = calculate_verification_time_series(location_name, variable, lead_time, days_back)
+        if "error" in result:
+            continue
+        entries[cache_key] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source_mtimes": source_mtimes,
+            "time_series": result
+        }
+
+    cache["entries"] = entries
+    save_verif_ts_cache(cache)
 
 
 def load_asos_trends_db():
@@ -274,8 +558,146 @@ def save_analog_prediction(target_date: str, analog_precip: float, analog_temp: 
         logger.error(f"Error saving analog prediction: {e}")
 
 
+def run_analog_sync(gfs_init_time=None) -> dict:
+    """
+    Compute historical analog pattern matching and persist results.
+
+    Called automatically from run_master_sync() after each new GFS fetch.
+    Skips recomputation if the latest cached result already covers this GFS
+    initialization time.
+
+    Returns a dict with keys:
+      status: 'computed' | 'cached' | 'skipped' | 'error'
+      avg_precip, avg_temp, avg_correlation, wave_number  (on 'computed')
+      message / error  (on other statuses)
+    """
+    import pandas as pd
+    import numpy as np
+    import xarray as xr
+
+    # Dedup check: skip if we already have a cached result for this exact GFS run.
+    if gfs_init_time is not None and ANALOG_LATEST_FILE.exists():
+        try:
+            with open(ANALOG_LATEST_FILE) as f:
+                cached = json.load(f)
+            cached_init = cached.get('computed_for_init')
+            if cached_init and pd.Timestamp(cached_init) == pd.Timestamp(str(gfs_init_time)):
+                return {'status': 'cached', 'message': f'Already computed for {gfs_init_time}'}
+        except Exception:
+            pass  # If check fails, proceed with fresh computation
+
+    try:
+        core = _find_analogs_core(top_n=10, method='composite')
+    except Exception as e:
+        return {'status': 'error', 'error': f'Pattern matching failed: {e}'}
+
+    top_analogs = core['top_analogs']
+    init_time = core['init_time']
+    current_date_str = core['current_date_str']
+    current_wave_num = core['current_wave_num']
+
+    weather_path = Path("/Volumes/T7/Weather_Models/era5/Fairfax/reanalysis-era5-single-levels-timeseries-sfc1zs15i59.nc")
+    if not weather_path.exists():
+        return {'status': 'skipped', 'message': 'ERA5 Fairfax weather data not available (drive not mounted?)'}
+
+    avg_precip = avg_temp = climatology_precip = climatology_temp = None
+    try:
+        weather_ds = xr.open_dataset(weather_path)
+
+        for analog in top_analogs:
+            try:
+                analog_date = pd.Timestamp(analog['date'])
+                end_date = analog_date + pd.Timedelta(days=14)
+                precip_m = float(weather_ds['tp'].sel(valid_time=slice(analog_date, end_date)).sum().values)
+                analog['precip_14d'] = round(precip_m * 39.3701, 2)
+                temp_k = float(weather_ds['t2m'].sel(valid_time=slice(analog_date, end_date)).mean().values)
+                analog['temp_14d'] = round((temp_k - 273.15) * 9/5 + 32, 1)
+            except Exception as e:
+                logger.warning(f"Analog sync: could not get outcomes for {analog['date']}: {e}")
+                analog['precip_14d'] = None
+                analog['temp_14d'] = None
+
+        precip_values = [a['precip_14d'] for a in top_analogs if a.get('precip_14d') is not None]
+        avg_precip = round(np.mean(precip_values), 2) if precip_values else None
+        temp_values = [a['temp_14d'] for a in top_analogs if a.get('temp_14d') is not None]
+        avg_temp = round(np.mean(temp_values), 1) if temp_values else None
+
+        # Climatology normals (1940–2025, same calendar window)
+        clim_precip_list: list = []
+        clim_temp_list: list = []
+        try:
+            for year in range(1940, 2026):
+                try:
+                    start = pd.Timestamp(year=year, month=init_time.month, day=init_time.day)
+                    end = start + pd.Timedelta(days=14)
+                    cp = float(weather_ds['tp'].sel(valid_time=slice(start, end)).sum().values)
+                    if not np.isnan(cp):
+                        clim_precip_list.append(cp * 39.3701)
+                    ct = float(weather_ds['t2m'].sel(valid_time=slice(start, end)).mean().values)
+                    if not np.isnan(ct):
+                        clim_temp_list.append((ct - 273.15) * 9/5 + 32)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Analog sync: climatology error: {e}")
+
+        climatology_precip = round(np.mean(clim_precip_list), 2) if clim_precip_list else None
+        climatology_temp = round(np.mean(clim_temp_list), 1) if clim_temp_list else None
+
+    except Exception as e:
+        logger.warning(f"Analog sync: ERA5 weather data error: {e}")
+
+    if avg_precip is None or avg_temp is None:
+        return {'status': 'skipped', 'message': 'Insufficient ERA5 weather data for outcome calculation'}
+
+    avg_correlation = (sum(a['correlation'] for a in top_analogs) / len(top_analogs)) if top_analogs else 0
+
+    save_analog_prediction(
+        target_date=current_date_str,
+        analog_precip=avg_precip,
+        analog_temp=avg_temp,
+        climatology_precip=climatology_precip or 0,
+        climatology_temp=climatology_temp or 0,
+        top_analogs=[{'date': a['date'], 'correlation': a['correlation']} for a in top_analogs],
+        avg_correlation=avg_correlation,
+    )
+
+    # Cache the full result so the UI can display it instantly on page load.
+    cached_result = {
+        'success': True,
+        'current_date': current_date_str,
+        'current_wave_number': current_wave_num,
+        'method': 'composite',
+        'analogs': top_analogs,
+        'avg_precip_14d': avg_precip,
+        'avg_temp_14d': avg_temp,
+        'climatology_precip_14d': climatology_precip,
+        'climatology_temp_14d': climatology_temp,
+        'computed_at': datetime.now(timezone.utc).isoformat(),
+        'computed_for_init': str(gfs_init_time) if gfs_init_time is not None else current_date_str,
+    }
+    try:
+        with open(ANALOG_LATEST_FILE, 'w') as f:
+            json.dump(cached_result, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Analog sync: could not write latest result cache: {e}")
+
+    logger.info(
+        f"Analog sync complete: {current_date_str}, "
+        f"precip={avg_precip}\", temp={avg_temp}°F, corr={avg_correlation:.3f}"
+    )
+    return {
+        'status': 'computed',
+        'target_date': current_date_str,
+        'avg_precip': avg_precip,
+        'avg_temp': avg_temp,
+        'avg_correlation': avg_correlation,
+        'wave_number': current_wave_num,
+    }
+
+
 def fetch_nws_forecast_cache(hours_ahead: int = 168):
-    """Fetch NWS forecast and cache only temperature data for verification overlays."""
+    """Fetch NWS forecast and cache temperature and precip data for verification overlays."""
     grid_id, grid_x, grid_y, forecast_url = get_grid_point(DEFAULT_LAT, DEFAULT_LON)
     forecast = fetch_hourly_forecast(forecast_url)
 
@@ -289,7 +711,8 @@ def fetch_nws_forecast_cache(hours_ahead: int = 168):
             break
         result.append({
             "datetime": hour["datetime"],
-            "temperature": hour["temperature"]
+            "temperature": hour["temperature"],
+            "precip_mm": hour.get("rain_amount_mm", 0) or 0
         })
 
     snapshot = {
@@ -418,6 +841,65 @@ logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 app = Flask(__name__)
+
+
+@app.route('/api/cocorahs-debug')
+def api_cocorahs_debug():
+    """
+    Debug CoCoRaHS ACIS lookup for a station.
+    Returns the first payload that has data, plus a summary of attempts.
+    """
+    station_id = request.args.get('station_id', COCORAHs_STATION_ID)
+    days_back = int(request.args.get('days_back', 10))
+    now_utc = datetime.now(timezone.utc)
+    local_now = weatherlink.utc_to_eastern(now_utc.replace(tzinfo=None))
+    end_date = (local_now.date() - timedelta(days=1))
+    start_date = end_date - timedelta(days=days_back - 1)
+
+    normalized = _normalize_cocorahs_station_id(station_id)
+    sid_candidates = [station_id]
+    if COCORAHs_ACIS_SID:
+        sid_candidates.insert(0, COCORAHs_ACIS_SID)
+    if normalized and normalized not in sid_candidates:
+        sid_candidates.append(normalized)
+        sid_candidates.append(f"{normalized} 10")
+        sid_candidates.append(f"US1{normalized}")
+
+    attempts = []
+    payload_with_data = None
+    for sid in sid_candidates:
+        params = {
+            "sid": sid,
+            "sdate": start_date.isoformat(),
+            "edate": end_date.isoformat(),
+            "elems": [{"name": "pcpn", "interval": "dly", "duration": "dly"}],
+            "meta": "name"
+        }
+        try:
+            response = requests.post("https://data.rcc-acis.org/StnData", json=params, timeout=30)
+            status = response.status_code
+            payload = response.json()
+            has_data = bool(payload and payload.get("data"))
+            attempts.append({
+                "sid": sid,
+                "status": status,
+                "has_data": has_data,
+                "error": payload.get("error") if isinstance(payload, dict) else None
+            })
+            if has_data and payload_with_data is None:
+                payload_with_data = payload
+        except Exception as e:
+            attempts.append({"sid": sid, "status": None, "has_data": False, "error": str(e)})
+
+    return jsonify({
+        "success": True,
+        "station_id": station_id,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "sid_candidates": sid_candidates,
+        "attempts": attempts,
+        "sample_payload": payload_with_data
+    })
 app.register_blueprint(pangu_bp, url_prefix="/pangu")
 cleanup_database()
 
@@ -807,6 +1289,7 @@ ASOS_LEAD_TIMES = [6, 12, 24, 48, 72, 120, 168]
 # Cache for verification results (1 hour TTL)
 _verification_cache = {}
 _verification_cache_time = {}
+
 
 
 def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
@@ -1729,11 +2212,15 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
         'mslp': ('mslps', 'mslps')
     }
 
-    if variable not in var_map:
+    if variable not in var_map and variable != 'precip':
         return {"error": "Invalid variable"}
 
-    fcst_key, obs_key = var_map[variable]
-    obs_lookup_key = 'temp' if variable == 'temp' else 'mslp'
+    if variable != 'precip':
+        fcst_key, obs_key = var_map[variable]
+        obs_lookup_key = 'temp' if variable == 'temp' else 'mslp'
+    else:
+        if location_name != "Fairfax, VA":
+            return {"error": "Precip time series only available for Fairfax, VA"}
 
     # Collect sums/counts grouped by date
     # Key: date string (YYYY-MM-DD)
@@ -1755,153 +2242,318 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
         errors_by_date[date_key][model_key]["count"] += 1
 
     # Seed from cached daily stats (keeps long-term trend after trimming)
-    cached_ts = db[location_name].get("cumulative_stats", {}).get("time_series", {})
-    for date_key, model_data in cached_ts.items():
-        try:
-            date_obj = datetime.fromisoformat(date_key).date()
-        except ValueError:
-            continue
-        if date_obj < cutoff_date.date():
-            continue
+    if variable != 'precip':
+        cached_ts = db[location_name].get("cumulative_stats", {}).get("time_series", {})
+        for date_key, model_data in cached_ts.items():
+            try:
+                date_obj = datetime.fromisoformat(date_key).date()
+            except ValueError:
+                continue
+            if date_obj < cutoff_date.date():
+                continue
 
-        _ensure_date(date_key)
-        model_key = None
-        var_key = 'temp' if variable == 'temp' else 'mslp'
+            _ensure_date(date_key)
+            model_key = None
+            var_key = 'temp' if variable == 'temp' else 'mslp'
 
-        for model_key in ["gfs", "aifs", "ifs"]:
-            for lt_key, stats in model_data.get(model_key, {}).get(var_key, {}).items():
-                # Keep only the selected lead time
-                if int(lt_key) != lead_time_hours:
+            for model_key in ["gfs", "aifs", "ifs"]:
+                for lt_key, stats in model_data.get(model_key, {}).get(var_key, {}).items():
+                    # Keep only the selected lead time
+                    if int(lt_key) != lead_time_hours:
+                        continue
+                    errors_by_date[date_key][model_key]["sum_abs"] += stats.get("sum_abs", 0.0)
+                    errors_by_date[date_key][model_key]["sum"] += stats.get("sum", 0.0)
+                    errors_by_date[date_key][model_key]["count"] += stats.get("count", 0)
+
+    if variable != 'precip':
+        # Build WeatherLink observation lookup for valid times in window
+        time_keys = set()
+        for run_id, run_data in runs.items():
+            gfs_data = run_data.get("gfs", {})
+            init_time_str = gfs_data.get("init_time")
+            if not init_time_str:
+                continue
+            try:
+                init_time = datetime.fromisoformat(init_time_str)
+                if init_time.tzinfo is None:
+                    init_time = init_time.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+            forecast_times = gfs_data.get("times", [])
+            for time_str in forecast_times:
+                try:
+                    valid_time = datetime.fromisoformat(time_str)
+                    if valid_time.tzinfo is None:
+                        valid_time = valid_time.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
                     continue
-                errors_by_date[date_key][model_key]["sum_abs"] += stats.get("sum_abs", 0.0)
-                errors_by_date[date_key][model_key]["sum"] += stats.get("sum", 0.0)
-                errors_by_date[date_key][model_key]["count"] += stats.get("count", 0)
 
-    # Build WeatherLink observation lookup for valid times in window
-    time_keys = set()
-    for run_id, run_data in runs.items():
-        gfs_data = run_data.get("gfs", {})
-        init_time_str = gfs_data.get("init_time")
-        if not init_time_str:
-            continue
-        try:
-            init_time = datetime.fromisoformat(init_time_str)
-            if init_time.tzinfo is None:
-                init_time = init_time.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
+                if valid_time >= now or valid_time < cutoff_date:
+                    continue
 
-        forecast_times = gfs_data.get("times", [])
-        for time_str in forecast_times:
-            try:
-                valid_time = datetime.fromisoformat(time_str)
-                if valid_time.tzinfo is None:
-                    valid_time = valid_time.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                continue
+                lead_time = int((valid_time - init_time).total_seconds() / 3600)
+                if lead_time != lead_time_hours:
+                    continue
 
-            if valid_time >= now or valid_time < cutoff_date:
-                continue
+                time_keys.add(valid_time.astimezone(timezone.utc).isoformat())
 
-            lead_time = int((valid_time - init_time).total_seconds() / 3600)
-            if lead_time != lead_time_hours:
-                continue
-
-            time_keys.add(valid_time.astimezone(timezone.utc).isoformat())
-
-    obs_lookup = {}
-    if time_keys:
-        sorted_time_keys = sorted(time_keys)
-        obs_times = []
-        for t in sorted_time_keys:
-            try:
-                dt = datetime.fromisoformat(t)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                obs_times.append(dt.replace(tzinfo=None))
-            except Exception:
-                obs_times.append(None)
-        obs_data = weatherlink.get_observations(obs_times, times_are_utc=True)
-        obs_temps = obs_data.get("temps", [])
-        obs_mslps = obs_data.get("mslps", [])
-        for idx, t in enumerate(sorted_time_keys):
-            obs_lookup[t] = {
-                "temp": obs_temps[idx] if idx < len(obs_temps) else None,
-                "mslp": obs_mslps[idx] if idx < len(obs_mslps) else None
-            }
+        obs_lookup = {}
+        if time_keys:
+            sorted_time_keys = sorted(time_keys)
+            obs_times = []
+            for t in sorted_time_keys:
+                try:
+                    dt = datetime.fromisoformat(t)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    obs_times.append(dt.replace(tzinfo=None))
+                except Exception:
+                    obs_times.append(None)
+            obs_data = weatherlink.get_observations(obs_times, times_are_utc=True)
+            obs_temps = obs_data.get("temps", [])
+            obs_mslps = obs_data.get("mslps", [])
+            for idx, t in enumerate(sorted_time_keys):
+                obs_lookup[t] = {
+                    "temp": obs_temps[idx] if idx < len(obs_temps) else None,
+                    "mslp": obs_mslps[idx] if idx < len(obs_mslps) else None
+                }
 
     # Build observed lookup by valid time for NWS verification (temp only)
     obs_by_time = {}
 
-    for run_id, run_data in runs.items():
-        gfs_data = run_data.get("gfs", {})
-        aifs_data = run_data.get("aifs", {})
-        ifs_data = run_data.get("ifs", {})
+    if variable != 'precip':
+        for run_id, run_data in runs.items():
+            gfs_data = run_data.get("gfs", {})
+            aifs_data = run_data.get("aifs", {})
+            ifs_data = run_data.get("ifs", {})
 
-        init_time_str = gfs_data.get("init_time")
-        if not init_time_str:
-            continue
+            init_time_str = gfs_data.get("init_time")
+            if not init_time_str:
+                continue
 
-        try:
-            init_time = datetime.fromisoformat(init_time_str)
-            if init_time.tzinfo is None:
-                init_time = init_time.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-
-        # Skip runs outside the time window
-        if init_time < cutoff_date:
-            continue
-
-        forecast_times = gfs_data.get("times", [])
-        gfs_values = gfs_data.get(fcst_key, [])
-        aifs_values = aifs_data.get(fcst_key, [])
-        ifs_values = ifs_data.get(fcst_key, []) if ifs_data else []
-        for i, time_str in enumerate(forecast_times):
             try:
-                valid_time = datetime.fromisoformat(time_str)
-                if valid_time.tzinfo is None:
-                    valid_time = valid_time.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
+                init_time = datetime.fromisoformat(init_time_str)
+                if init_time.tzinfo is None:
+                    init_time = init_time.replace(tzinfo=timezone.utc)
+            except ValueError:
                 continue
 
-            # Only include past times
-            if valid_time >= now:
-                continue
-            if cutoff_date and valid_time < cutoff_date:
+            # Skip runs outside the time window
+            if init_time < cutoff_date:
                 continue
 
-            # Calculate lead time in hours
-            lead_time = int((valid_time - init_time).total_seconds() / 3600)
+            forecast_times = gfs_data.get("times", [])
+            gfs_values = gfs_data.get(fcst_key, [])
+            aifs_values = aifs_data.get(fcst_key, [])
+            ifs_values = ifs_data.get(fcst_key, []) if ifs_data else []
+            for i, time_str in enumerate(forecast_times):
+                try:
+                    valid_time = datetime.fromisoformat(time_str)
+                    if valid_time.tzinfo is None:
+                        valid_time = valid_time.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    continue
 
-            # Only include the requested lead time
-            if lead_time != lead_time_hours:
+                # Only include past times
+                if valid_time >= now:
+                    continue
+                if cutoff_date and valid_time < cutoff_date:
+                    continue
+
+                # Calculate lead time in hours
+                lead_time = int((valid_time - init_time).total_seconds() / 3600)
+
+                # Only include the requested lead time
+                if lead_time != lead_time_hours:
+                    continue
+
+                time_key = valid_time.astimezone(timezone.utc).isoformat()
+                obs_val = obs_lookup.get(time_key, {}).get(obs_lookup_key)
+                if obs_val is not None:
+                    obs_by_time[time_key] = obs_val
+
+                # Use the date of the valid time for grouping
+                date_key = valid_time.date().isoformat()
+                _ensure_date(date_key)
+
+                # Collect errors for each model
+                if i < len(gfs_values):
+                    gfs_val = gfs_values[i]
+                    if gfs_val is not None and obs_val is not None:
+                        _add(date_key, "gfs", gfs_val - obs_val)
+
+                if i < len(aifs_values):
+                    aifs_val = aifs_values[i]
+                    if aifs_val is not None and obs_val is not None:
+                        _add(date_key, "aifs", aifs_val - obs_val)
+
+                if ifs_values and i < len(ifs_values):
+                    ifs_val = ifs_values[i]
+                    if ifs_val is not None and obs_val is not None:
+                        _add(date_key, "ifs", ifs_val - obs_val)
+    else:
+        # Precip verification based on 12Z CoCoRaHS daily totals
+        local_now = weatherlink.utc_to_eastern(now.replace(tzinfo=None))
+        obs_end = local_now.date() - timedelta(days=1)
+        start_date = (local_now.date() - timedelta(days=1)) - timedelta(days=days_back - 1)
+
+        obs_data = fetch_cocorahs_daily_precip(
+            COCORAHs_STATION_ID,
+            start_date.isoformat(),
+            obs_end.isoformat()
+        )
+
+        def compute_daily_total_for_run(model_data, day_end_utc):
+            times = model_data.get("times", [])
+            precips = model_data.get("precips", [])
+            if not times or not precips:
+                return None, 0
+            window_start = day_end_utc - timedelta(hours=24)
+            total = 0.0
+            count = 0
+            for i, time_str in enumerate(times):
+                try:
+                    valid_time = datetime.fromisoformat(time_str)
+                    if valid_time.tzinfo is None:
+                        valid_time = valid_time.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    continue
+                if window_start < valid_time <= day_end_utc:
+                    if i < len(precips) and precips[i] is not None:
+                        total += precips[i]
+                        count += 1
+            if count >= 3:
+                return total, count
+            return None, count
+
+        def select_best_total_for_date(model_key, day_end_utc):
+            best_total = None
+            best_init = None
+            for run_id, run_data in runs.items():
+                model_data = run_data.get(model_key, {})
+                init_time_str = model_data.get("init_time") or run_data.get("gfs", {}).get("init_time")
+                if not init_time_str:
+                    continue
+                try:
+                    init_time = datetime.fromisoformat(init_time_str)
+                    if init_time.tzinfo is None:
+                        init_time = init_time.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+
+                # Check that this run provides the day_end_utc valid time at the selected lead time
+                times = model_data.get("times", [])
+                has_valid = False
+                for t in times:
+                    try:
+                        valid_time = datetime.fromisoformat(t)
+                        if valid_time.tzinfo is None:
+                            valid_time = valid_time.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        continue
+                    if valid_time == day_end_utc:
+                        lead_time = int((valid_time - init_time).total_seconds() / 3600)
+                        if lead_time == lead_time_hours:
+                            has_valid = True
+                        break
+                if not has_valid:
+                    continue
+
+                total, count = compute_daily_total_for_run(model_data, day_end_utc)
+                if total is None:
+                    continue
+
+                if best_init is None or init_time > best_init:
+                    best_init = init_time
+                    best_total = total
+            return best_total
+
+        # NWS precip totals from cached hourly forecast
+        def compute_nws_total_for_run(run, day_end_utc):
+            forecast = run.get("forecast", [])
+            if not forecast:
+                return None, 0
+            window_start = day_end_utc - timedelta(hours=24)
+            total_mm = 0.0
+            count = 0
+            for entry in forecast:
+                try:
+                    valid_time = datetime.fromisoformat(entry["datetime"])
+                    if valid_time.tzinfo is None:
+                        valid_time = valid_time.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if window_start < valid_time <= day_end_utc:
+                    val = entry.get("precip_mm")
+                    if val is None:
+                        continue
+                    total_mm += val
+                    count += 1
+            if count >= 3:
+                return total_mm / 25.4, count
+            return None, count
+
+        def select_best_nws_total(day_end_utc):
+            nws_cache = load_nws_cache()
+            runs = nws_cache.get("runs", []) if isinstance(nws_cache, dict) else []
+            best_total = None
+            best_init = None
+            for run in runs:
+                fetched_at = run.get("fetched_at")
+                if not fetched_at:
+                    continue
+                try:
+                    nws_init = datetime.fromisoformat(fetched_at)
+                    if nws_init.tzinfo is None:
+                        local_tz = datetime.now().astimezone().tzinfo
+                        nws_init = nws_init.replace(tzinfo=local_tz).astimezone(timezone.utc)
+                    else:
+                        nws_init = nws_init.astimezone(timezone.utc)
+                except Exception:
+                    continue
+
+                # Anchor NWS lead times to the previous 6-hour cycle (UTC)
+                nws_cycle_init = nws_init.replace(minute=0, second=0, microsecond=0)
+                cycle_hour = (nws_cycle_init.hour // 6) * 6
+                nws_cycle_init = nws_cycle_init.replace(hour=cycle_hour)
+
+                lead_time = int((day_end_utc - nws_cycle_init).total_seconds() / 3600)
+                if lead_time != lead_time_hours:
+                    continue
+
+                total_in, count = compute_nws_total_for_run(run, day_end_utc)
+                if total_in is None:
+                    continue
+
+                if best_init is None or nws_cycle_init > best_init:
+                    best_init = nws_cycle_init
+                    best_total = total_in
+            return best_total
+
+        d = start_date
+        while d <= obs_end:
+            date_key = d.isoformat()
+            obs_val = obs_data.get(date_key)
+            if obs_val is None:
+                d += timedelta(days=1)
                 continue
-
-            time_key = valid_time.astimezone(timezone.utc).isoformat()
-            obs_val = obs_lookup.get(time_key, {}).get(obs_lookup_key)
-            if obs_val is not None:
-                obs_by_time[time_key] = obs_val
-
-            # Use the date of the valid time for grouping
-            date_key = valid_time.date().isoformat()
             _ensure_date(date_key)
+            day_end = datetime(d.year, d.month, d.day, 12, tzinfo=timezone.utc)
+            gfs_total = select_best_total_for_date("gfs", day_end)
+            aifs_total = select_best_total_for_date("aifs", day_end)
+            ifs_total = select_best_total_for_date("ifs", day_end)
+            nws_total = select_best_nws_total(day_end)
 
-            # Collect errors for each model
-            if i < len(gfs_values):
-                gfs_val = gfs_values[i]
-                if gfs_val is not None and obs_val is not None:
-                    _add(date_key, "gfs", gfs_val - obs_val)
-
-            if i < len(aifs_values):
-                aifs_val = aifs_values[i]
-                if aifs_val is not None and obs_val is not None:
-                    _add(date_key, "aifs", aifs_val - obs_val)
-
-            if ifs_values and i < len(ifs_values):
-                ifs_val = ifs_values[i]
-                if ifs_val is not None and obs_val is not None:
-                    _add(date_key, "ifs", ifs_val - obs_val)
+            if gfs_total is not None:
+                _add(date_key, "gfs", gfs_total - obs_val)
+            if aifs_total is not None:
+                _add(date_key, "aifs", aifs_total - obs_val)
+            if ifs_total is not None:
+                _add(date_key, "ifs", ifs_total - obs_val)
+            if nws_total is not None:
+                _add(date_key, "nws", nws_total - obs_val)
+            d += timedelta(days=1)
 
     # NWS verification (temperature only) using cached forecast + WeatherLink observations
     if variable == 'temp':
@@ -1966,7 +2618,7 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
         "aifs": {"mae": [], "bias": [], "counts": []},
         "ifs": {"mae": [], "bias": [], "counts": []}
     }
-    if variable == 'temp':
+    if variable in ('temp', 'precip'):
         result["nws"] = {"mae": [], "bias": [], "counts": []}
 
     for date in dates:
@@ -1983,7 +2635,7 @@ def calculate_verification_time_series(location_name: str, variable: str = 'temp
                 result[model]["bias"].append(None)
                 result[model]["counts"].append(0)
 
-        if variable == 'temp':
+        if variable in ('temp', 'precip'):
             stats = errors_by_date[date]["nws"]
             if stats["count"] > 0:
                 mae = stats["sum_abs"] / stats["count"]
@@ -2549,6 +3201,29 @@ def api_verification_by_lead_time():
     period = request.args.get('period', 'all').lower()
 
     try:
+        cache = load_verif_lead_cache()
+        entries = cache.get("entries", {})
+        cache_key = f"{location_name}|{period}"
+        source_mtimes = _get_verif_ts_source_mtimes()
+
+        cached = entries.get(cache_key)
+        if cached:
+            cached_sources = cached.get("source_mtimes", {})
+            relevant_keys = ["forecasts"]
+            if period == "monthly":
+                # monthly uses recent obs data
+                relevant_keys.append("forecasts")
+            if period in ("all", "monthly"):
+                relevant_keys.append("nws")
+
+            if all(cached_sources.get(k) == source_mtimes.get(k) for k in relevant_keys):
+                return jsonify({
+                    "success": True,
+                    "location": location_name,
+                    "verification": cached.get("verification", {}),
+                    "period": period
+                })
+
         if period == 'monthly':
             result = calculate_lead_time_verification(location_name, days_back=30, use_cumulative=False)
         else:
@@ -2556,6 +3231,14 @@ def api_verification_by_lead_time():
 
         if "error" in result:
             return jsonify({"success": False, "error": result["error"]})
+
+        entries[cache_key] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source_mtimes": source_mtimes,
+            "verification": result
+        }
+        cache["entries"] = entries
+        save_verif_lead_cache(cache)
 
         return jsonify({
             "success": True,
@@ -2718,10 +3401,44 @@ def api_verification_time_series():
     days_back = int(request.args.get('days_back', 30))
 
     try:
+        cache = load_verif_ts_cache()
+        entries = cache.get("entries", {})
+        cache_key = f"{location_name}|{variable}|{lead_time}|{days_back}"
+
+        source_mtimes = _get_verif_ts_source_mtimes()
+
+        cached = entries.get(cache_key)
+        if cached:
+            cached_sources = cached.get("source_mtimes", {})
+            # For temp/mslp, cocorahs is not relevant; for mslp, NWS is not relevant
+            relevant_keys = ["forecasts"]
+            if variable in ("temp", "precip"):
+                relevant_keys.append("nws")
+            if variable == "precip":
+                relevant_keys.append("cocorahs")
+
+            if all(cached_sources.get(k) == source_mtimes.get(k) for k in relevant_keys):
+                return jsonify({
+                    "success": True,
+                    "location": location_name,
+                    "variable": variable,
+                    "lead_time": lead_time,
+                    "days_back": days_back,
+                    "time_series": cached.get("time_series", {})
+                })
+
         result = calculate_verification_time_series(location_name, variable, lead_time, days_back)
 
         if "error" in result:
             return jsonify({"success": False, "error": result["error"]})
+
+        entries[cache_key] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source_mtimes": source_mtimes,
+            "time_series": result
+        }
+        cache["entries"] = entries
+        save_verif_ts_cache(cache)
 
         return jsonify({
             "success": True,
@@ -2840,10 +3557,33 @@ def api_temp_bias_history():
     days_back = int(request.args.get('days_back', 30))
 
     try:
+        cache = load_bias_history_cache()
+        entries = cache.get("entries", {})
+        cache_key = f"temp|{location_name}|{lead_time}|{days_back}"
+        source_mtimes = _get_verif_ts_source_mtimes()
+
+        cached = entries.get(cache_key)
+        if cached and cached.get("source_mtimes", {}).get("forecasts") == source_mtimes.get("forecasts"):
+            return jsonify({
+                "success": True,
+                "location": location_name,
+                "lead_time": lead_time,
+                "days_back": days_back,
+                "history": cached.get("history", {})
+            })
+
         result = calculate_temp_bias_history(location_name, lead_time, days_back)
 
         if "error" in result:
             return jsonify({"success": False, "error": result["error"]})
+
+        entries[cache_key] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source_mtimes": source_mtimes,
+            "history": result
+        }
+        cache["entries"] = entries
+        save_bias_history_cache(cache)
 
         return jsonify({
             "success": True,
@@ -3006,10 +3746,33 @@ def api_mslp_bias_history():
     days_back = int(request.args.get('days_back', 30))
 
     try:
+        cache = load_bias_history_cache()
+        entries = cache.get("entries", {})
+        cache_key = f"mslp|{location_name}|{lead_time}|{days_back}"
+        source_mtimes = _get_verif_ts_source_mtimes()
+
+        cached = entries.get(cache_key)
+        if cached and cached.get("source_mtimes", {}).get("forecasts") == source_mtimes.get("forecasts"):
+            return jsonify({
+                "success": True,
+                "location": location_name,
+                "lead_time": lead_time,
+                "days_back": days_back,
+                "history": cached.get("history", {})
+            })
+
         result = calculate_mslp_bias_history(location_name, lead_time, days_back)
 
         if "error" in result:
             return jsonify({"success": False, "error": result["error"]})
+
+        entries[cache_key] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source_mtimes": source_mtimes,
+            "history": result
+        }
+        cache["entries"] = entries
+        save_bias_history_cache(cache)
 
         return jsonify({
             "success": True,
@@ -3022,6 +3785,198 @@ def api_mslp_bias_history():
         logger.error(f"Error calculating MSLP bias history: {e}")
         return jsonify({"success": False, "error": str(e)})
 
+
+@app.route('/api/precip-daily-history')
+def api_precip_daily_history():
+    """
+    Get daily precipitation history for Fairfax using CoCoRaHS (past) and latest model run (future only).
+    """
+    location_name = request.args.get('location', 'Fairfax, VA')
+    days_back = int(request.args.get('days_back', 30))
+    future_days = int(request.args.get('future_days', 15))
+    lead_time_hours = int(request.args.get('lead_time', 24))
+
+    if location_name != "Fairfax, VA":
+        return jsonify({"success": False, "error": "Precip history only available for Fairfax, VA"}), 400
+
+    now_utc = datetime.now(timezone.utc)
+    local_now = weatherlink.utc_to_eastern(now_utc.replace(tzinfo=None))
+    end_date = local_now.date() + timedelta(days=future_days)
+    start_date = (local_now.date() - timedelta(days=1)) - timedelta(days=days_back - 1)
+
+    obs_end = local_now.date() - timedelta(days=1)
+    obs_data = fetch_cocorahs_daily_precip(
+        COCORAHs_STATION_ID,
+        start_date.isoformat(),
+        obs_end.isoformat()
+    )
+
+    # Build model daily totals from latest run only (future dates)
+    db = load_forecasts_db()
+    runs = db.get(location_name, {}).get("runs", {})
+    latest_run_id = db.get(location_name, {}).get("latest_run")
+    run_data = runs.get(latest_run_id, {}) if latest_run_id else {}
+    has_ifs = any(rd.get("ifs") for rd in runs.values())
+
+    gfs_data = run_data.get("gfs", {})
+    aifs_data = run_data.get("aifs", {})
+    ifs_data = run_data.get("ifs", {})
+
+    times = gfs_data.get("times", [])
+    gfs_precips = gfs_data.get("precips", [])
+    aifs_precips = aifs_data.get("precips", [])
+    ifs_precips = ifs_data.get("precips", []) if ifs_data else []
+
+    model_daily = {}
+    for i, time_str in enumerate(times):
+        try:
+            valid_time = datetime.fromisoformat(time_str)
+            if valid_time.tzinfo is None:
+                valid_time = valid_time.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        local_dt = weatherlink.utc_to_eastern(valid_time.replace(tzinfo=None))
+        date_key = local_dt.date()
+        if date_key < local_now.date() or date_key > end_date:
+            continue
+
+        model_daily.setdefault(date_key, {"gfs": [], "aifs": [], "ifs": []})
+
+        if i < len(gfs_precips) and gfs_precips[i] is not None:
+            model_daily[date_key]["gfs"].append(gfs_precips[i])
+        if i < len(aifs_precips) and aifs_precips[i] is not None:
+            model_daily[date_key]["aifs"].append(aifs_precips[i])
+        if ifs_precips and i < len(ifs_precips) and ifs_precips[i] is not None:
+            model_daily[date_key]["ifs"].append(ifs_precips[i])
+
+    model_totals = {}
+    for date_key, vals in model_daily.items():
+        model_totals[date_key] = {
+            "gfs": sum(vals["gfs"]) if len(vals["gfs"]) >= 3 else None,
+            "aifs": sum(vals["aifs"]) if len(vals["aifs"]) >= 3 else None,
+            "ifs": sum(vals["ifs"]) if len(vals["ifs"]) >= 3 else None
+        }
+
+    # Build historical model daily totals (lead-time matched to 12Z) for bias only
+    def compute_daily_total_for_run(model_data, day_end_utc):
+        times = model_data.get("times", [])
+        precips = model_data.get("precips", [])
+        if not times or not precips:
+            return None, 0
+        window_start = day_end_utc - timedelta(hours=24)
+        total = 0.0
+        count = 0
+        for i, time_str in enumerate(times):
+            try:
+                valid_time = datetime.fromisoformat(time_str)
+                if valid_time.tzinfo is None:
+                    valid_time = valid_time.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if window_start < valid_time <= day_end_utc:
+                if i < len(precips) and precips[i] is not None:
+                    total += precips[i]
+                    count += 1
+        if count >= 3:
+            return total, count
+        return None, count
+
+    def select_best_total_for_date(model_key, day_end_utc):
+        best_total = None
+        best_init = None
+        for run_id, run_data in runs.items():
+            model_data = run_data.get(model_key, {})
+            init_time_str = model_data.get("init_time") or run_data.get("gfs", {}).get("init_time")
+            if not init_time_str:
+                continue
+            try:
+                init_time = datetime.fromisoformat(init_time_str)
+                if init_time.tzinfo is None:
+                    init_time = init_time.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+            # Check that this run provides the day_end_utc valid time at the selected lead time
+            times = model_data.get("times", [])
+            has_valid = False
+            for t in times:
+                try:
+                    valid_time = datetime.fromisoformat(t)
+                    if valid_time.tzinfo is None:
+                        valid_time = valid_time.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    continue
+                if valid_time == day_end_utc:
+                    lead_time = int((valid_time - init_time).total_seconds() / 3600)
+                    if lead_time == lead_time_hours:
+                        has_valid = True
+                    break
+            if not has_valid:
+                continue
+
+            total, count = compute_daily_total_for_run(model_data, day_end_utc)
+            if total is None:
+                continue
+
+            if best_init is None or init_time > best_init:
+                best_init = init_time
+                best_total = total
+
+        return best_total
+
+    dates = []
+    observed = []
+    gfs = []
+    aifs = []
+    ifs = []
+    gfs_bias = []
+    aifs_bias = []
+    ifs_bias = []
+
+    d = start_date
+    while d <= end_date:
+        date_str = d.isoformat()
+        dates.append(date_str)
+        observed.append(obs_data.get(date_str))
+        best_future = model_totals.get(d, {})
+        gfs.append(best_future.get("gfs"))
+        aifs.append(best_future.get("aifs"))
+        ifs.append(best_future.get("ifs"))
+
+        if d <= obs_end:
+            obs_val = obs_data.get(date_str)
+            day_end = datetime(d.year, d.month, d.day, 12, tzinfo=timezone.utc)
+            gfs_hist = select_best_total_for_date("gfs", day_end)
+            aifs_hist = select_best_total_for_date("aifs", day_end)
+            ifs_hist = select_best_total_for_date("ifs", day_end) if has_ifs else None
+            gfs_bias.append(
+                (gfs_hist - obs_val) if (gfs_hist is not None and obs_val is not None) else None
+            )
+            aifs_bias.append(
+                (aifs_hist - obs_val) if (aifs_hist is not None and obs_val is not None) else None
+            )
+            ifs_bias.append(
+                (ifs_hist - obs_val) if (ifs_hist is not None and obs_val is not None) else None
+            )
+        else:
+            gfs_bias.append(None)
+            aifs_bias.append(None)
+            ifs_bias.append(None)
+        d += timedelta(days=1)
+
+    return jsonify({
+        "success": True,
+        "station_id": COCORAHs_STATION_ID,
+        "dates": dates,
+        "observed": observed,
+        "gfs": gfs,
+        "aifs": aifs,
+        "ifs": ifs,
+        "gfs_bias": gfs_bias,
+        "aifs_bias": aifs_bias,
+        "ifs_bias": ifs_bias
+    })
 
 @app.route('/api/wave-analysis')
 def api_wave_analysis():
@@ -4049,7 +5004,7 @@ def api_era5_analog_compare_map():
         era5_z500    = analog_slice['z'].sel(**{pressure_coord: 500})
         era5_lats    = era5_z500[lat_coord].values
         era5_lons    = era5_z500[lon_coord].values
-        era5_heights = era5_z500.values / 9.80665  # → dam
+        era5_heights = era5_z500.values / 10.0  # m → dam
 
         # Climatology for ERA5 (shared between both panels)
         target_doy  = analog_time.dayofyear
@@ -4059,7 +5014,7 @@ def api_era5_analog_compare_map():
         mask        = ds_doy.dayofyear.isin(window_days)
         if mask.sum() > 0:
             clim_z500_raw = ds_doy.where(mask, drop=True)['z'].sel(**{pressure_coord: 500}).mean(dim='time')
-            clim_heights  = clim_z500_raw.values / 9.80665
+            clim_heights  = clim_z500_raw.values / 10.0  # m → dam
         else:
             clim_heights  = np.mean(era5_heights, axis=1, keepdims=True) * np.ones_like(era5_heights)
 
@@ -4073,7 +5028,7 @@ def api_era5_analog_compare_map():
         gfs_mask    = ds_doy.dayofyear.isin(gfs_window)
         if gfs_mask.sum() > 0:
             gfs_clim_raw  = ds_doy.where(gfs_mask, drop=True)['z'].sel(**{pressure_coord: 500}).mean(dim='time')
-            gfs_clim_vals = gfs_clim_raw.values / 9.80665
+            gfs_clim_vals = gfs_clim_raw.values / 10.0  # m → dam
         else:
             gfs_clim_vals = None  # fallback handled below
 
@@ -4644,6 +5599,24 @@ def api_era5_analog_history():
     except Exception as e:
         logger.error(f"Error loading analog history: {e}")
         return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/era5/latest-analog-result')
+def api_era5_latest_analog_result():
+    """
+    Return the most recently auto-computed analog prediction written by run_analog_sync().
+    Used by the Historical Weather UI to pre-populate the analog card on page load
+    without requiring a slow live recomputation.
+    """
+    try:
+        if not ANALOG_LATEST_FILE.exists():
+            return jsonify({'success': False, 'error': 'No cached analog result available yet'})
+        with open(ANALOG_LATEST_FILE) as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f"Error loading latest analog result: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/runs')
@@ -5284,12 +6257,11 @@ def api_asos_forecast_summary():
         run_data = runs[latest_run_key]
         forecast_hours = run_data.get("forecast_hours", [])
 
-        # Find the index for the requested lead time
+        # Find the index for the requested lead time (snap to nearest if exact not available)
         if lead_time not in forecast_hours:
-            return jsonify({
-                "success": False,
-                "error": f"Lead time {lead_time}h not available. Available: {forecast_hours}"
-            }), 400
+            if not forecast_hours:
+                return jsonify({"success": False, "error": "No forecast hours available"}), 400
+            lead_time = min(forecast_hours, key=lambda h: abs(h - lead_time))
 
         lead_time_index = forecast_hours.index(lead_time)
 
@@ -5425,9 +6397,11 @@ def api_asos_verification_map():
     model = request.args.get('model', 'gfs')
     lead_time = int(request.args.get('lead_time', 24))
     period = request.args.get('period', 'all')
+    if period == 'monthly' and get_asos_data_span_days() < 30:
+        period = 'all'
 
     # Check cache
-    cache_key = f"{variable}_{metric}_{model}_{lead_time}"
+    cache_key = f"{variable}_{metric}_{model}_{lead_time}_{period}"
     cache_ttl = 3600  # 1 hour
 
     if cache_key in _verification_cache:
@@ -5599,6 +6573,8 @@ def api_asos_station_verification():
     station_id = request.args.get('station_id')
     model = request.args.get('model') # Required model filter
     period = request.args.get('period', 'all')
+    if period == 'monthly' and get_asos_data_span_days() < 30:
+        period = 'all'
 
     if not station_id:
         return jsonify({"success": False, "error": "Missing station_id parameter"}), 400
@@ -5616,6 +6592,8 @@ def api_asos_station_verification():
                 "lead_times": raw_result["lead_times"],
                 "temp_mae": raw_result["temp_mae"],
                 "temp_bias": raw_result["temp_bias"],
+                "mslp_mae": raw_result["mslp_mae"],
+                "mslp_bias": raw_result["mslp_bias"],
                 "precip_mae": raw_result["precip_mae"],
                 "precip_bias": raw_result["precip_bias"],
             }
@@ -5631,8 +6609,10 @@ def api_asos_station_verification():
                 "lead_times": raw_result["lead_times"],
                 "temp_mae": raw_result["temp_mae"],
                 "temp_bias": raw_result["temp_bias"],
+                "temp_count": raw_result.get("temp_count", []),
                 "precip_mae": raw_result["precip_mae"],
                 "precip_bias": raw_result["precip_bias"],
+                "precip_count": raw_result.get("precip_count", []),
             }
 
         return jsonify({
@@ -5646,6 +6626,284 @@ def api_asos_station_verification():
     except Exception as e:
         logger.error(f"Error getting station verification for {station_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/asos/station-observations')
+def api_asos_station_observations():
+    """Return saved ASOS observations (temp/mslp) for a station."""
+    station_id = request.args.get('station_id', '').upper()
+    period = request.args.get('period', 'all').lower()
+    if period == 'monthly' and get_asos_data_span_days() < 30:
+        period = 'all'
+
+    if not station_id:
+        return jsonify({"success": False, "error": "Missing station_id"}), 400
+
+    try:
+        db = asos.load_asos_forecasts_db()
+        station_obs = db.get("observations", {}).get(station_id, {})
+        if not station_obs:
+            return jsonify({"success": False, "error": "No observations found for this station"}), 404
+
+        now = datetime.now(timezone.utc)
+        cutoff = None
+        if period == "monthly":
+            cutoff = now - timedelta(days=30)
+
+        times = []
+        temps = []
+        mslps = []
+        for time_str, obs in station_obs.items():
+            try:
+                dt = datetime.fromisoformat(time_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if cutoff and dt < cutoff:
+                continue
+
+            times.append(dt.astimezone(timezone.utc).isoformat())
+            temps.append(obs.get("temp"))
+            mslps.append(obs.get("mslp"))
+
+        zipped = sorted(zip(times, temps, mslps), key=lambda x: x[0])
+        if not zipped:
+            return jsonify({"success": False, "error": "No observations in selected period"}), 404
+
+        times, temps, mslps = zip(*zipped)
+        return jsonify({
+            "success": True,
+            "station_id": station_id,
+            "period": period,
+            "times": list(times),
+            "temps": list(temps),
+            "mslps": list(mslps)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching station observations: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/asos/station-obs-timeseries')
+def api_asos_station_obs_timeseries():
+    """Return per-time observations and model bias for a station/lead time."""
+    station_id = request.args.get('station_id', '').upper()
+    model = request.args.get('model', 'gfs').lower()
+    lead_time = int(request.args.get('lead_time', 24))
+    period = request.args.get('period', 'all').lower()
+    if period == 'monthly' and get_asos_data_span_days() < 30:
+        period = 'all'
+
+    if not station_id:
+        return jsonify({"success": False, "error": "Missing station_id"}), 400
+
+    try:
+        db = asos.load_asos_forecasts_db()
+        runs = db.get("runs", {})
+        if not runs:
+            return jsonify({"success": False, "error": "No ASOS forecast runs available"}), 404
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=30) if period == "monthly" else None
+
+        times = []
+        obs_temps = []
+        obs_precips = []
+        temp_bias = []
+        precip_bias = []
+
+        for run_key, run_data in runs.items():
+            try:
+                init_time = datetime.fromisoformat(run_key)
+                if init_time.tzinfo is None:
+                    init_time = init_time.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+            forecast_hours = run_data.get("forecast_hours", [])
+            if lead_time not in forecast_hours:
+                continue
+            idx = forecast_hours.index(lead_time)
+
+            model_data = run_data.get(model, {})
+            fcst = model_data.get(station_id)
+            if not fcst:
+                continue
+
+            valid_time = init_time + timedelta(hours=lead_time)
+            if valid_time >= now:
+                continue
+            if cutoff and valid_time < cutoff:
+                continue
+
+            # ASOS temps often report around :52; use wider window to match synoptic times.
+            # Use a wider window for temperature (ASOS often reports at :52)
+            station_obs = db.get("observations", {}).get(station_id, {})
+
+            def _nearest_var(var_key, max_delta_minutes=90):
+                best_val = None
+                best_delta = timedelta(minutes=max_delta_minutes + 1)
+                for obs_time_str, obs_data in station_obs.items():
+                    try:
+                        obs_time = datetime.fromisoformat(obs_time_str)
+                    except Exception:
+                        continue
+                    delta = abs(obs_time - valid_time)
+                    if delta > timedelta(minutes=max_delta_minutes):
+                        continue
+                    val = obs_data.get(var_key)
+                    if val is not None and delta < best_delta:
+                        best_delta = delta
+                        best_val = val
+                return best_val
+
+            obs_temp = _nearest_var('temp', max_delta_minutes=90)
+            # For precip, use 6-hr accumulation logic (synoptic times)
+            obs = asos.get_stored_observation(db, station_id, valid_time, max_delta_minutes=70)
+            obs_precip = obs.get("precip_6hr") if obs else None
+            if not obs:
+                continue
+
+            fcst_temps = fcst.get("temps", [])
+            fcst_precips = fcst.get("precips", [])
+            fcst_temp = fcst_temps[idx] if idx < len(fcst_temps) else None
+            fcst_precip = fcst_precips[idx] if idx < len(fcst_precips) else None
+
+
+            times.append(valid_time.astimezone(timezone.utc).isoformat())
+            obs_temps.append(obs_temp)
+            obs_precips.append(obs_precip)
+            temp_bias.append(
+                (fcst_temp - obs_temp) if (fcst_temp is not None and obs_temp is not None) else None
+            )
+            precip_bias.append(
+                (fcst_precip - obs_precip) if (fcst_precip is not None and obs_precip is not None) else None
+            )
+
+        if not times:
+            return jsonify({"success": False, "error": "No observations available for this station/lead time"}), 404
+
+        # Sort by time
+        zipped = sorted(zip(times, obs_temps, obs_precips, temp_bias, precip_bias), key=lambda x: x[0])
+        times, obs_temps, obs_precips, temp_bias, precip_bias = zip(*zipped)
+
+        return jsonify({
+            "success": True,
+            "station_id": station_id,
+            "model": model,
+            "lead_time": lead_time,
+            "period": period,
+            "times": list(times),
+            "obs_temps": list(obs_temps),
+            "obs_precips": list(obs_precips),
+            "temp_bias": list(temp_bias),
+            "precip_bias": list(precip_bias)
+        })
+    except Exception as e:
+        logger.error(f"Error building station obs time series: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/nws/qpf-debug')
+def api_nws_qpf_debug():
+    """
+    Fetch raw NWS gridpoint QPF periods around a target time for a station.
+    Query params:
+      - station_id (ASOS station id)
+      - target (ISO datetime, e.g. 2026-02-11T12:00:00Z)
+      - hours (window radius, default 24)
+    """
+    station_id = request.args.get('station_id', '').upper()
+    target_str = request.args.get('target')
+    hours = int(request.args.get('hours', 24))
+
+    if not station_id or not target_str:
+        return jsonify({"success": False, "error": "Missing station_id or target"}), 400
+
+    try:
+        target_time = datetime.fromisoformat(target_str.replace("Z", "+00:00"))
+        if target_time.tzinfo is None:
+            target_time = target_time.replace(tzinfo=timezone.utc)
+    except Exception:
+        return jsonify({"success": False, "error": "Invalid target datetime"}), 400
+
+    stations = asos.get_stations_dict()
+    st = stations.get(station_id)
+    if not st:
+        return jsonify({"success": False, "error": "Station not found"}), 404
+
+    lat = st.get("lat")
+    lon = st.get("lon")
+    if lat is None or lon is None:
+        return jsonify({"success": False, "error": "Station missing lat/lon"}), 400
+
+    # Get grid point
+    try:
+        url = f"{NWS_API}/points/{lat:.4f},{lon:.4f}"
+        resp = requests.get(url, headers=NWS_HEADERS, timeout=10)
+        resp.raise_for_status()
+        props = resp.json().get("properties", {})
+        grid_id = props.get("gridId")
+        grid_x = props.get("gridX")
+        grid_y = props.get("gridY")
+        if not grid_id:
+            return jsonify({"success": False, "error": "No grid info returned"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Grid lookup failed: {e}"}), 500
+
+    # Fetch gridpoint QPF values
+    try:
+        grid_url = f"{NWS_API}/gridpoints/{grid_id}/{grid_x},{grid_y}"
+        resp = requests.get(grid_url, headers=NWS_HEADERS, timeout=15)
+        resp.raise_for_status()
+        props = resp.json().get("properties", {})
+        qpf_values = props.get("quantitativePrecipitation", {}).get("values", [])
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Grid QPF fetch failed: {e}"}), 500
+
+    window_start = target_time - timedelta(hours=hours)
+    window_end = target_time + timedelta(hours=hours)
+    filtered = []
+
+    for entry in qpf_values:
+        valid_time = entry.get("validTime", "")
+        if "/" in valid_time:
+            start_str, dur_str = valid_time.split("/")
+        else:
+            start_str, dur_str = valid_time, "PT1H"
+        try:
+            start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        # Compute end from duration if possible
+        end_dt = None
+        try:
+            match = re.search(r'PT(\\d+)H', dur_str)
+            if match:
+                end_dt = start_dt + timedelta(hours=int(match.group(1)))
+        except Exception:
+            end_dt = None
+
+        if start_dt > window_end or (end_dt and end_dt < window_start):
+            continue
+
+        filtered.append({
+            "validTime": valid_time,
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat() if end_dt else None,
+            "value_mm": entry.get("value")
+        })
+
+    return jsonify({
+        "success": True,
+        "station_id": station_id,
+        "target": target_time.isoformat(),
+        "window_hours": hours,
+        "grid": {"id": grid_id, "x": grid_x, "y": grid_y},
+        "qpf_values": filtered
+    })
 
 
 @app.route('/api/asos/verification-time-series')
@@ -5730,6 +6988,8 @@ def api_asos_mean_verification():
     # The 'model' parameter is no longer taken here, as we fetch for all models.
     # Location is not directly used for mean across all stations.
     period = request.args.get('period', 'all').lower()
+    if period == 'monthly' and get_asos_data_span_days() < 30:
+        period = 'all'
 
     try:
         if period == 'monthly':
@@ -5897,8 +7157,8 @@ def api_asos_sync():
 
         logger.info(f"Syncing ASOS forecasts for {len(stations)} stations...")
 
-        # Define forecast hours (6-hourly up to 24h, then 24-hourly to 15 days)
-        forecast_hours = list(range(6, 25, 6)) + list(range(48, 361, 24))
+        # Define forecast hours (all 6-hour increments)
+        forecast_hours = list(range(6, 361, 6))
 
         results = {}
 
@@ -6040,6 +7300,39 @@ def api_asos_sync():
         return jsonify({"success": False, "error": str(e)})
 
 
+@app.route('/api/asos/nws-resync')
+def api_asos_nws_resync():
+    """Rebuild NWS ASOS forecasts and verification cache."""
+    try:
+        stations_list = asos.fetch_all_stations()
+        stations = [
+            {'station_id': s.station_id, 'lat': s.lat, 'lon': s.lon, 'name': s.name}
+            for s in stations_list
+        ]
+
+        gfs_init_str, _ = get_latest_init_times(None)
+        gfs_init = datetime.fromisoformat(gfs_init_str)
+        if gfs_init.tzinfo is None:
+            gfs_init = gfs_init.replace(tzinfo=timezone.utc)
+        forecast_hours = list(range(6, 361, 6))
+        nws_forecast_hours = [h for h in forecast_hours if h <= 168]
+        nws_raw = nws_batch.fetch_nws_forecasts_batch_sync(stations)
+        nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init)
+        asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
+
+        # Rebuild verification cache
+        asos.precompute_verification_cache()
+
+        return jsonify({
+            "success": True,
+            "message": "NWS ASOS forecasts refreshed",
+            "init_time": gfs_init.isoformat()
+        })
+    except Exception as e:
+        logger.error(f"NWS ASOS resync failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/sync-logs')
 def api_sync_logs():
     """
@@ -6156,6 +7449,29 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 save_forecast_data(location, gfs_data, aifs_data, observed, verification, ifs_data)
                 broadcast_sync_log("Fairfax forecast data saved successfully", 'success')
 
+                # Auto-compute historical analog pattern matching for this new GFS run.
+                # Skips silently if ERA5 drive is not mounted or result is already current.
+                broadcast_sync_log("Computing historical analog pattern matching...", 'info')
+                try:
+                    analog_result = run_analog_sync(gfs_init_time=gfs_init)
+                    if analog_result['status'] == 'computed':
+                        broadcast_sync_log(
+                            f"Analog prediction: {analog_result['avg_precip']:.2f}\" precip / "
+                            f"{analog_result['avg_temp']:.1f}°F avg temp "
+                            f"(pattern match: {analog_result['avg_correlation']:.0%})",
+                            'success'
+                        )
+                    elif analog_result['status'] == 'cached':
+                        broadcast_sync_log("Analog prediction already current", 'info')
+                    else:
+                        broadcast_sync_log(
+                            f"Analog matching skipped: {analog_result.get('message', analog_result.get('error', ''))}",
+                            'warning'
+                        )
+                except Exception as _ae:
+                    broadcast_sync_log(f"Analog pattern matching failed: {_ae}", 'warning')
+                    logger.warning(f"Analog sync failed during master sync: {_ae}", exc_info=True)
+
                 results['fairfax'] = {
                     'status': 'synced',
                     'message': 'Fetched new forecast data',
@@ -6176,6 +7492,87 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
         except Exception as e:
             broadcast_sync_log(f"NWS cache refresh failed: {e}", 'warning')
             logger.warning(f"NWS cache refresh failed: {e}")
+
+        # Refresh CoCoRaHS cache for last 30 days
+        try:
+            broadcast_sync_log("Refreshing CoCoRaHS daily precip cache (last 30 days)...", 'info')
+            now_utc = datetime.now(timezone.utc)
+            local_now = weatherlink.utc_to_eastern(now_utc.replace(tzinfo=None))
+            obs_end = local_now.date() - timedelta(days=1)
+            start_date = obs_end - timedelta(days=29)
+            fetch_cocorahs_daily_precip(COCORAHs_STATION_ID, start_date.isoformat(), obs_end.isoformat())
+            broadcast_sync_log("CoCoRaHS cache refreshed", 'success')
+        except Exception as e:
+            broadcast_sync_log(f"CoCoRaHS cache refresh failed: {e}", 'warning')
+            logger.warning(f"CoCoRaHS cache refresh failed: {e}")
+
+        # Precompute verification time series cache for fast first load
+        try:
+            broadcast_sync_log("Precomputing verification trends cache...", 'info')
+            precompute_verif_time_series_cache("Fairfax, VA", [
+                {"variable": "temp", "lead_time": 24, "days_back": 30},
+                {"variable": "mslp", "lead_time": 24, "days_back": 30},
+                {"variable": "precip", "lead_time": 24, "days_back": 30}
+            ])
+            broadcast_sync_log("Verification trends cache ready", 'success')
+        except Exception as e:
+            broadcast_sync_log(f"Verification trends cache failed: {e}", 'warning')
+            logger.warning(f"Verification trends cache failed: {e}")
+
+        # Precompute lead-time verification cache for table (monthly + all)
+        try:
+            broadcast_sync_log("Precomputing verification table cache...", 'info')
+            lead_cache = load_verif_lead_cache()
+            entries = lead_cache.get("entries", {})
+            source_mtimes = _get_verif_ts_source_mtimes()
+
+            for period in ["all", "monthly"]:
+                if period == "monthly":
+                    result = calculate_lead_time_verification("Fairfax, VA", days_back=30, use_cumulative=False)
+                else:
+                    result = calculate_lead_time_verification("Fairfax, VA", use_cumulative=True)
+                if "error" in result:
+                    continue
+                cache_key = f"Fairfax, VA|{period}"
+                entries[cache_key] = {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "source_mtimes": source_mtimes,
+                    "verification": result
+                }
+
+            lead_cache["entries"] = entries
+            save_verif_lead_cache(lead_cache)
+            broadcast_sync_log("Verification table cache ready", 'success')
+        except Exception as e:
+            broadcast_sync_log(f"Verification table cache failed: {e}", 'warning')
+            logger.warning(f"Verification table cache failed: {e}")
+
+        # Precompute bias history cache for fast first load
+        try:
+            broadcast_sync_log("Precomputing bias history cache...", 'info')
+            bias_cache = load_bias_history_cache()
+            bias_entries = bias_cache.get("entries", {})
+            source_mtimes = _get_verif_ts_source_mtimes()
+
+            for variable, calc_fn in [("temp", calculate_temp_bias_history), ("mslp", calculate_mslp_bias_history)]:
+                for lead_time in [24]:
+                    for days_back in [30]:
+                        result = calc_fn("Fairfax, VA", lead_time, days_back)
+                        if "error" in result:
+                            continue
+                        cache_key = f"{variable}|Fairfax, VA|{lead_time}|{days_back}"
+                        bias_entries[cache_key] = {
+                            "generated_at": datetime.now(timezone.utc).isoformat(),
+                            "source_mtimes": source_mtimes,
+                            "history": result
+                        }
+
+            bias_cache["entries"] = bias_entries
+            save_bias_history_cache(bias_cache)
+            broadcast_sync_log("Bias history cache ready", 'success')
+        except Exception as e:
+            broadcast_sync_log(f"Bias history cache failed: {e}", 'warning')
+            logger.warning(f"Bias history cache failed: {e}")
 
         # 2. Sync ASOS forecasts
         broadcast_sync_log("-" * 60, 'info')
@@ -6595,10 +7992,19 @@ def api_asos_single_run_bias():
 
             # Get observation for this valid time
             obs = get_observation(station_id, valid_time)
-            if not obs or variable not in obs or obs[variable] is None:
+            if not obs:
                 continue
 
-            observed_value = obs[variable]
+            # For precipitation, model forecasts are 6-hour accumulated totals.
+            # Use calculate_6hr_precip_total to match the same accumulation window.
+            if variable == 'precip':
+                observed_value = asos.calculate_6hr_precip_total(db, station_id, valid_time)
+                if observed_value is None:
+                    continue
+            else:
+                if obs.get(variable) is None:
+                    continue
+                observed_value = obs[variable]
 
             # Get forecast for each model
             for model in ['gfs', 'aifs', 'ifs', 'nws']:
