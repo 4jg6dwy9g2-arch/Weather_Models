@@ -50,6 +50,11 @@
             Rossby Waves
         </button>
     </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="single-bias-tab" data-bs-toggle="tab" data-bs-target="#singleBiasPane" type="button" role="tab" aria-controls="singleBiasPane" aria-selected="false">
+            Single Run Bias
+        </button>
+    </li>
 </ul>
 
 <div class="tab-content" id="modelVerificationContent">
@@ -61,6 +66,9 @@
     </div>
     <div class="tab-pane fade" id="rossbyPane" role="tabpanel" aria-labelledby="rossby-tab">
         <iframe class="verification-frame" src="/rossby?embed=1" title="Rossby Waves"></iframe>
+    </div>
+    <div class="tab-pane fade" id="singleBiasPane" role="tabpanel" aria-labelledby="single-bias-tab">
+        <iframe class="verification-frame" src="/single-run-bias?embed=1" title="Single Run Bias"></iframe>
     </div>
 </div>
 {% endblock %}

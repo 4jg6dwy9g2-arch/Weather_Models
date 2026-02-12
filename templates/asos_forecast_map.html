@@ -421,9 +421,10 @@ async function loadAsosForecastStations() {
 
         document.getElementById('asosForecastStationCount').textContent = `${data.count} stations`;
 
-        // Display valid time
+        // Display valid time (use actual lead time from response in case it was snapped)
         const initTime = new Date(data.init_time);
-        const validTime = new Date(initTime.getTime() + (leadTime * 60 * 60 * 1000));
+        const actualLeadTime = data.lead_time;
+        const validTime = new Date(initTime.getTime() + (actualLeadTime * 60 * 60 * 1000));
         const formatOptions = {
             weekday: 'short',
             month: 'short',

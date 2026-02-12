@@ -155,9 +155,35 @@
                             </div>
                             <div class="col-lg-6 mb-4">
                                 <div class="card h-100">
-                                    <div class="card-header"><i class="bi bi-speedometer"></i> Pressure Accuracy</div>
+                                    <div class="card-header"><i class="bi bi-cloud-rain"></i> Precipitation Accuracy</div>
                                     <div class="card-body chart-container chart-container-small">
-                                        <canvas id="asosMslpVerificationChart"></canvas>
+                                        <canvas id="asosPrecipVerificationChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-6 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><i class="bi bi-thermometer-half"></i> Station Temperature (Obs + Bias)</div>
+                                    <div class="card-body">
+                                        <div class="chart-container chart-container-small">
+                                            <canvas id="asosObsTempChart"></canvas>
+                                        </div>
+                                        <div class="chart-container mt-3" style="height: 180px;">
+                                            <canvas id="asosObsTempBiasChart"></canvas>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-6 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><i class="bi bi-cloud-rain"></i> Station Precipitation (Obs + Bias)</div>
+                                    <div class="card-body">
+                                        <div class="chart-container chart-container-small">
+                                            <canvas id="asosObsPrecipChart"></canvas>
+                                        </div>
+                                        <div class="chart-container mt-3" style="height: 180px;">
+                                            <canvas id="asosObsPrecipBiasChart"></canvas>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -404,8 +430,11 @@ function initAsosMap() {
 }
 
 // Color interpolation for MAE (green -> yellow -> red)
-function getMaeColor(value, minVal, maxVal) {
-    const ratio = Math.max(0, Math.min(1, (value - minVal) / (maxVal - minVal || 1)));
+function getMaeColor(value, minVal, maxVal, variable) {
+    // Fixed scale: different ranges for precipitation vs temp/mslp
+    const fixedMin = 0;
+    const fixedMax = (variable === 'precip') ? 1 : 10;
+    const ratio = Math.max(0, Math.min(1, (value - fixedMin) / (fixedMax - fixedMin)));
 
     // Green (#22c55e) -> Yellow (#eab308) -> Red (#ef4444)
     if (ratio < 0.5) {
@@ -425,47 +454,68 @@ function getMaeColor(value, minVal, maxVal) {
     }
 }
 
-// Color interpolation for Bias (blue -> white -> red)
-function getBiasColor(value, minVal, maxVal) {
-    // Normalize to -1 to 1
-    const maxAbs = Math.max(Math.abs(minVal), Math.abs(maxVal), 0.1);
-    const ratio = value / maxAbs;  // -1 to 1
+// Color interpolation for Bias with variable-specific color schemes
+function getBiasColor(value, minVal, maxVal, variable) {
+    // Fixed scale: different ranges for precipitation vs temp/mslp
+    const fixedMax = (variable === 'precip') ? 1 : 10;
+    const fixedMin = -fixedMax;
+    const clampedValue = Math.max(fixedMin, Math.min(fixedMax, value));
+    const ratio = clampedValue / fixedMax;  // -1 to 1
 
-    // Blue (#3b82f6) -> White (#ffffff) -> Red (#ef4444)
-    if (ratio < 0) {
-        // Blue to White
-        const t = 1 + ratio;  // 0 to 1
-        const r = Math.round(59 + t * (255 - 59));
-        const g = Math.round(130 + t * (255 - 130));
-        const b = Math.round(246 + t * (255 - 246));
-        return `rgb(${r}, ${g}, ${b})`;
+    // Different color schemes for precipitation vs temperature/pressure
+    if (variable === 'precip') {
+        // Precipitation: Brown (dry) -> White -> Green (wet)
+        const gradientRatio = (ratio + 1) / 2;  // 0 to 1
+        if (gradientRatio < 0.5) {
+            // Brown to White (negative bias - drier)
+            const t = gradientRatio * 2;  // 0 to 1
+            const r = Math.round(139 + t * (255 - 139));  // 139 to 255
+            const g = Math.round(69 + t * (255 - 69));    // 69 to 255
+            const b = Math.round(19 + t * (255 - 19));    // 19 to 255
+            return `rgb(${r}, ${g}, ${b})`;
+        } else {
+            // White to Green (positive bias - wetter)
+            const t = (gradientRatio - 0.5) * 2;  // 0 to 1
+            const r = Math.round(255 - t * (255 - 34));   // 255 to 34
+            const g = Math.round(255 - t * (255 - 139));  // 255 to 139
+            const b = Math.round(255 - t * (255 - 34));   // 255 to 34
+            return `rgb(${r}, ${g}, ${b})`;
+        }
     } else {
-        // White to Red
-        const t = ratio;  // 0 to 1
-        const r = Math.round(255 + t * (239 - 255));
-        const g = Math.round(255 + t * (68 - 255));
-        const b = Math.round(255 + t * (68 - 255));
-        return `rgb(${r}, ${g}, ${b})`;
+        // Temperature/Pressure: Blue -> White -> Red
+        if (ratio < 0) {
+            // Blue to White
+            const t = 1 + ratio;  // 0 to 1
+            const r = Math.round(59 + t * (255 - 59));
+            const g = Math.round(130 + t * (255 - 130));
+            const b = Math.round(246 + t * (255 - 246));
+            return `rgb(${r}, ${g}, ${b})`;
+        } else {
+            // White to Red
+            const t = ratio;  // 0 to 1
+            const r = Math.round(255 + t * (239 - 255));
+            const g = Math.round(255 + t * (68 - 255));
+            const b = Math.round(255 + t * (68 - 255));
+            return `rgb(${r}, ${g}, ${b})`;
+        }
     }
 }
 
 // Get color based on metric type
-function getMarkerColor(value, metric, minVal, maxVal) {
+function getMarkerColor(value, metric, minVal, maxVal, variable) {
     if (metric === 'bias') {
-        return getBiasColor(value, minVal, maxVal);
+        return getBiasColor(value, minVal, maxVal, variable);
     } else {
-        return getMaeColor(value, minVal, maxVal);
+        return getMaeColor(value, minVal, maxVal, variable);
     }
 }
 
 // Update color scale display
-function updateColorScale(metric, minVal, maxVal) {
+function updateColorScale(metric, minVal, maxVal, variable) {
     const scale = document.getElementById('asosColorScale');
     const minSpan = document.getElementById('asosColorMin');
     const maxSpan = document.getElementById('asosColorMax');
     const unitsSpan = document.getElementById('asosUnits');
-
-    const variable = document.getElementById('asosVariable').value;
 
     // Set units
     const units = {
@@ -475,14 +525,27 @@ function updateColorScale(metric, minVal, maxVal) {
     };
     unitsSpan.textContent = units[variable] || '';
 
-    // Format values
-    minSpan.textContent = minVal.toFixed(1);
-    maxSpan.textContent = maxVal.toFixed(1);
-
-    // Create gradient
+    // Use fixed scale ranges - different for precipitation vs temp/mslp
     if (metric === 'bias') {
-        scale.style.background = 'linear-gradient(to right, #3b82f6, #ffffff 50%, #ef4444)';
-    } else {
+        if (variable === 'precip') {
+            minSpan.textContent = '-1.0';
+            maxSpan.textContent = '1.0';
+            // Brown -> White -> Green gradient for precipitation
+            scale.style.background = 'linear-gradient(to right, rgb(139, 69, 19), rgb(255, 255, 255), rgb(34, 139, 34))';
+        } else {
+            minSpan.textContent = '-10.0';
+            maxSpan.textContent = '10.0';
+            // Blue -> White -> Red gradient for temperature/pressure
+            scale.style.background = 'linear-gradient(to right, #3b82f6, #ffffff 50%, #ef4444)';
+        }
+    } else {  // MAE
+        if (variable === 'precip') {
+            minSpan.textContent = '0.0';
+            maxSpan.textContent = '1.0';
+        } else {
+            minSpan.textContent = '0.0';
+            maxSpan.textContent = '10.0';
+        }
         scale.style.background = 'linear-gradient(to right, #22c55e, #eab308 50%, #ef4444)';
     }
 }
@@ -496,7 +559,11 @@ function clearAsosMarkers() {
 }
 
 let currentAsosTempChart = null;
-let currentAsosMslpChart = null;
+let currentAsosPrecipChart = null;
+let currentAsosObsTempChart = null;
+let currentAsosObsTempBiasChart = null;
+let currentAsosObsPrecipChart = null;
+let currentAsosObsPrecipBiasChart = null;
 let currentAsosStationId = null;
 let currentAsosStationName = null;
 
@@ -525,6 +592,7 @@ async function loadAsosStationCharts(stationId, stationName) {
 
         document.getElementById('asosStationMessage').classList.add('d-none');
         renderAsosVerificationCharts(data.verification, period);
+        loadAsosStationObservations(stationId, period);
 
     } catch (error) {
         console.error(`Error loading detailed verification for ${stationName}:`, error);
@@ -536,17 +604,233 @@ async function loadAsosStationCharts(stationId, stationName) {
     }
 }
 
+// Load saved observations (temp/mslp) for a station
+async function loadAsosStationObservations(stationId, period) {
+    const model = document.getElementById('asosModel').value;
+    const leadTime = document.getElementById('asosLeadTime').value;
+    try {
+        const response = await fetch(
+            `/api/asos/station-obs-timeseries?station_id=${encodeURIComponent(stationId)}&model=${encodeURIComponent(model)}&lead_time=${leadTime}&period=${period}`
+        );
+        const data = await response.json();
+        if (!data.success) {
+            if (currentAsosObsTempChart) currentAsosObsTempChart.destroy();
+            if (currentAsosObsTempBiasChart) currentAsosObsTempBiasChart.destroy();
+            if (currentAsosObsPrecipChart) currentAsosObsPrecipChart.destroy();
+            if (currentAsosObsPrecipBiasChart) currentAsosObsPrecipBiasChart.destroy();
+            return;
+        }
+        renderAsosObsCharts(data);
+    } catch (error) {
+        console.error(`Error loading observations for ${stationId}:`, error);
+        if (currentAsosObsTempChart) currentAsosObsTempChart.destroy();
+        if (currentAsosObsTempBiasChart) currentAsosObsTempBiasChart.destroy();
+        if (currentAsosObsPrecipChart) currentAsosObsPrecipChart.destroy();
+        if (currentAsosObsPrecipBiasChart) currentAsosObsPrecipBiasChart.destroy();
+    }
+}
+
+function renderAsosObsCharts(data) {
+    const labels = data.times.map(t => {
+        const date = new Date(t);
+        const md = date.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' });
+        const hh = date.toLocaleTimeString('en-US', { hour: '2-digit', hour12: false });
+        return `${md} ${hh}Z`;
+    });
+
+    const obsTemps = data.obs_temps || [];
+    const obsPrecip = data.obs_precips || [];
+    const tempBias = data.temp_bias || [];
+    const precipBias = data.precip_bias || [];
+
+    // Temperature observations
+    if (currentAsosObsTempChart) currentAsosObsTempChart.destroy();
+    currentAsosObsTempChart = new Chart(document.getElementById('asosObsTempChart'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'Temperature (°F)',
+                    data: obsTemps,
+                    borderColor: '#dc3545',
+                    backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 5,
+                    yAxisID: 'y'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    position: 'left',
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Temperature (°F)' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: { maxRotation: 45, minRotation: 45 }
+                }
+            }
+        }
+    });
+
+    // Temperature bias (model - obs)
+    if (currentAsosObsTempBiasChart) currentAsosObsTempBiasChart.destroy();
+    currentAsosObsTempBiasChart = new Chart(document.getElementById('asosObsTempBiasChart'), {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: `${data.model.toUpperCase()} Bias (°F)`,
+                data: tempBias,
+                backgroundColor: 'rgba(13, 110, 253, 0.7)',
+                borderColor: '#0d6efd',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: { position: 'top' }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Bias (°F)' },
+                    beginAtZero: true
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: { maxRotation: 45, minRotation: 45 }
+                }
+            }
+        }
+    });
+
+    // Precip observations
+    if (currentAsosObsPrecipChart) currentAsosObsPrecipChart.destroy();
+    currentAsosObsPrecipChart = new Chart(document.getElementById('asosObsPrecipChart'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'Precipitation (in)',
+                    data: obsPrecip,
+                    borderColor: '#20c997',
+                    backgroundColor: 'rgba(32, 201, 151, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 5
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Precipitation (in)' },
+                    beginAtZero: true
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: { maxRotation: 45, minRotation: 45 }
+                }
+            }
+        }
+    });
+
+    // Precip bias (model - obs)
+    if (currentAsosObsPrecipBiasChart) currentAsosObsPrecipBiasChart.destroy();
+    currentAsosObsPrecipBiasChart = new Chart(document.getElementById('asosObsPrecipBiasChart'), {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: `${data.model.toUpperCase()} Bias (in)`,
+                data: precipBias,
+                backgroundColor: 'rgba(32, 201, 151, 0.7)',
+                borderColor: '#20c997',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: { position: 'top' }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Bias (in)' },
+                    beginAtZero: true
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: { maxRotation: 45, minRotation: 45 }
+                }
+            }
+        }
+    });
+
+}
+
 // Render detailed verification charts for a single ASOS station
 function renderAsosVerificationCharts(v, period = 'all') {
     const periodSuffix = period === 'monthly' ? ' (30-day avg)' : '';
     const tempIndices = v.lead_times
         .map((_, i) => i)
         .filter(i => v.temp_mae[i] !== null || v.temp_bias[i] !== null);
-    const mslpIndices = v.lead_times
+    const precipIndices = v.lead_times
         .map((_, i) => i)
-        .filter(i => v.mslp_mae[i] !== null || v.mslp_bias[i] !== null);
+        .filter(i => v.precip_mae && (v.precip_mae[i] !== null || v.precip_bias[i] !== null));
     const tempLabels = tempIndices.map(i => formatLeadTime(v.lead_times[i]));
-    const mslpLabels = mslpIndices.map(i => formatLeadTime(v.lead_times[i]));
+    const precipLabels = precipIndices.map(i => formatLeadTime(v.lead_times[i]));
 
     // Temperature MAE and Bias Chart
     const tempDatasets = [
@@ -594,6 +878,15 @@ function renderAsosVerificationCharts(v, period = 'all') {
                         padding: 20
                     }
                 },
+                tooltip: {
+                    callbacks: {
+                        footer: (items) => {
+                            const i = tempIndices[items[0].dataIndex];
+                            const count = v.temp_count ? v.temp_count[i] : null;
+                            return count != null ? `Samples: ${count}` : '';
+                        }
+                    }
+                },
                 annotation: {
                     annotations: {
                         zeroLine: {
@@ -632,13 +925,13 @@ function renderAsosVerificationCharts(v, period = 'all') {
         }
     });
 
-    // Pressure MAE and Bias Chart
-    const mslpDatasets = [
+    // Precipitation MAE and Bias Chart
+    const precipDatasets = [
         {
-            label: `MAE (mb)${periodSuffix}`,
-            data: mslpIndices.map(i => v.mslp_mae[i]),
-            borderColor: '#6f42c1',
-            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+            label: `MAE (in)${periodSuffix}`,
+            data: precipIndices.map(i => v.precip_mae[i]),
+            borderColor: '#0ea5e9',
+            backgroundColor: 'rgba(14, 165, 233, 0.1)',
             fill: false,
             tension: 0.3,
             pointRadius: 3,
@@ -646,10 +939,10 @@ function renderAsosVerificationCharts(v, period = 'all') {
             yAxisID: 'y'
         },
         {
-            label: `Bias (mb)${periodSuffix}`,
-            data: mslpIndices.map(i => v.mslp_bias[i]),
-            borderColor: '#fd7e14',
-            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+            label: `Bias (in)${periodSuffix}`,
+            data: precipIndices.map(i => v.precip_bias[i]),
+            borderColor: '#84cc16',
+            backgroundColor: 'rgba(132, 204, 22, 0.1)',
             fill: false,
             tension: 0.3,
             pointRadius: 3,
@@ -659,10 +952,10 @@ function renderAsosVerificationCharts(v, period = 'all') {
         }
     ];
 
-    if (currentAsosMslpChart) currentAsosMslpChart.destroy();
-    currentAsosMslpChart = new Chart(document.getElementById('asosMslpVerificationChart'), {
+    if (currentAsosPrecipChart) currentAsosPrecipChart.destroy();
+    currentAsosPrecipChart = new Chart(document.getElementById('asosPrecipVerificationChart'), {
         type: 'line',
-        data: { labels: mslpLabels, datasets: mslpDatasets },
+        data: { labels: precipLabels, datasets: precipDatasets },
         options: {
             responsive: true,
             maintainAspectRatio: false,
@@ -678,6 +971,15 @@ function renderAsosVerificationCharts(v, period = 'all') {
                         padding: 20
                     }
                 },
+                tooltip: {
+                    callbacks: {
+                        footer: (items) => {
+                            const i = precipIndices[items[0].dataIndex];
+                            const count = v.precip_count ? v.precip_count[i] : null;
+                            return count != null ? `Samples: ${count}` : '';
+                        }
+                    }
+                },
                 annotation: {
                     annotations: {
                         zeroLine: {
@@ -687,7 +989,7 @@ function renderAsosVerificationCharts(v, period = 'all') {
                             borderColor: '#999',
                             borderWidth: 1,
                             borderDash: [5, 5],
-                            yAxisID: 'y1' // Ensure zero line applies to bias axis
+                            yAxisID: 'y1'
                         }
                     }
                 }
@@ -702,15 +1004,15 @@ function renderAsosVerificationCharts(v, period = 'all') {
                     display: true,
                     position: 'left',
                     grid: { color: '#e0e0e0' },
-                    title: { display: true, text: 'MAE (mb)' },
-                    min: 0 // MAE should start from 0
+                    title: { display: true, text: 'MAE (in)' },
+                    min: 0
                 },
                 y1: {
                     type: 'linear',
                     display: true,
                     position: 'right',
                     grid: { drawOnChartArea: false },
-                    title: { display: true, text: 'Bias (mb)' }
+                    title: { display: true, text: 'Bias (in)' }
                 }
             }
         }
@@ -948,7 +1250,7 @@ async function loadAsosVerification() {
         }
 
         // Update color scale
-        updateColorScale(metric, data.min_value, data.max_value);
+        updateColorScale(metric, data.min_value, data.max_value, variable);
 
         // Clear existing markers
         clearAsosMarkers();
@@ -957,10 +1259,23 @@ async function loadAsosVerification() {
         for (const station of stations) {
             if (!station.lat || !station.lon) continue;
 
-            const color = getMarkerColor(station.value, metric, data.min_value, data.max_value);
+            const color = getMarkerColor(station.value, metric, data.min_value, data.max_value, variable);
+
+            // Calculate radius proportional to value magnitude
+            // Different scales for precipitation (0-1) vs temp/mslp (0-10)
+            const maxScale = (variable === 'precip') ? 1 : 10;
+            let radius;
+            if (metric === 'bias') {
+                const absValue = Math.abs(station.value);
+                const normalized = Math.min(absValue / maxScale, 1);
+                radius = 3 + normalized * 4.5;  // 3 to 7.5
+            } else {  // MAE
+                const normalized = Math.min(station.value / maxScale, 1);
+                radius = 3 + normalized * 4.5;  // 3 to 7.5
+            }
 
             const marker = L.circleMarker([station.lat, station.lon], {
-                radius: 6,
+                radius: radius,
                 fillColor: color,
                 color: '#333',
                 weight: 1,
@@ -1204,6 +1519,11 @@ document.getElementById('asosLeadTime').addEventListener('change', loadAsosVerif
 document.getElementById('asosPeriodToggle').addEventListener('change', function() {
     loadAsosVerification();
     loadMeanAsosVerification(this.checked ? 'monthly' : 'all');
+    if (currentAsosStationId) {
+        loadAsosStationCharts(currentAsosStationId, currentAsosStationName || '');
+    }
+});
+document.getElementById('asosLeadTime').addEventListener('change', function() {
     if (currentAsosStationId) {
         loadAsosStationCharts(currentAsosStationId, currentAsosStationName || '');
     }

@@ -32,13 +32,43 @@ import json
 logger = logging.getLogger(__name__)
 
 # Stations known to report cumulative or unreliable precip that breaks 6-hr totals
-PRECIP_EXCLUDE_STATIONS = {"SMD"}
+PRECIP_EXCLUDE_STATIONS = {"SMD", "ADF"}  # ADF gauge stuck at 2.56/5.12" (tipping bucket overflow)
+
+# ASOS tipping-bucket gauges overflow at 256 tips × 0.01"/tip = 2.56 inches.
+# When the internal counter wraps the sensor reports 2.56, 5.12, 7.68, … inches
+# rather than the true accumulation.  These are not real precipitation and must
+# be discarded before computing hourly maxima.
+_TIPPING_BUCKET_OVERFLOW_IN = 2.56
+
+
+def _is_overflow_value(v: float) -> bool:
+    """Return True if v is an exact multiple of the tipping-bucket overflow increment."""
+    if v <= 0:
+        return False
+    ratio = v / _TIPPING_BUCKET_OVERFLOW_IN
+    return abs(ratio - round(ratio)) < 1e-4
 
 
 def should_include_precip(fcst_val, obs_val) -> bool:
-    """Include precip verification unless both forecast and observed are zero."""
+    """
+    Include precip verification only for meaningful precipitation events.
+
+    Excludes zero-zero pairs where both forecast and observation are zero, because:
+    - They inflate sample size without adding information about precipitation skill
+    - MAE should represent error in actual precipitation amounts, not dry periods
+    - Correctly predicting "no rain" when there's no rain is trivial
+
+    Includes:
+    - Forecast > 0, Observed = 0 (false alarm)
+    - Forecast = 0, Observed > 0 (missed precipitation)
+    - Forecast > 0, Observed > 0 (verify amount)
+
+    Excludes:
+    - Forecast = 0, Observed = 0 (both dry, no skill test)
+    """
     if fcst_val is None or obs_val is None:
         return False
+    # Exclude zero-zero pairs (both correctly predict no precipitation)
     if fcst_val == 0 and obs_val == 0:
         return False
     return True
@@ -59,13 +89,22 @@ STATIONS_CACHE_FILE = CACHE_DIR / "stations.json"
 STATIONS_CACHE_TTL_DAYS = 7
 
 # ASOS forecasts storage file (in project directory)
-ASOS_FORECASTS_FILE = Path(__file__).parent / "asos_forecasts.json"
+ASOS_FORECASTS_FILE = Path(__file__).parent / "data" / "asos_forecasts.json"
 
 # ASOS verification cache file (precomputed stats)
-ASOS_VERIFICATION_CACHE_FILE = Path(__file__).parent / "asos_verification_cache.json"
+ASOS_VERIFICATION_CACHE_FILE = Path(__file__).parent / "data" / "asos_verification_cache.json"
 
 # Retention period for stored forecasts
 FORECASTS_RETENTION_DAYS = 21
+
+# ---------------------------------------------------------------------------
+# In-memory caches for large JSON files (invalidated when file mtime changes)
+# ---------------------------------------------------------------------------
+_asos_forecasts_db_cache: dict | None = None
+_asos_forecasts_db_mtime: float | None = None
+
+_verification_cache_data: dict | None = None
+_verification_cache_mtime: float | None = None
 
 # US states with ASOS networks
 US_STATES = [
@@ -428,29 +467,44 @@ def _get_6hr_window_end(dt: datetime) -> datetime:
 
 
 def load_asos_forecasts_db() -> dict:
-    """Load the ASOS forecasts database from JSON file."""
-    if ASOS_FORECASTS_FILE.exists():
-        try:
-            with open(ASOS_FORECASTS_FILE) as f:
-                data = json.load(f)
-                # Ensure cumulative_stats structure exists
-                if "cumulative_stats" not in data:
-                    data["cumulative_stats"] = {
-                        "by_station": {},
-                        "by_lead_time": {},
-                        "time_series": {}
-                    }
-                # Ensure time_series exists in cumulative_stats
-                if "time_series" not in data["cumulative_stats"]:
-                    data["cumulative_stats"]["time_series"] = {}
-                # Monthly cache for recent stats
-                if "by_station_monthly" not in data["cumulative_stats"]:
-                    data["cumulative_stats"]["by_station_monthly"] = {}
-                if "monthly_generated_at" not in data["cumulative_stats"]:
-                    data["cumulative_stats"]["monthly_generated_at"] = None
-                return data
-        except Exception as e:
-            logger.warning(f"Error loading asos_forecasts.json: {e}")
+    """Load the ASOS forecasts database from JSON file, with in-memory mtime cache."""
+    global _asos_forecasts_db_cache, _asos_forecasts_db_mtime
+    if not ASOS_FORECASTS_FILE.exists():
+        return {
+            "stations": {},
+            "runs": {},
+            "cumulative_stats": {
+                "by_station": {},
+                "by_lead_time": {},
+                "time_series": {},
+                "by_station_monthly": {},
+                "monthly_generated_at": None
+            }
+        }
+    try:
+        current_mtime = ASOS_FORECASTS_FILE.stat().st_mtime
+        if _asos_forecasts_db_cache is not None and _asos_forecasts_db_mtime == current_mtime:
+            return _asos_forecasts_db_cache
+        with open(ASOS_FORECASTS_FILE) as f:
+            data = json.load(f)
+        # Ensure cumulative_stats structure exists
+        if "cumulative_stats" not in data:
+            data["cumulative_stats"] = {
+                "by_station": {},
+                "by_lead_time": {},
+                "time_series": {}
+            }
+        if "time_series" not in data["cumulative_stats"]:
+            data["cumulative_stats"]["time_series"] = {}
+        if "by_station_monthly" not in data["cumulative_stats"]:
+            data["cumulative_stats"]["by_station_monthly"] = {}
+        if "monthly_generated_at" not in data["cumulative_stats"]:
+            data["cumulative_stats"]["monthly_generated_at"] = None
+        _asos_forecasts_db_cache = data
+        _asos_forecasts_db_mtime = current_mtime
+        return _asos_forecasts_db_cache
+    except Exception as e:
+        logger.warning(f"Error loading asos_forecasts.json: {e}")
     return {
         "stations": {},
         "runs": {},
@@ -844,8 +898,13 @@ def calculate_6hr_precip_total(db: dict, station_id: str, end_time: datetime) ->
     """
     Calculate 6-hour accumulated precipitation ending at the specified time.
 
-    Accumulates 1-hour precipitation observations over the 6-hour period ending
-    at end_time. This is used to match model 6-hour precipitation forecasts.
+    ASOS p01i is a running accumulation that resets after each hourly METAR (:53).
+    Within a clock hour the values grow from ~0 up to the full hour total, so
+    the maximum p01i in each clock hour equals that hour's true precipitation total.
+
+    Correct approach: take the maximum p01i per clock hour, then sum over 6 hours.
+    This avoids the double-counting error that occurs when summing all sub-hourly
+    observations (each of which is a cumulative sub-total, not an independent increment).
 
     Args:
         db: The loaded database
@@ -862,41 +921,65 @@ def calculate_6hr_precip_total(db: dict, station_id: str, end_time: datetime) ->
     if not station_obs:
         return None
 
-    # Collect all 1-hour precipitation values in the 6-hour window
+    # Define the 6-hour window
     start_time = end_time - timedelta(hours=6)
-    precip_values = []
 
-    # Look for observations within each hour of the 6-hour period
-    for hour_offset in range(6):
-        # Target time for this hour (e.g., if end_time is 06Z, we want 01Z, 02Z, 03Z, 04Z, 05Z, 06Z)
-        target = start_time + timedelta(hours=hour_offset + 1)
+    # Collect all observations in the window, sorted by time.
+    window_obs = []
+    for obs_time_str, obs_data in station_obs.items():
+        try:
+            obs_time = datetime.fromisoformat(obs_time_str)
+            if start_time < obs_time <= end_time:
+                precip = obs_data.get('precip')
+                if precip is not None:
+                    window_obs.append((obs_time, precip))
+        except (ValueError, AttributeError):
+            continue
 
-        # Find observation closest to this hour (within 30 minutes)
-        best_obs = None
-        best_delta = timedelta(minutes=31)
-
-        for obs_time_str, obs_data in station_obs.items():
-            try:
-                obs_time = datetime.fromisoformat(obs_time_str)
-                delta = abs(obs_time - target)
-
-                if delta < best_delta:
-                    best_delta = delta
-                    best_obs = obs_data
-            except ValueError:
-                continue
-
-        # If we found an observation within 30 minutes and it has precip data
-        if best_obs and best_obs.get('precip') is not None:
-            precip_values.append(best_obs['precip'])
-        # else: missing data for this hour
-
-    # Require at least 4 out of 6 hours to have data (allows some missing obs)
-    if len(precip_values) < 4:
+    if not window_obs:
         return None
 
-    # Sum up the 1-hour values to get 6-hour total
-    return sum(precip_values)
+    window_obs.sort(key=lambda x: x[0])
+
+    # Pre-filter tipping-bucket overflow artifacts (2.56", 5.12", 7.68", …).
+    # These appear as isolated spikes before or during a stuck-gauge run and
+    # escape the consecutive-duplicate detector below.
+    window_obs = [(t, p) for t, p in window_obs if not _is_overflow_value(p)]
+
+    if not window_obs:
+        return None
+
+    # Detect stuck-gauge readings: a non-zero value repeated 2+ consecutive times
+    # is a sensor malfunction.  Real ASOS running totals always increase between
+    # reports; a flat non-zero reading means the gauge is stuck.
+    # Build a set of timestamps to exclude.
+    stuck_times: set = set()
+    if len(window_obs) >= 2:
+        for i in range(len(window_obs) - 1):
+            v0, v1 = window_obs[i][1], window_obs[i+1][1]
+            if v0 > 0 and v0 == v1:
+                # Mark this run (and any continuations) as stuck
+                j = i
+                while j < len(window_obs) and window_obs[j][1] == v0:
+                    stuck_times.add(window_obs[j][0])
+                    j += 1
+
+    # Group non-stuck observations by clock hour and take the maximum p01i per hour.
+    # The maximum equals the full-hour METAR total because sub-hourly automated
+    # reports are running sub-totals that peak at the :53 METAR observation.
+    hourly_max: dict = {}  # hour_key (datetime truncated to hour) -> max p01i
+
+    for obs_time, precip in window_obs:
+        if obs_time in stuck_times:
+            continue
+        hour_key = obs_time.replace(minute=0, second=0, microsecond=0)
+        if hour_key not in hourly_max or precip > hourly_max[hour_key]:
+            hourly_max[hour_key] = precip
+
+    if not hourly_max:
+        return None
+
+    return sum(hourly_max.values())
 
 
 def get_stored_observation(db: dict, station_id: str, target_time: datetime, max_delta_minutes: int = 30) -> Optional[dict]:
@@ -1401,6 +1484,72 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
         "station": station,
         "lead_times": lead_times,
         "data": result_data
+    }
+
+
+def get_station_detail_from_cache(station_id: str, model: str) -> dict:
+    """
+    Get detailed verification for a single station from the precomputed verification cache.
+
+    The verification cache is built using composite observation matching (get_cached_observation),
+    which correctly finds temperature data at :56 even when MSLP-only reports exist at :00.
+    This avoids the issue where get_station_detail() uses non-composite get_stored_observation()
+    and misses temperature data for some stations.
+
+    Returns a flat structure with lead_times, temp_mae, temp_bias, mslp_mae, mslp_bias lists.
+    """
+    cache = load_verification_cache()
+    if cache is None:
+        return {"error": "Verification cache not available. Run a sync to rebuild it."}
+
+    stations = cache.get("stations", {})
+    station = stations.get(station_id)
+    if not station:
+        # Try the main DB as fallback for station metadata
+        db = load_asos_forecasts_db()
+        station = db.get("stations", {}).get(station_id)
+    if not station:
+        return {"error": "Station not found"}
+
+    station_data = cache.get("by_station", {}).get(station_id, {})
+    model_data = station_data.get(model.lower(), {})
+
+    if not model_data:
+        return {"error": "No verification data for this station"}
+
+    lead_times = cache.get("lead_times", [])  # List of integers
+
+    temp_mae = []
+    temp_bias = []
+    precip_mae = []
+    precip_bias = []
+
+    temp_count = []
+    precip_count = []
+
+    for lt in lead_times:
+        lt_str = str(lt)
+        lt_data = model_data.get(lt_str, {})
+
+        temp = lt_data.get('temp')
+        temp_mae.append(temp['mae'] if temp else None)
+        temp_bias.append(temp['bias'] if temp else None)
+        temp_count.append(temp['count'] if temp else 0)
+
+        precip = lt_data.get('precip')
+        precip_mae.append(precip['mae'] if precip else None)
+        precip_bias.append(precip['bias'] if precip else None)
+        precip_count.append(precip['count'] if precip else 0)
+
+    return {
+        "station": station,
+        "lead_times": lead_times,
+        "temp_mae": temp_mae,
+        "temp_bias": temp_bias,
+        "temp_count": temp_count,
+        "precip_mae": precip_mae,
+        "precip_bias": precip_bias,
+        "precip_count": precip_count,
     }
 
 
@@ -2085,22 +2234,27 @@ def precompute_verification_cache() -> dict:
 
 def load_verification_cache() -> Optional[dict]:
     """
-    Load precomputed verification cache from file.
+    Load precomputed verification cache from file, with in-memory mtime cache.
 
     Returns:
         Dict with cached verification data, or None if cache doesn't exist
     """
+    global _verification_cache_data, _verification_cache_mtime
     if not ASOS_VERIFICATION_CACHE_FILE.exists():
         logger.warning(f"Verification cache file not found: {ASOS_VERIFICATION_CACHE_FILE}")
         return None
 
     try:
+        current_mtime = ASOS_VERIFICATION_CACHE_FILE.stat().st_mtime
+        if _verification_cache_data is not None and _verification_cache_mtime == current_mtime:
+            return _verification_cache_data
         with open(ASOS_VERIFICATION_CACHE_FILE) as f:
             cache_data = json.load(f)
-
         last_updated = cache_data.get("last_updated", "unknown")
         logger.info(f"Loaded verification cache (last updated: {last_updated})")
-        return cache_data
+        _verification_cache_data = cache_data
+        _verification_cache_mtime = current_mtime
+        return _verification_cache_data
     except Exception as e:
         logger.error(f"Error loading verification cache: {e}")
         return None
@@ -2290,14 +2444,19 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = 30)
     if not model_data:
         return {"error": "No monthly data for this station"}
 
-    # Build lead time list from available temp or mslp data
-    lead_times = sorted({int(k) for k in model_data.get("temp", {}).keys()} |
-                        {int(k) for k in model_data.get("mslp", {}).keys()})
+    # Build lead time list from available temp, mslp, or precip data
+    lead_times = sorted(
+        {int(k) for k in model_data.get("temp", {}).keys()} |
+        {int(k) for k in model_data.get("mslp", {}).keys()} |
+        {int(k) for k in model_data.get("precip", {}).keys()}
+    )
 
     temp_mae = []
     temp_bias = []
     mslp_mae = []
     mslp_bias = []
+    precip_mae = []
+    precip_bias = []
 
     for lt in lead_times:
         lt_str = str(lt)
@@ -2320,6 +2479,15 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = 30)
             mslp_mae.append(None)
             mslp_bias.append(None)
 
+        precip_stats = model_data.get("precip", {}).get(lt_str)
+        if precip_stats and precip_stats.get("count", 0) > 0:
+            count = precip_stats["count"]
+            precip_mae.append(round(precip_stats["sum_abs_errors"] / count, 2))
+            precip_bias.append(round(precip_stats["sum_errors"] / count, 2))
+        else:
+            precip_mae.append(None)
+            precip_bias.append(None)
+
     return {
         "station": station,
         "lead_times": lead_times,
@@ -2327,6 +2495,8 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = 30)
         "temp_bias": temp_bias,
         "mslp_mae": mslp_mae,
         "mslp_bias": mslp_bias,
+        "precip_mae": precip_mae,
+        "precip_bias": precip_bias,
         "period_days": days_back
     }
 
