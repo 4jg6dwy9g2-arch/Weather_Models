@@ -90,10 +90,12 @@ ANALOG_HISTORY_FILE = Path(__file__).parent / "data" / "analog_forecast_history.
 ANALOG_LATEST_FILE = Path(__file__).parent / "data" / "analog_latest_result.json"
 SOM_CACHE_FILE = Path(__file__).parent / "data" / "era5_som_cache_6x6_30y_anom.npz"
 SOM_SKILL_FILE = Path(__file__).parent / "data" / "som_cluster_skill.json"
+EOF_CACHE_FILE = Path(__file__).parent / "data" / "era5_eof_cache_30y.npz"
 
 _SOM_CACHE: dict | None = None
 _SOM_SKILL_CACHE: dict = {}
 _SOM_ANOM_CACHE: dict | None = None
+_EOF_CACHE: dict | None = None
 
 # ---------------------------------------------------------------------------
 # ERA5 analog caches (populated lazily, persist for the lifetime of the process)
@@ -5413,6 +5415,54 @@ def compute_analog_grid(ds, dates, variable_name, days=14, aggregation='sum'):
     return avg_grid
 
 
+def compute_analog_exceedance_probs(precip_ds, analog_dates, clim_precip, days=14):
+    """
+    For each CONUS grid point, compute the fraction of analog dates on which
+    the 14-day accumulated precipitation was:
+      - Above WET_FACTOR × climatological mean  (flood risk)
+      - Below DRY_FACTOR × climatological mean  (drought risk)
+
+    Returns:
+        tuple (prob_flood, prob_drought): two float32 arrays of shape (lat, lon)
+        with values 0–100 (percent), or (None, None) if no analogs processed.
+    """
+    import pandas as pd
+
+    WET_FACTOR = 1.75   # >175 % of normal → potential flooding
+    DRY_FACTOR = 0.25   # < 25 % of normal → severe drought
+
+    flood_count  = None
+    drought_count = None
+    n_valid = 0
+
+    for analog_date in analog_dates:
+        try:
+            end_date = analog_date + pd.Timedelta(days=days - 1)
+            window = precip_ds['tp'].sel(time=slice(analog_date, end_date))
+
+            if len(window.time) < 10:
+                continue
+
+            total = window.sum(dim='time').values  # shape (lat, lon)
+
+            if flood_count is None:
+                flood_count   = np.zeros_like(total, dtype=np.float32)
+                drought_count = np.zeros_like(total, dtype=np.float32)
+
+            flood_count   += (total > clim_precip * WET_FACTOR).astype(np.float32)
+            drought_count += (total < clim_precip * DRY_FACTOR).astype(np.float32)
+            n_valid += 1
+
+        except Exception as e:
+            logger.warning(f"Exceedance prob failed for {analog_date}: {e}")
+            continue
+
+    if n_valid == 0 or flood_count is None:
+        return None, None
+
+    return (flood_count / n_valid * 100.0), (drought_count / n_valid * 100.0)
+
+
 @app.route('/api/era5/analogs-conus')
 def api_era5_analogs_conus():
     """
@@ -5431,45 +5481,100 @@ def api_era5_analogs_conus():
         import numpy as np
         import pandas as pd
 
-        top_n = int(request.args.get('top_n', 10))
+        top_n           = int(request.args.get('top_n', 10))
         variable_filter = request.args.get('variable', 'both')
-        method = request.args.get('method', 'composite')
 
-        # ========== STEP 1: PATTERN MATCHING (shared core) ==========
-        core = _find_analogs_core(top_n=top_n, method=method)
+        # ========== STEP 1: EOF ANALOG SELECTION ==========
 
-        top_analogs      = core['top_analogs']
-        init_time        = core['init_time']
-        current_date_str = core['current_date_str']
-        current_wave_num = core['current_wave_num']
-        current_doy      = init_time.dayofyear
+        if not _HAS_ANALOG_METRICS:
+            return jsonify({"success": False, "error": "analog_metrics module not available"})
 
-        analog_dates     = [pd.Timestamp(a['date']) for a in top_analogs]
-        analog_date_strs = [a['date'] for a in top_analogs]
+        # Load EOF decomposition (builds automatically on first call)
+        eof_cache = _load_or_build_era5_eofs(n_years=30, stride=6, n_eofs=20)
 
-        # Build analog_correlations list for UI display
-        analog_correlations = [
-            {
-                'date': a['date'],
-                'correlation': a.get('correlation'),
-                'composite_score': a.get('composite_score'),
-            }
-            for a in top_analogs
-        ]
+        # Project today's GFS F000 z500 anomaly onto EOF space
+        current_date_str, gfs_pcs, gfs_raw_flat = _compute_gfs_eof_projection(eof_cache)
+        if gfs_pcs is None:
+            return jsonify({"success": False, "error": "Could not project current GFS pattern onto EOFs"})
 
-        # ========== STEP 2: LOAD CONUS DATA AND COMPUTE GRIDS ==========
+        # Load historical anomaly matrix for correlation scoring
+        anom_cache = _load_era5_anomaly_matrix_for_som(n_years=30, stride=6)
+        dates_all  = eof_cache['dates']          # list[str] YYYY-MM-DD
+        all_pcs    = eof_cache['pcs']            # (n_days, n_eofs)
+        anomalies  = anom_cache['anomalies']     # (n_days, lat, lon)
+        lats_som   = anom_cache['lats']
+
+        # Euclidean distance in EOF PC space (noise-filtered, latitude-weighted via PCA)
+        dists = np.sqrt(((all_pcs - gfs_pcs[None, :]) ** 2).sum(axis=1))  # (n_days,)
+
+        # ±45-day seasonal filter
+        init_time   = pd.Timestamp(current_date_str)
+        current_doy = init_time.dayofyear
+        WINDOW      = 45
+
+        def _doy_gap(d):
+            diff = abs(pd.Timestamp(d).dayofyear - current_doy) % 365
+            return min(diff, 365 - diff)
+
+        seasonal_mask    = np.array([_doy_gap(d) <= WINDOW for d in dates_all])
+        seasonal_indices = np.where(seasonal_mask)[0]
+        if len(seasonal_indices) < max(3, top_n):
+            seasonal_indices = np.arange(len(dates_all))  # fallback: no seasonal filter
+
+        # Sort by distance ascending → best analogs first
+        seasonal_dists = dists[seasonal_indices]
+        sorted_order   = np.argsort(seasonal_dists)
+        top_indices    = seasonal_indices[sorted_order[:top_n]]
+
+        # Compute weighted pattern correlation vs current GFS anomaly for display
+        w2d          = _analog_metrics.build_lat_weights(lats_som, anomalies[0].shape)
+        weights_flat = w2d.flatten()
+
+        scored = []
+        for i in top_indices:
+            sample      = anomalies[i].flatten()
+            corr        = _analog_metrics.weighted_pearson(gfs_raw_flat, sample, weights_flat)
+            scored.append({
+                'date':            str(dates_all[i]),
+                'composite_score': round(float(corr), 4),
+                'correlation':     round(float(corr), 4),
+            })
+
+        analog_dates        = [pd.Timestamp(s['date']) for s in scored]
+        analog_date_strs    = [s['date']               for s in scored]
+        analog_correlations = scored
+
+        n_eofs        = int(eof_cache["meta"].get("n_eofs", 20))
+        var_explained = float(eof_cache["explained_variance"].sum())
+
+        logger.info(f"EOF analog ({n_eofs} EOFs, {100*var_explained:.1f}% var): "
+                    f"{int(seasonal_mask.sum())} seasonal, top {top_n} selected")
+
+        # ========== STEP 2: LOAD CONUS DATA, COMPUTE GRIDS, INTERPOLATE TO STATIONS ==========
+
+        from scipy.interpolate import RegularGridInterpolator
 
         result = {
-            "success": True,
-            "current_date": current_date_str,
-            "current_wave_number": current_wave_num,
-            "method": method,
-            "analog_dates": analog_date_strs,
+            "success":             True,
+            "current_date":        current_date_str,
+            "n_eofs":              n_eofs,
+            "variance_explained":  round(100 * var_explained, 1),
+            "total_matches":       len(dates_all),
+            "seasonal_matches":    int(seasonal_mask.sum()),
+            "analog_dates":        analog_date_strs,
             "analog_correlations": analog_correlations,
-            "grid": {},
-            "precip": None,
-            "temp": None,
+            "stations":            [],
         }
+
+        # ERA5 grid arrays (populated per variable, used for station interpolation)
+        _grid_lats     = None   # decreasing (49→24); flipped for interpolator
+        _grid_lons     = None   # increasing (-125→-66)
+        _precip_anom_in  = None   # (lat, lon) array, inches
+        _precip_anom_pct = None   # (lat, lon) array, percent
+        _precip_prob_flood   = None   # (lat, lon) array, 0–100 %
+        _precip_prob_drought = None   # (lat, lon) array, 0–100 %
+        _temp_anom_f     = None   # (lat, lon) array, °F
+        _temp_anom_pct   = None   # (lat, lon) array, percent (Kelvin-relative)
 
         # Process precipitation if requested
         if variable_filter in ['precip', 'both']:
@@ -5484,38 +5589,21 @@ def api_era5_analogs_conus():
                 precip_clim_ds = load_conus_climatology('precip')
                 clim_precip = precip_clim_ds['precip_14d_clim'].sel(doy=current_doy).values
 
-                # Calculate anomalies
                 anomaly_precip = avg_precip_grid - clim_precip
-
-                # Avoid division by zero, use small epsilon
                 clim_precip_safe = np.where(clim_precip > 0.1, clim_precip, np.nan)
                 anomaly_percent = 100 * (avg_precip_grid - clim_precip) / clim_precip_safe
 
-                # Convert mm to inches (1 mm = 1/25.4 inches)
-                avg_precip_grid_in = avg_precip_grid / 25.4
-                clim_precip_in = clim_precip / 25.4
-                anomaly_precip_in = anomaly_precip / 25.4
+                _grid_lats = precip_ds.latitude.values   # 49→24 (decreasing)
+                _grid_lons = precip_ds.longitude.values  # -125→-66 (increasing)
+                _precip_anom_in  = anomaly_precip / 25.4
+                _precip_anom_pct = np.where(np.isfinite(anomaly_percent), anomaly_percent, np.nan)
 
-                # Store grid coordinates (same for both variables)
-                if not result['grid']:
-                    result['grid'] = {
-                        'latitudes': precip_ds.latitude.values.tolist(),
-                        'longitudes': precip_ds.longitude.values.tolist()
-                    }
-
-                result['precip'] = {
-                    'analog_mm': avg_precip_grid.tolist(),
-                    'climatology_mm': clim_precip.tolist(),
-                    'anomaly_mm': anomaly_precip.tolist(),
-                    'analog_in': avg_precip_grid_in.tolist(),
-                    'climatology_in': clim_precip_in.tolist(),
-                    'anomaly_in': anomaly_precip_in.tolist(),
-                    'anomaly_percent': np.where(np.isfinite(anomaly_percent), anomaly_percent, 0).tolist()
-                }
+                logger.info("Computing exceedance probabilities...")
+                _precip_prob_flood, _precip_prob_drought = compute_analog_exceedance_probs(
+                    precip_ds, analog_dates, clim_precip, days=14
+                )
 
                 logger.info(f"Precipitation grid computed: {avg_precip_grid.shape}")
-
-                # Cleanup
                 precip_ds.close()
                 precip_clim_ds.close()
 
@@ -5536,46 +5624,101 @@ def api_era5_analogs_conus():
                 temp_clim_ds = load_conus_climatology('temp')
                 clim_temp = temp_clim_ds['temp_14d_clim'].sel(doy=current_doy).values
 
-                # Calculate anomalies
-                anomaly_temp = avg_temp_grid - clim_temp
+                anomaly_temp   = avg_temp_grid - clim_temp
+                anomaly_temp_f = anomaly_temp * 9 / 5
 
-                # Convert Celsius to Fahrenheit (°F = °C * 9/5 + 32)
-                avg_temp_grid_f = avg_temp_grid * 9/5 + 32
-                clim_temp_f = clim_temp * 9/5 + 32
-                anomaly_temp_f = anomaly_temp * 9/5  # Anomaly doesn't need +32 offset
-
-                # For temperature, percent anomaly is less meaningful, but calculate anyway
-                # Use absolute zero in Celsius (-273.15) offset to avoid division issues
-                temp_absolute = avg_temp_grid + 273.15
-                clim_absolute = clim_temp + 273.15
+                temp_absolute  = avg_temp_grid + 273.15
+                clim_absolute  = clim_temp + 273.15
                 anomaly_percent_temp = 100 * (temp_absolute - clim_absolute) / clim_absolute
 
-                # Store grid coordinates if not already stored
-                if not result['grid']:
-                    result['grid'] = {
-                        'latitudes': temp_ds.latitude.values.tolist(),
-                        'longitudes': temp_ds.longitude.values.tolist()
-                    }
-
-                result['temp'] = {
-                    'analog_c': avg_temp_grid.tolist(),
-                    'climatology_c': clim_temp.tolist(),
-                    'anomaly_c': anomaly_temp.tolist(),
-                    'analog_f': avg_temp_grid_f.tolist(),
-                    'climatology_f': clim_temp_f.tolist(),
-                    'anomaly_f': anomaly_temp_f.tolist(),
-                    'anomaly_percent': np.where(np.isfinite(anomaly_percent_temp), anomaly_percent_temp, 0).tolist()
-                }
+                if _grid_lats is None:
+                    _grid_lats = temp_ds.latitude.values
+                    _grid_lons = temp_ds.longitude.values
+                _temp_anom_f   = anomaly_temp_f
+                _temp_anom_pct = np.where(np.isfinite(anomaly_percent_temp), anomaly_percent_temp, np.nan)
 
                 logger.info(f"Temperature grid computed: {avg_temp_grid.shape}")
-
-                # Cleanup
                 temp_ds.close()
                 temp_clim_ds.close()
 
             except Exception as e:
                 logger.error(f"Failed to process temperature: {e}", exc_info=True)
                 result['temp_error'] = str(e)
+
+        # ========== STEP 3: INTERPOLATE GRIDS TO ASOS STATION LOCATIONS ==========
+        if _grid_lats is not None and (_precip_anom_in is not None or _temp_anom_f is not None):
+            try:
+                # RegularGridInterpolator requires strictly increasing axes — flip lat
+                lats_inc = _grid_lats[::-1]   # 24→49
+                lons     = _grid_lons          # -125→-66
+
+                def _make_interp(arr):
+                    """Build a RegularGridInterpolator from a (lat_dec, lon) array."""
+                    if arr is None:
+                        return None
+                    return RegularGridInterpolator(
+                        (lats_inc, lons), arr[::-1, :],
+                        method='linear', bounds_error=False, fill_value=np.nan
+                    )
+
+                interp_precip_in     = _make_interp(_precip_anom_in)
+                interp_precip_pct    = _make_interp(_precip_anom_pct)
+                interp_prob_flood    = _make_interp(_precip_prob_flood)
+                interp_prob_drought  = _make_interp(_precip_prob_drought)
+                interp_temp_f        = _make_interp(_temp_anom_f)
+                interp_temp_pct      = _make_interp(_temp_anom_pct)
+
+                # Load all ASOS stations and filter to CONUS bounding box
+                stations_dict = asos.get_stations_dict()
+                conus = [
+                    (sid, s) for sid, s in stations_dict.items()
+                    if s.get('lat') and s.get('lon')
+                    and 24.0 <= s['lat'] <= 49.0
+                    and -125.0 <= s['lon'] <= -66.0
+                ]
+
+                if conus:
+                    pts = np.array([[s['lat'], s['lon']] for _, s in conus])
+
+                    def _interp_vec(interp):
+                        if interp is None:
+                            return np.full(len(pts), np.nan)
+                        return interp(pts)
+
+                    prec_in_vals    = _interp_vec(interp_precip_in)
+                    prec_pct_vals   = _interp_vec(interp_precip_pct)
+                    flood_vals      = _interp_vec(interp_prob_flood)
+                    drought_vals    = _interp_vec(interp_prob_drought)
+                    temp_f_vals     = _interp_vec(interp_temp_f)
+                    temp_pct_vals   = _interp_vec(interp_temp_pct)
+
+                    def _f(arr, i, decimals=1):
+                        v = arr[i]
+                        return None if not np.isfinite(v) else round(float(v), decimals)
+
+                    for i, (sid, s) in enumerate(conus):
+                        entry = {
+                            'station_id': sid,
+                            'name':  s.get('name', ''),
+                            'lat':   s['lat'],
+                            'lon':   s['lon'],
+                            'state': s.get('state', ''),
+                        }
+                        if interp_precip_in is not None:
+                            entry['precip_anomaly_in']  = _f(prec_in_vals,  i, 3)
+                            entry['precip_anomaly_pct'] = _f(prec_pct_vals, i, 1)
+                            entry['prob_flood']   = _f(flood_vals,   i, 1)
+                            entry['prob_drought'] = _f(drought_vals, i, 1)
+                        if interp_temp_f is not None:
+                            entry['temp_anomaly_f']   = _f(temp_f_vals,   i, 2)
+                            entry['temp_anomaly_pct'] = _f(temp_pct_vals, i, 1)
+                        result['stations'].append(entry)
+
+                logger.info(f"Interpolated to {len(result['stations'])} ASOS stations")
+
+            except Exception as e:
+                logger.error(f"Failed station interpolation: {e}", exc_info=True)
+                result['station_error'] = str(e)
 
         return jsonify(result)
 
@@ -5743,7 +5886,7 @@ def _load_or_build_era5_som(rows: int = 6, cols: int = 6, n_years: int = 30, str
         else:
             anomalies[i] = z500_vals[i] - clim
 
-    dates = [np.datetime_as_string(d, unit="D") for d in z500["time"].values]
+    dates = [str(np.datetime_as_string(d, unit="D")) for d in z500["time"].values]
     data = anomalies.reshape(anomalies.shape[0], -1).astype(np.float32)
 
     # Standardize features
@@ -5887,6 +6030,186 @@ def _compute_latest_gfs_som_cluster(som: dict) -> tuple[str | None, tuple[int, i
         return None, None
 
 
+def _load_or_build_era5_eofs(n_years: int = 30, stride: int = 6, n_eofs: int = 20) -> dict:
+    """
+    Build or load an EOF decomposition of ERA5 z500 anomalies.
+    Reuses the SOM anomaly matrix cache to avoid redundant ERA5 I/O.
+    Returns dict with: eofs, pcs, explained_variance, dates, climatology, lats, lons, mean, std.
+    """
+    global _EOF_CACHE
+    if _EOF_CACHE is not None:
+        return _EOF_CACHE
+
+    if EOF_CACHE_FILE.exists():
+        try:
+            cached = np.load(EOF_CACHE_FILE, allow_pickle=True)
+            meta = cached["meta"].item()
+            if (meta.get("n_years") == n_years and
+                    meta.get("stride") == stride and
+                    meta.get("n_eofs") == n_eofs):
+                _EOF_CACHE = {
+                    "eofs":               cached["eofs"],
+                    "pcs":                cached["pcs"],
+                    "explained_variance": cached["explained_variance"],
+                    "dates":              cached["dates"].tolist(),
+                    "climatology":        cached["climatology"],
+                    "lats":               cached["lats"],
+                    "lons":               cached["lons"],
+                    "mean":               cached["mean"],
+                    "std":                cached["std"],
+                    "lon_mode":           meta.get("lon_mode", "-180_180"),
+                    "meta":               meta,
+                }
+                logger.info(f"Loaded EOF cache: {n_eofs} EOFs, "
+                            f"{100*cached['explained_variance'].sum():.1f}% variance explained")
+                return _EOF_CACHE
+        except Exception as e:
+            logger.warning(f"Failed to load EOF cache: {e}")
+
+    logger.info("Building ERA5 EOF decomposition…")
+
+    # Reuse the anomaly matrix already computed for the SOM (avoids re-reading ERA5 files)
+    anom_cache = _load_era5_anomaly_matrix_for_som(n_years=n_years, stride=stride)
+    dates     = anom_cache["dates"]
+    anomalies = anom_cache["anomalies"]   # (n_days, lat, lon) float32
+    lats      = anom_cache["lats"]
+    lons      = anom_cache["lons"]
+
+    # Climatology for projecting new fields — borrow from SOM cache (same grid)
+    som = _load_or_build_era5_som(n_years=n_years, stride=stride)
+    climatology = som["climatology"]      # (366, lat, lon) float32
+    lon_mode    = som.get("lon_mode", "-180_180")
+
+    data = anomalies.reshape(anomalies.shape[0], -1).astype(np.float32)
+    mean = data.mean(axis=0)
+    std  = data.std(axis=0)
+    std[std == 0] = 1.0
+    data_std = (data - mean) / std
+
+    from sklearn.decomposition import TruncatedSVD
+    svd = TruncatedSVD(n_components=n_eofs, random_state=42)
+    pcs  = svd.fit_transform(data_std).astype(np.float32)   # (n_days, n_eofs)
+    eofs = svd.components_.astype(np.float32)               # (n_eofs, n_features)
+    explained_variance = svd.explained_variance_ratio_.astype(np.float32)
+
+    logger.info(f"EOF: {n_eofs} components explain {100*explained_variance.sum():.1f}% of variance")
+
+    meta = {
+        "n_years":                 n_years,
+        "stride":                  stride,
+        "n_eofs":                  n_eofs,
+        "total_variance_explained": float(explained_variance.sum()),
+        "lon_mode":                lon_mode,
+        "built_at":                datetime.now(timezone.utc).isoformat(),
+    }
+
+    np.savez_compressed(
+        EOF_CACHE_FILE,
+        eofs=eofs,
+        pcs=pcs,
+        explained_variance=explained_variance,
+        dates=np.array(dates, dtype=object),
+        climatology=climatology.astype(np.float32),
+        lats=lats.astype(np.float32),
+        lons=lons.astype(np.float32),
+        mean=mean.astype(np.float32),
+        std=std.astype(np.float32),
+        meta=meta,
+    )
+
+    _EOF_CACHE = {
+        "eofs":               eofs,
+        "pcs":                pcs,
+        "explained_variance": explained_variance,
+        "dates":              dates,
+        "climatology":        climatology,
+        "lats":               lats,
+        "lons":               lons,
+        "mean":               mean,
+        "std":                std,
+        "lon_mode":           lon_mode,
+        "meta":               meta,
+    }
+    return _EOF_CACHE
+
+
+def _compute_gfs_eof_projection(eof_cache: dict) -> tuple[str | None, np.ndarray | None, np.ndarray | None]:
+    """
+    Regrid today's GFS F000 z500 field to the ERA5 grid, compute anomaly,
+    and project onto the stored EOFs.
+    Returns (date_str, pc_scores [n_eofs], raw_anomaly_flat [n_features]).
+    """
+    try:
+        import xarray as xr
+        db = load_forecasts_db()
+        location_name = "Fairfax, VA"
+        if location_name not in db or not db[location_name].get("latest_run"):
+            return None, None, None
+
+        latest_run = db[location_name]["latest_run"]
+        run_data   = db[location_name]["runs"].get(latest_run, {})
+        gfs_data   = run_data.get("gfs", {})
+        z500_field = gfs_data.get("z500_field")
+        if not z500_field:
+            return None, None, None
+
+        gfs_vals = np.array(z500_field["values"],   dtype=np.float32) * 10.0  # dm → m
+        gfs_lats = np.array(z500_field["latitude"],  dtype=np.float32)
+        gfs_lons = np.array(z500_field["longitude"], dtype=np.float32)
+
+        era5_lats = eof_cache["lats"]
+        era5_lons = eof_cache["lons"]
+        lon_mode  = eof_cache.get("lon_mode", "-180_180")
+
+        gfs_da = xr.DataArray(
+            gfs_vals,
+            coords={"latitude": gfs_lats, "longitude": gfs_lons},
+            dims=["latitude", "longitude"],
+        )
+        if lon_mode == "0_360":
+            if gfs_da.longitude.values.min() < 0:
+                gfs_da = gfs_da.assign_coords(
+                    longitude=(gfs_da.longitude % 360)
+                ).sortby("longitude")
+        else:
+            if gfs_da.longitude.values.max() > 180:
+                gfs_da = gfs_da.assign_coords(
+                    longitude=(((gfs_da.longitude + 180) % 360) - 180)
+                ).sortby("longitude")
+
+        gfs_regrid = gfs_da.interp(
+            latitude=era5_lats, longitude=era5_lons, method="linear"
+        ).values
+
+        init_time  = datetime.fromisoformat(latest_run)
+        doy        = init_time.timetuple().tm_yday
+        clim_stack = eof_cache["climatology"]
+        clim       = clim_stack[doy - 1] if 1 <= doy <= 366 else None
+
+        if clim is None or np.isnan(clim).all():
+            zonal_mean = np.nanmean(gfs_regrid, axis=1, keepdims=True)
+            anomaly = gfs_regrid - zonal_mean
+        else:
+            anomaly = gfs_regrid - clim
+
+        raw_flat = anomaly.reshape(-1).astype(np.float32)
+
+        mean      = eof_cache["mean"]
+        std       = eof_cache["std"]
+        std_safe  = np.where(std == 0, 1.0, std)
+        flat_std  = (raw_flat - mean) / std_safe
+        flat_std  = np.nan_to_num(flat_std, nan=0.0, posinf=0.0, neginf=0.0)
+
+        eofs      = eof_cache["eofs"]          # (n_eofs, n_features)
+        pc_scores = eofs @ flat_std            # (n_eofs,)
+
+        return latest_run.split("T")[0], pc_scores, raw_flat
+
+    except Exception as e:
+        logger.warning(f"Failed to compute GFS EOF projection: {e}")
+        return None, None, None
+
+
 def _load_era5_anomaly_matrix_for_som(n_years: int = 30, stride: int = 6) -> dict:
     """
     Load ERA5 Z500 anomalies on the SOM grid and return anomalies + dates.
@@ -5931,7 +6254,7 @@ def _load_era5_anomaly_matrix_for_som(n_years: int = 30, stride: int = 6) -> dic
         else:
             anomalies[i] = z500_vals[i] - clim
 
-    dates = [np.datetime_as_string(d, unit="D") for d in z500["time"].values]
+    dates = [str(np.datetime_as_string(d, unit="D")) for d in z500["time"].values]
 
     _SOM_ANOM_CACHE = {
         "dates": dates,

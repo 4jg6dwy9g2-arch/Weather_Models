@@ -510,6 +510,14 @@
                                     <option value="temp">Temperature</option>
                                 </select>
                             </div>
+                            <div class="col-md-3" id="conus-display-col">
+                                <label for="conus-analog-display" class="form-label">Display</label>
+                                <select class="form-select" id="conus-analog-display">
+                                    <option value="anomaly" selected>Anomaly %</option>
+                                    <option value="flood">Flood Risk (&gt;175% normal)</option>
+                                    <option value="drought">Drought Risk (&lt;25% normal)</option>
+                                </select>
+                            </div>
                             <div class="col-md-3">
                                 <button id="load-conus-analogs-btn" class="btn btn-primary w-100">
                                     <i class="bi bi-search"></i> Find CONUS Analogs
@@ -555,20 +563,26 @@
                     <div class="col-md-3">
                         <div class="card">
                             <div class="card-body">
-                                <h6 class="text-muted mb-1">Current Wave #</h6>
-                                <h4 id="conus-wave-number" class="mb-0">--</h4>
+                                <h6 class="text-muted mb-1">EOF Analogs</h6>
+                                <h4 id="conus-som-cluster" class="mb-0">--</h4>
+                                <small class="text-muted" id="conus-som-cluster-info"></small>
                             </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Heatmap Container -->
+                <!-- Station Map Container -->
                 <div class="card mb-4" id="conus-heatmap-card" style="display:none;">
-                    <div class="card-header">
-                        <i class="bi bi-map"></i> <span id="conus-heatmap-title">14-Day Precipitation Analog</span>
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span><i class="bi bi-map"></i> <span id="conus-heatmap-title">14-Day Precipitation Analog</span></span>
+                        <div class="d-flex align-items-center gap-2" style="font-size:0.8rem;">
+                            <span id="conus-legend-label-low" style="font-weight:600;"></span>
+                            <div id="conus-legend-bar" style="width:160px;height:12px;border-radius:4px;border:1px solid #ccc;"></div>
+                            <span id="conus-legend-label-high" style="font-weight:600;"></span>
+                        </div>
                     </div>
-                    <div class="card-body">
-                        <div id="conus-analog-heatmap" style="height: 600px;"></div>
+                    <div class="card-body p-0">
+                        <div id="conus-analog-map" style="height:600px;width:100%;"></div>
                     </div>
                 </div>
 
@@ -576,6 +590,7 @@
                 <div class="card" id="conus-analog-table-card" style="display:none;">
                     <div class="card-header">
                         <i class="bi bi-calendar-check"></i> Analog Dates
+                        <small class="text-muted ms-2" id="conus-cluster-header"></small>
                     </div>
                     <div class="card-body">
                         <div class="table-responsive">
@@ -584,7 +599,7 @@
                                     <tr>
                                         <th>Rank</th>
                                         <th>Date</th>
-                                        <th>Correlation</th>
+                                        <th>Pattern Corr</th>
                                         <th>Days Ago</th>
                                     </tr>
                                 </thead>
@@ -1815,8 +1830,9 @@ function closeAnalogCompare() {
 // ========== CONUS Analog Functions ==========
 
 async function loadConusAnalogs() {
-    const topN = document.getElementById('conus-analog-count').value;
+    const topN     = document.getElementById('conus-analog-count').value;
     const variable = document.getElementById('conus-analog-variable').value;
+    const display  = document.getElementById('conus-analog-display').value;
 
     // Show loading spinner
     document.getElementById('conus-analog-loading').style.display = 'block';
@@ -1826,7 +1842,7 @@ async function loadConusAnalogs() {
     document.getElementById('conus-analog-table-card').style.display = 'none';
 
     try {
-        const response = await fetch(`/api/era5/analogs-conus?top_n=${topN}&variable=${variable}`);
+        const response = await fetch(`/api/era5/analogs-conus?top_n=${topN}&variable=${variable}&display=${display}`);
         const data = await response.json();
 
         document.getElementById('conus-analog-loading').style.display = 'none';
@@ -1837,11 +1853,14 @@ async function loadConusAnalogs() {
             return;
         }
 
+        // Cache for re-render on display change
+        _conusLastData = data;
+
         // Update summary stats
         updateConusSummaryStats(data, variable);
 
-        // Render heatmap
-        renderConusHeatmap(data, variable);
+        // Render station map
+        renderConusHeatmap(data, variable, display);
 
         // Update analog table
         updateConusAnalogTable(data);
@@ -1860,122 +1879,224 @@ async function loadConusAnalogs() {
 }
 
 function updateConusSummaryStats(data, variable) {
-    const varData = variable === 'precip' ? data.precip : data.temp;
+    const stations = data.stations || [];
+    if (!stations.length) return;
 
-    if (!varData) {
-        console.warn('No data for variable:', variable);
-        return;
-    }
+    const anomField = variable === 'precip' ? 'precip_anomaly_in'  : 'temp_anomaly_f';
+    const pctField  = variable === 'precip' ? 'precip_anomaly_pct' : 'temp_anomaly_pct';
 
-    // Flatten the grid to calculate statistics (use US units)
-    const flatData = varData.anomaly_in ? varData.anomaly_in.flat() : varData.anomaly_f.flat();
-    const flatPercent = varData.anomaly_percent.flat();
+    const vals = stations.map(s => s[anomField]).filter(v => v != null && isFinite(v));
+    const pcts = stations.map(s => s[pctField]).filter(v => v != null && isFinite(v));
 
-    // Filter out NaN values
-    const validData = flatData.filter(val => isFinite(val));
-    const validPercent = flatPercent.filter(val => isFinite(val));
+    if (!vals.length) return;
 
-    // Calculate mean anomaly
-    const meanAnomaly = validData.reduce((sum, val) => sum + val, 0) / validData.length;
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const above = pcts.filter(p => p > 5).length;
+    const below = pcts.filter(p => p < -5).length;
+    const pctAbove = (above / pcts.length * 100).toFixed(1);
+    const pctBelow = (below / pcts.length * 100).toFixed(1);
 
-    // Calculate percent above/below normal
-    const aboveNormal = validPercent.filter(val => val > 5).length;
-    const belowNormal = validPercent.filter(val => val < -5).length;
-    const pctAbove = (aboveNormal / validPercent.length * 100).toFixed(1);
-    const pctBelow = (belowNormal / validPercent.length * 100).toFixed(1);
-
-    // Update DOM with US units
     if (variable === 'precip') {
-        document.getElementById('conus-avg-anomaly').textContent = `${meanAnomaly.toFixed(2)}"`;
+        document.getElementById('conus-avg-anomaly').textContent = `${mean >= 0 ? '+' : ''}${mean.toFixed(2)}"`;
         document.getElementById('conus-pct-above').textContent = `${pctAbove}% wetter`;
         document.getElementById('conus-pct-below').textContent = `${pctBelow}% drier`;
     } else {
-        document.getElementById('conus-avg-anomaly').textContent = `${meanAnomaly.toFixed(1)}°F`;
+        document.getElementById('conus-avg-anomaly').textContent = `${mean >= 0 ? '+' : ''}${mean.toFixed(1)}°F`;
         document.getElementById('conus-pct-above').textContent = `${pctAbove}% warmer`;
         document.getElementById('conus-pct-below').textContent = `${pctBelow}% cooler`;
     }
 
-    document.getElementById('conus-wave-number').textContent = data.current_wave_number || 'N/A';
+    document.getElementById('conus-som-cluster').textContent =
+        data.n_eofs != null ? `${data.n_eofs} EOFs` : 'N/A';
+    document.getElementById('conus-som-cluster-info').textContent =
+        data.seasonal_matches != null
+            ? `${data.seasonal_matches} seasonal / ${data.total_matches} total · ${data.variance_explained}% var`
+            : '';
 }
 
-function renderConusHeatmap(data, variable) {
-    const varData = variable === 'precip' ? data.precip : data.temp;
+// ── CONUS station map (Leaflet) ──────────────────────────────────────────────
+let _conusMap = null;
+let _conusMarkers = [];
 
-    if (!varData) {
-        console.warn('No data for variable:', variable);
-        return;
+function _interpolateColorStops(value, stops) {
+    if (value <= stops[0].v) return stops[0].c;
+    if (value >= stops[stops.length - 1].v) return stops[stops.length - 1].c;
+    for (let i = 0; i < stops.length - 1; i++) {
+        const lo = stops[i], hi = stops[i + 1];
+        if (value >= lo.v && value <= hi.v) {
+            const t = (value - lo.v) / (hi.v - lo.v);
+            const r = Math.round(lo.c[0] + t * (hi.c[0] - lo.c[0]));
+            const g = Math.round(lo.c[1] + t * (hi.c[1] - lo.c[1]));
+            const b = Math.round(lo.c[2] + t * (hi.c[2] - lo.c[2]));
+            return [r, g, b];
+        }
+    }
+    return [128, 128, 128];
+}
+
+const _PRECIP_STOPS = [
+    { v: -100, c: [139, 69,  19] },   // brown  (very dry)
+    { v:  -30, c: [244, 164,  96] },   // sandy  (dry)
+    { v:    0, c: [255, 255, 255] },   // white  (normal)
+    { v:   30, c: [144, 238, 144] },   // light green (wet)
+    { v:  100, c: [  0, 100,   0] },   // dark green  (very wet)
+];
+const _TEMP_STOPS = [
+    { v: -15, c: [  0,   0, 200] },   // blue        (very cold)
+    { v:  -5, c: [135, 206, 235] },   // sky blue    (cool)
+    { v:   0, c: [255, 255, 255] },   // white       (normal)
+    { v:   5, c: [255, 165,   0] },   // orange      (warm)
+    { v:  15, c: [200,   0,   0] },   // red         (very warm)
+];
+
+function _conusMarkerColor(pct, variable) {
+    if (pct == null || !isFinite(pct)) return 'rgb(150,150,150)';
+    const stops = variable === 'precip' ? _PRECIP_STOPS : _TEMP_STOPS;
+    const [r, g, b] = _interpolateColorStops(pct, stops);
+    return `rgb(${r},${g},${b})`;
+}
+
+function _updateConusLegend(variable, display) {
+    const bar = document.getElementById('conus-legend-bar');
+    const lo  = document.getElementById('conus-legend-label-low');
+    const hi  = document.getElementById('conus-legend-label-high');
+    if (display === 'flood') {
+        bar.style.background = 'linear-gradient(to right, #ffffff, #bfdbfe, #3b82f6, #1d4ed8, #1e3a5f)';
+        lo.textContent = '0%';
+        hi.textContent = 'Flood Risk 100%';
+    } else if (display === 'drought') {
+        bar.style.background = 'linear-gradient(to right, #ffffff, #fed7aa, #f97316, #b45309, #7c2d12)';
+        lo.textContent = '0%';
+        hi.textContent = 'Drought Risk 100%';
+    } else if (variable === 'precip') {
+        bar.style.background = 'linear-gradient(to right, #8B4513, #F4A460, #ffffff, #90EE90, #006400)';
+        lo.textContent = 'Drier';
+        hi.textContent = 'Wetter';
+    } else {
+        bar.style.background = 'linear-gradient(to right, #0000C8, #87CEEB, #ffffff, #FFA500, #C80000)';
+        lo.textContent = 'Colder';
+        hi.textContent = 'Warmer';
+    }
+}
+
+function renderConusHeatmap(data, variable, display = 'anomaly') {
+    const stations = data.stations || [];
+
+    // Determine what to show
+    let title, pctField, valField, unit, colorFn;
+    if (display === 'flood') {
+        title    = '14-Day Flood Risk (Analogs >175% of Normal)';
+        pctField = 'prob_flood';
+        valField = 'prob_flood';
+        unit     = '%';
+        colorFn  = pct => {
+            const stops = [
+                { v:   0, c: [255, 255, 255] },
+                { v:  25, c: [191, 219, 254] },
+                { v:  50, c: [ 59, 130, 246] },
+                { v:  75, c: [ 29,  78, 216] },
+                { v: 100, c: [ 30,  58,  95] },
+            ];
+            const [r, g, b] = _interpolateColorStops(pct, stops);
+            return `rgb(${r},${g},${b})`;
+        };
+    } else if (display === 'drought') {
+        title    = '14-Day Drought Risk (Analogs <25% of Normal)';
+        pctField = 'prob_drought';
+        valField = 'prob_drought';
+        unit     = '%';
+        colorFn  = pct => {
+            const stops = [
+                { v:   0, c: [255, 255, 255] },
+                { v:  25, c: [254, 215, 170] },
+                { v:  50, c: [249, 115,  22] },
+                { v:  75, c: [180,  83,   9] },
+                { v: 100, c: [124,  45,  18] },
+            ];
+            const [r, g, b] = _interpolateColorStops(pct, stops);
+            return `rgb(${r},${g},${b})`;
+        };
+    } else {
+        // anomaly
+        title    = variable === 'precip' ? '14-Day Precipitation Analog' : '14-Day Temperature Analog';
+        pctField = variable === 'precip' ? 'precip_anomaly_pct' : 'temp_anomaly_pct';
+        valField = variable === 'precip' ? 'precip_anomaly_in'  : 'temp_anomaly_f';
+        unit     = variable === 'precip' ? '"' : '°F';
+        colorFn  = pct => _conusMarkerColor(pct, variable);
     }
 
-    const zData = varData.anomaly_percent;
-    const units = variable === 'precip' ? 'inches' : '°F';
-    const title = variable === 'precip' ? '14-Day Precipitation Analog' : '14-Day Temperature Analog';
-
-    // Update card title
     document.getElementById('conus-heatmap-title').textContent = title;
+    _updateConusLegend(variable, display);
 
-    // Create Plotly heatmap
-    const trace = {
-        type: 'heatmap',
-        x: data.grid.longitudes,
-        y: data.grid.latitudes,
-        z: zData,
-        colorscale: variable === 'precip' ? [
-            [0.0, '#8B4513'],  // Brown (very dry)
-            [0.3, '#F4A460'],  // Sandy brown (dry)
-            [0.5, '#FFFFFF'],  // White (normal)
-            [0.7, '#90EE90'],  // Light green (wet)
-            [1.0, '#006400']   // Dark green (very wet)
-        ] : [
-            [0.0, '#0000FF'],  // Blue (cold)
-            [0.3, '#87CEEB'],  // Sky blue (cool)
-            [0.5, '#FFFFFF'],  // White (normal)
-            [0.7, '#FFA500'],  // Orange (warm)
-            [1.0, '#FF0000']   // Red (hot)
-        ],
-        zmid: 0,
-        zmin: -100,
-        zmax: 100,
-        colorbar: {
-            title: 'Anomaly (%)',
-            len: 0.8
-        },
-        hovertemplate:
-            'Lat: %{y:.2f}°<br>' +
-            'Lon: %{x:.2f}°<br>' +
-            'Anomaly: %{z:.1f}%<br>' +
-            '<extra></extra>'
-    };
+    // Initialise or reuse the Leaflet map
+    if (!_conusMap) {
+        _conusMap = L.map('conus-analog-map', {
+            center: [38, -96],
+            zoom: 4,
+            zoomControl: true,
+        });
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; OpenStreetMap, &copy; CartoDB',
+            maxZoom: 10,
+        }).addTo(_conusMap);
+    }
 
-    const layout = {
-        title: `${title} - Percent Anomaly from 1990-2020 Normal`,
-        xaxis: {
-            title: 'Longitude',
-            range: [-125, -66]
-        },
-        yaxis: {
-            title: 'Latitude',
-            range: [24, 49]
-        },
-        height: 600,
-        margin: { l: 50, r: 50, t: 80, b: 50 }
-    };
+    // Remove old markers
+    for (const m of _conusMarkers) _conusMap.removeLayer(m);
+    _conusMarkers = [];
 
-    const config = {
-        responsive: true,
-        displayModeBar: true,
-        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-        displaylogo: false
-    };
+    for (const s of stations) {
+        const pct = s[pctField];
+        const val = s[valField];
+        if (pct == null) continue;
 
-    Plotly.newPlot('conus-analog-heatmap', [trace], layout, config);
+        const color  = colorFn(pct);
+        const marker = L.circleMarker([s.lat, s.lon], {
+            radius:      4,
+            fillColor:   color,
+            color:       '#333',
+            weight:      0.5,
+            opacity:     0.8,
+            fillOpacity: 0.9,
+        });
+
+        let tooltipBody;
+        if (display === 'flood') {
+            tooltipBody = `Flood risk: ${pct.toFixed(0)}% of analogs<br><small style="color:#666">(&gt;175% of normal precip)</small>`;
+        } else if (display === 'drought') {
+            tooltipBody = `Drought risk: ${pct.toFixed(0)}% of analogs<br><small style="color:#666">(&lt;25% of normal precip)</small>`;
+        } else {
+            const sign    = val != null && val >= 0 ? '+' : '';
+            const valStr  = val != null ? `${sign}${val.toFixed(2)}${unit}` : 'N/A';
+            const pctSign = pct >= 0 ? '+' : '';
+            tooltipBody   = `Anomaly: ${valStr} (${pctSign}${pct.toFixed(1)}%)`;
+        }
+
+        marker.bindTooltip(
+            `<strong>${s.name}</strong> (${s.station_id})<br>${tooltipBody}`,
+            { direction: 'top', offset: [0, -5] }
+        );
+
+        marker.addTo(_conusMap);
+        _conusMarkers.push(marker);
+    }
+
+    // Nudge Leaflet to recalculate layout after the card becomes visible
+    setTimeout(() => _conusMap && _conusMap.invalidateSize(), 100);
 }
 
 function updateConusAnalogTable(data) {
     const tbody = document.getElementById('conus-analog-table-body');
     tbody.innerHTML = '';
 
+    // Update analog header text
+    const hdr = document.getElementById('conus-cluster-header');
+    if (hdr) {
+        const varStr = data.variance_explained != null ? ` · ${data.variance_explained}% variance` : '';
+        hdr.textContent = `${data.seasonal_matches} seasonal matches${varStr}`;
+    }
+
     const currentDate = new Date(data.current_date);
-    // analog_correlations is a list of {date, correlation, composite_score}
     const corrMap = {};
     (data.analog_correlations || []).forEach(item => { corrMap[item.date] = item; });
 
@@ -2000,12 +2121,34 @@ function updateConusAnalogTable(data) {
     });
 }
 
+// Keep a reference to the last loaded CONUS data so display changes don't require a reload
+let _conusLastData = null;
+
 // Event listeners for CONUS Analogs
 document.getElementById('load-conus-analogs-btn')?.addEventListener('click', loadConusAnalogs);
+
 document.getElementById('conus-analog-variable')?.addEventListener('change', function() {
-    // Re-render if data already loaded
+    const variable = this.value;
+    // Show/hide the Display dropdown — flood/drought only make sense for precip
+    const displayCol = document.getElementById('conus-display-col');
+    if (displayCol) displayCol.style.display = variable === 'temp' ? 'none' : '';
+    // Reset to anomaly when switching to temp
+    if (variable === 'temp') document.getElementById('conus-analog-display').value = 'anomaly';
+
     if (document.getElementById('conus-heatmap-card').style.display !== 'none') {
-        loadConusAnalogs();
+        if (_conusLastData) {
+            updateConusSummaryStats(_conusLastData, variable);
+            renderConusHeatmap(_conusLastData, variable, document.getElementById('conus-analog-display').value);
+        } else {
+            loadConusAnalogs();
+        }
+    }
+});
+
+document.getElementById('conus-analog-display')?.addEventListener('change', function() {
+    if (_conusLastData && document.getElementById('conus-heatmap-card').style.display !== 'none') {
+        const variable = document.getElementById('conus-analog-variable').value;
+        renderConusHeatmap(_conusLastData, variable, this.value);
     }
 });
 
