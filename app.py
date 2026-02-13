@@ -88,6 +88,12 @@ ASOS_TRENDS_FILE = Path(__file__).parent / "data" / "asos_forecast_trends.json"
 ANALOG_HISTORY_FILE = Path(__file__).parent / "data" / "analog_forecast_history.json"
 # Full cached result from the most recent auto-sync (allows instant UI load)
 ANALOG_LATEST_FILE = Path(__file__).parent / "data" / "analog_latest_result.json"
+SOM_CACHE_FILE = Path(__file__).parent / "data" / "era5_som_cache_6x6_30y_anom.npz"
+SOM_SKILL_FILE = Path(__file__).parent / "data" / "som_cluster_skill.json"
+
+_SOM_CACHE: dict | None = None
+_SOM_SKILL_CACHE: dict = {}
+_SOM_ANOM_CACHE: dict | None = None
 
 # ---------------------------------------------------------------------------
 # ERA5 analog caches (populated lazily, persist for the lifetime of the process)
@@ -4470,6 +4476,10 @@ def api_era5_500mb_map():
         wave_result = rossby_waves.calculate_wave_number(z500, latitude=55.0)
 
         # Generate map image
+        import warnings
+        import warnings
+        import warnings
+        import warnings
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
@@ -4531,8 +4541,7 @@ def api_era5_500mb_map():
         ax.clabel(cs, inline=True, fontsize=8, fmt='%d')
 
         # Add colorbar
-        cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.05, shrink=0.8)
-        cbar.set_label('500mb Height Anomaly (dam)', fontsize=10)
+        # Colorbar intentionally omitted to save space in modal
 
         # Title with top 3 wave numbers
         date_str = pd.Timestamp(nearest_time.time.values).strftime('%Y-%m-%d %H:%M UTC')
@@ -5571,7 +5580,893 @@ def api_era5_analogs_conus():
         return jsonify(result)
 
     except Exception as e:
-        logger.error(f"Error in CONUS analogs: {e}", exc_info=True)
+        logger.error(f"Error building CONUS analog grid: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)})
+
+
+def _load_era5_z500_last_n_years(n_years: int = 30):
+    import xarray as xr
+    import re
+    from datetime import datetime
+
+    era5_path = Path("/Volumes/T7/Weather_Models/era5/global_500mb")
+    if not era5_path.exists():
+        raise FileNotFoundError(f"ERA5 data directory not found: {era5_path}")
+
+    range_re = re.compile(r"(\d{4})-(\d{4})")
+    year_re = re.compile(r"(\d{4})")
+    end_year = datetime.now(timezone.utc).year
+    start_year = end_year - n_years + 1
+
+    era5_files = []
+    for f in sorted(era5_path.glob("era5_z500_NH_*.nc")):
+        match_range = range_re.search(f.name)
+        if match_range:
+            start = int(match_range.group(1))
+            end = int(match_range.group(2))
+            if end >= start_year:
+                era5_files.append(f)
+            continue
+        match_year = year_re.search(f.name)
+        if match_year:
+            year = int(match_year.group(1))
+            if year >= start_year:
+                era5_files.append(f)
+
+    if not era5_files:
+        raise FileNotFoundError(f"No ERA5 data found for requested years >= {start_year}")
+
+    datasets = []
+    for f in era5_files:
+        try:
+            datasets.append(xr.open_dataset(f))
+        except Exception as e:
+            logger.warning(f"Failed to load {f}: {e}")
+
+    if not datasets:
+        raise RuntimeError("Failed to load ERA5 datasets")
+
+    ds = xr.concat(datasets, dim='time')
+    ds = ds.sortby('time')
+
+    pressure_coord = None
+    for coord_name in ['pressure_level', 'level', 'plev', 'lev']:
+        if coord_name in ds.coords or coord_name in ds.dims:
+            pressure_coord = coord_name
+            break
+
+    if pressure_coord is None:
+        raise RuntimeError("Could not find pressure level coordinate in dataset")
+
+    lat_coord_name = 'latitude' if 'latitude' in ds.coords else 'lat'
+    lon_coord_name = 'longitude' if 'longitude' in ds.coords else 'lon'
+
+    return ds, pressure_coord, lat_coord_name, lon_coord_name
+
+
+def _train_som(data: np.ndarray, rows: int, cols: int, n_iter: int = 2000, lr: float = 0.5):
+    rng = np.random.default_rng(42)
+    n_samples, n_features = data.shape
+    weights = data[rng.choice(n_samples, rows * cols, replace=False)].reshape(rows, cols, n_features).copy()
+    grid_r, grid_c = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
+    sigma0 = max(rows, cols) / 2.0
+
+    for t in range(n_iter):
+        x = data[rng.integers(0, n_samples)]
+        dists = ((weights - x) ** 2).sum(axis=2)
+        bmu_index = np.unravel_index(np.argmin(dists), dists.shape)
+        lr_t = lr * (1 - t / n_iter)
+        sigma_t = max(0.5, sigma0 * (1 - t / n_iter))
+
+        dist_sq = (grid_r - bmu_index[0]) ** 2 + (grid_c - bmu_index[1]) ** 2
+        influence = np.exp(-dist_sq / (2 * sigma_t ** 2))
+        weights += influence[..., None] * lr_t * (x - weights)
+
+    return weights
+
+
+def _assign_som_bmu(data: np.ndarray, weights: np.ndarray, batch_size: int = 256):
+    rows, cols, n_features = weights.shape
+    weights_flat = weights.reshape(rows * cols, n_features)
+    bmu = []
+    for i in range(0, data.shape[0], batch_size):
+        batch = data[i:i + batch_size]
+        dists = ((batch[:, None, :] - weights_flat[None, :, :]) ** 2).sum(axis=2)
+        idx = np.argmin(dists, axis=1)
+        bmu.extend(idx.tolist())
+    return np.array(bmu, dtype=np.int32)
+
+
+def _load_or_build_era5_som(rows: int = 6, cols: int = 6, n_years: int = 30, stride: int = 6):
+    global _SOM_CACHE
+    if _SOM_CACHE is not None:
+        return _SOM_CACHE
+
+    if SOM_CACHE_FILE.exists():
+        try:
+            cached = np.load(SOM_CACHE_FILE, allow_pickle=True)
+            meta = cached["meta"].item()
+            if (meta.get("rows") == rows and meta.get("cols") == cols and
+                    meta.get("n_years") == n_years and meta.get("stride") == stride and
+                    meta.get("anomaly") is True):
+                _SOM_CACHE = {
+                    "rows": rows,
+                    "cols": cols,
+                    "dates": cached["dates"].tolist(),
+                    "bmu": cached["bmu"],
+                    "weights": cached["weights"],
+                    "mean": cached["mean"],
+                    "std": cached["std"],
+                    "climatology": cached["climatology"],
+                    "lats": cached["lats"],
+                    "lons": cached["lons"],
+                    "lon_mode": meta.get("lon_mode", "unknown"),
+                    "meta": meta
+                }
+                return _SOM_CACHE
+        except Exception as e:
+            logger.warning(f"Failed to load SOM cache: {e}")
+
+    ds, pressure_coord, lat_coord_name, lon_coord_name = _load_era5_z500_last_n_years(n_years)
+
+    var_name = "z" if "z" in ds.data_vars else list(ds.data_vars)[0]
+    z500 = ds[var_name].sel({pressure_coord: 500})
+
+    # Daily mean
+    z500 = z500.resample(time="1D").mean()
+    z500 = z500.dropna("time", how="all")
+
+    # Downsample grid
+    z500 = z500.isel({
+        lat_coord_name: slice(None, None, stride),
+        lon_coord_name: slice(None, None, stride)
+    })
+
+    # Build climatology (31-day window) and compute anomalies
+    ds_with_doy = z500.assign_coords(dayofyear=z500.time.dt.dayofyear)
+    climatology = {}
+    for doy in range(1, 367):
+        window_days = [(doy + offset - 1) % 366 + 1 for offset in range(-15, 16)]
+        mask = ds_with_doy.dayofyear.isin(window_days)
+        if mask.sum() > 0:
+            window_data = ds_with_doy.where(mask, drop=True)
+            climatology[doy] = window_data.mean(dim="time").values
+
+    z500_vals = z500.values
+    doys = z500["time"].dt.dayofyear.values
+    anomalies = np.empty_like(z500_vals)
+    for i, doy in enumerate(doys):
+        clim = climatology.get(int(doy))
+        if clim is None:
+            zonal_mean = z500_vals[i].mean(axis=1, keepdims=True)
+            anomalies[i] = z500_vals[i] - zonal_mean
+        else:
+            anomalies[i] = z500_vals[i] - clim
+
+    dates = [np.datetime_as_string(d, unit="D") for d in z500["time"].values]
+    data = anomalies.reshape(anomalies.shape[0], -1).astype(np.float32)
+
+    # Standardize features
+    mean = data.mean(axis=0)
+    std = data.std(axis=0)
+    std[std == 0] = 1.0
+    data = (data - mean) / std
+
+    # Train SOM on subset for speed
+    rng = np.random.default_rng(42)
+    sample_size = min(2000, data.shape[0])
+    sample_idx = rng.choice(data.shape[0], sample_size, replace=False)
+    weights = _train_som(data[sample_idx], rows, cols, n_iter=2000, lr=0.5)
+
+    bmu = _assign_som_bmu(data, weights, batch_size=256)
+
+    lats = z500[lat_coord_name].values
+    lons = z500[lon_coord_name].values
+    lon_mode = "0_360" if np.nanmax(lons) > 180 else "-180_180"
+
+    # Stack climatology to array for caching (366, lat, lon)
+    clim_stack = np.full((366, lats.shape[0], lons.shape[0]), np.nan, dtype=np.float32)
+    for doy in range(1, 367):
+        if doy in climatology:
+            clim_stack[doy - 1] = climatology[doy].astype(np.float32)
+
+    meta = {
+        "rows": rows,
+        "cols": cols,
+        "n_years": n_years,
+        "stride": stride,
+        "anomaly": True,
+        "climatology_window_days": 31,
+        "lon_mode": lon_mode,
+        "built_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    np.savez_compressed(
+        SOM_CACHE_FILE,
+        dates=np.array(dates, dtype=object),
+        bmu=bmu,
+        weights=weights.astype(np.float32),
+        mean=mean.astype(np.float32),
+        std=std.astype(np.float32),
+        climatology=clim_stack,
+        lats=lats.astype(np.float32),
+        lons=lons.astype(np.float32),
+        meta=meta
+    )
+
+    _SOM_CACHE = {
+        "rows": rows,
+        "cols": cols,
+        "dates": dates,
+        "bmu": bmu,
+        "weights": weights,
+        "mean": mean,
+        "std": std,
+        "climatology": clim_stack,
+        "lats": lats,
+        "lons": lons,
+        "lon_mode": lon_mode,
+        "meta": meta
+    }
+    return _SOM_CACHE
+
+
+def _compute_latest_gfs_som_cluster(som: dict) -> tuple[str | None, tuple[int, int] | None]:
+    try:
+        import xarray as xr
+        db = load_forecasts_db()
+        location_name = "Fairfax, VA"
+        if location_name not in db or not db[location_name].get("latest_run"):
+            return None, None
+
+        latest_run = db[location_name]["latest_run"]
+        run_data = db[location_name]["runs"].get(latest_run, {})
+        gfs_data = run_data.get("gfs", {})
+        z500_field = gfs_data.get("z500_field")
+        if not z500_field:
+            return None, None
+
+        gfs_vals = np.array(z500_field["values"], dtype=np.float32) * 10.0  # dm -> m
+        gfs_lats = np.array(z500_field["latitude"], dtype=np.float32)
+        gfs_lons = np.array(z500_field["longitude"], dtype=np.float32)
+
+        era5_lats = som["lats"]
+        era5_lons = som["lons"]
+        lon_mode = som.get("lon_mode", "-180_180")
+
+        gfs_da = xr.DataArray(
+            gfs_vals,
+            coords={"latitude": gfs_lats, "longitude": gfs_lons},
+            dims=["latitude", "longitude"]
+        )
+
+        if lon_mode == "0_360":
+            if gfs_da.longitude.values.min() < 0:
+                gfs_da = gfs_da.assign_coords(
+                    longitude=(gfs_da.longitude % 360)
+                ).sortby("longitude")
+        else:
+            if gfs_da.longitude.values.max() > 180:
+                gfs_da = gfs_da.assign_coords(
+                    longitude=(((gfs_da.longitude + 180) % 360) - 180)
+                ).sortby("longitude")
+
+        gfs_regrid = gfs_da.interp(
+            latitude=era5_lats,
+            longitude=era5_lons,
+            method="linear"
+        ).values
+
+        init_time = datetime.fromisoformat(latest_run)
+        doy = init_time.timetuple().tm_yday
+        clim_stack = som["climatology"]
+        clim = clim_stack[doy - 1] if 1 <= doy <= 366 else None
+
+        if clim is None or np.isnan(clim).all():
+            zonal_mean = np.nanmean(gfs_regrid, axis=1, keepdims=True)
+            anomaly = gfs_regrid - zonal_mean
+        else:
+            anomaly = gfs_regrid - clim
+
+        flat = anomaly.reshape(-1).astype(np.float32)
+        mean = som["mean"]
+        std = som["std"]
+        std_safe = np.where(std == 0, 1.0, std)
+        flat = (flat - mean) / std_safe
+        if np.any(~np.isfinite(flat)):
+            flat = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+        weights = som["weights"]
+        weights_flat = weights.reshape(weights.shape[0] * weights.shape[1], -1)
+        dists = ((weights_flat - flat) ** 2).sum(axis=1)
+        idx = int(np.argmin(dists))
+        return latest_run.split("T")[0], (idx // som["cols"], idx % som["cols"])
+
+    except Exception as e:
+        logger.warning(f"Failed to compute GFS SOM cluster: {e}")
+        return None, None
+
+
+def _load_era5_anomaly_matrix_for_som(n_years: int = 30, stride: int = 6) -> dict:
+    """
+    Load ERA5 Z500 anomalies on the SOM grid and return anomalies + dates.
+    Cached in-memory for reuse by SOM cluster analog lookups.
+    """
+    global _SOM_ANOM_CACHE
+    if _SOM_ANOM_CACHE is not None:
+        return _SOM_ANOM_CACHE
+
+    ds, pressure_coord, lat_coord_name, lon_coord_name = _load_era5_z500_last_n_years(n_years)
+    var_name = "z" if "z" in ds.data_vars else list(ds.data_vars)[0]
+    z500 = ds[var_name].sel({pressure_coord: 500})
+
+    z500 = z500.resample(time="1D").mean()
+    z500 = z500.dropna("time", how="all")
+
+    z500 = z500.isel({
+        lat_coord_name: slice(None, None, stride),
+        lon_coord_name: slice(None, None, stride)
+    })
+
+    lats = z500[lat_coord_name].values
+    lons = z500[lon_coord_name].values
+
+    ds_with_doy = z500.assign_coords(dayofyear=z500.time.dt.dayofyear)
+    climatology = {}
+    for doy in range(1, 367):
+        window_days = [(doy + offset - 1) % 366 + 1 for offset in range(-15, 16)]
+        mask = ds_with_doy.dayofyear.isin(window_days)
+        if mask.sum() > 0:
+            window_data = ds_with_doy.where(mask, drop=True)
+            climatology[doy] = window_data.mean(dim="time").values
+
+    z500_vals = z500.values
+    doys = z500["time"].dt.dayofyear.values
+    anomalies = np.empty_like(z500_vals)
+    for i, doy in enumerate(doys):
+        clim = climatology.get(int(doy))
+        if clim is None:
+            zonal_mean = z500_vals[i].mean(axis=1, keepdims=True)
+            anomalies[i] = z500_vals[i] - zonal_mean
+        else:
+            anomalies[i] = z500_vals[i] - clim
+
+    dates = [np.datetime_as_string(d, unit="D") for d in z500["time"].values]
+
+    _SOM_ANOM_CACHE = {
+        "dates": dates,
+        "anomalies": anomalies.astype(np.float32),
+        "lats": lats,
+        "lons": lons
+    }
+    return _SOM_ANOM_CACHE
+
+
+def _compute_gfs_som_cluster_for_run(
+    som: dict,
+    run_time_str: str,
+    forecasts_db: dict,
+    location_name: str = "Fairfax, VA"
+) -> tuple[int, int] | None:
+    try:
+        import xarray as xr
+
+        if location_name not in forecasts_db:
+            return None
+
+        runs = forecasts_db[location_name].get("runs", {})
+        run_data = runs.get(run_time_str)
+        if run_data is None:
+            # Try without timezone offset if needed
+            alt = run_time_str.split("+")[0]
+            run_data = runs.get(alt)
+        if run_data is None:
+            return None
+
+        gfs_data = run_data.get("gfs", {})
+        z500_field = gfs_data.get("z500_field")
+        if not z500_field:
+            return None
+
+        gfs_vals = np.array(z500_field["values"], dtype=np.float32) * 10.0
+        gfs_lats = np.array(z500_field["latitude"], dtype=np.float32)
+        gfs_lons = np.array(z500_field["longitude"], dtype=np.float32)
+
+        era5_lats = som["lats"]
+        era5_lons = som["lons"]
+        lon_mode = som.get("lon_mode", "-180_180")
+
+        gfs_da = xr.DataArray(
+            gfs_vals,
+            coords={"latitude": gfs_lats, "longitude": gfs_lons},
+            dims=["latitude", "longitude"]
+        )
+
+        if lon_mode == "0_360":
+            if gfs_da.longitude.values.min() < 0:
+                gfs_da = gfs_da.assign_coords(
+                    longitude=(gfs_da.longitude % 360)
+                ).sortby("longitude")
+        else:
+            if gfs_da.longitude.values.max() > 180:
+                gfs_da = gfs_da.assign_coords(
+                    longitude=(((gfs_da.longitude + 180) % 360) - 180)
+                ).sortby("longitude")
+
+        gfs_regrid = gfs_da.interp(
+            latitude=era5_lats,
+            longitude=era5_lons,
+            method="linear"
+        ).values
+
+        init_time = datetime.fromisoformat(run_time_str.split("+")[0])
+        doy = init_time.timetuple().tm_yday
+        clim_stack = som["climatology"]
+        clim = clim_stack[doy - 1] if 1 <= doy <= 366 else None
+
+        if clim is None or np.isnan(clim).all():
+            zonal_mean = np.nanmean(gfs_regrid, axis=1, keepdims=True)
+            anomaly = gfs_regrid - zonal_mean
+        else:
+            anomaly = gfs_regrid - clim
+
+        flat = anomaly.reshape(-1).astype(np.float32)
+        mean = som["mean"]
+        std = som["std"]
+        std_safe = np.where(std == 0, 1.0, std)
+        flat = (flat - mean) / std_safe
+        if np.any(~np.isfinite(flat)):
+            flat = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+        weights = som["weights"]
+        weights_flat = weights.reshape(weights.shape[0] * weights.shape[1], -1)
+        dists = ((weights_flat - flat) ** 2).sum(axis=1)
+        idx = int(np.argmin(dists))
+        return (idx // som["cols"], idx % som["cols"])
+
+    except Exception as e:
+        logger.warning(f"Failed to compute GFS SOM cluster for {run_time_str}: {e}")
+        return None
+
+
+def _load_som_skill_store() -> dict:
+    if SOM_SKILL_FILE.exists():
+        try:
+            with SOM_SKILL_FILE.open("r") as f:
+                store = json.load(f)
+                # Backward-compat: migrate old schema (no variable dimension)
+                if "clusters" in store and store.get("meta", {}).get("variables") is None:
+                    old_clusters = store.get("clusters", {})
+                    migrated = {}
+                    for cluster_key, lt_dict in old_clusters.items():
+                        migrated[cluster_key] = {"precip": lt_dict}
+                    store["clusters"] = migrated
+                    old_station = store.get("cluster_station", {})
+                    migrated_station = {}
+                    for cluster_key, lt_dict in old_station.items():
+                        migrated_station[cluster_key] = {"precip": lt_dict}
+                    store["cluster_station"] = migrated_station
+                    store.setdefault("meta", {})["variables"] = ["precip", "temp"]
+                # Backward-compat: migrate processed_runs to include variable
+                processed = store.get("processed_runs", {})
+                if processed and "precip" not in processed:
+                    store["processed_runs"] = {
+                        "precip": processed,
+                        "temp": {k: [] for k in processed.keys()}
+                    }
+                return store
+        except Exception as e:
+            logger.warning(f"Failed to load SOM skill store: {e}")
+    return {
+        "meta": {
+            "lead_times": [24, 48, 72, 120],
+            "rows": 6,
+            "cols": 6,
+            "variables": ["precip", "temp"],
+            "updated_at": None
+        },
+        "clusters": {},
+        "cluster_station": {},
+        "stations": {},
+        "processed_runs": {
+            "precip": {
+                "24": [],
+                "48": [],
+                "72": [],
+                "120": []
+            },
+            "temp": {
+                "24": [],
+                "48": [],
+                "72": [],
+                "120": []
+            }
+        }
+    }
+
+
+def _save_som_skill_store(store: dict) -> None:
+    try:
+        SOM_SKILL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with SOM_SKILL_FILE.open("w") as f:
+            json.dump(store, f)
+    except Exception as e:
+        logger.warning(f"Failed to save SOM skill store: {e}")
+
+
+def update_som_cluster_skill() -> dict:
+    """
+    Incrementally update SOM cluster skill using GFS F000 patterns and
+    NWS precip MAE/bias across ASOS stations.
+    """
+    try:
+        import asos
+
+        som = _load_or_build_era5_som(rows=6, cols=6, n_years=30, stride=6)
+        store = _load_som_skill_store()
+
+        lead_times = store.get("meta", {}).get("lead_times", [24, 48, 72, 120])
+        variables = store.get("meta", {}).get("variables", ["precip", "temp"])
+        processed = store.get("processed_runs", {})
+        clusters = store.get("clusters", {})
+        cluster_station = store.get("cluster_station", {})
+
+        asos_db = asos.load_asos_forecasts_db()
+        if not asos_db or "runs" not in asos_db:
+            return {"success": False, "error": "ASOS verification data not available"}
+
+        forecasts_db = load_forecasts_db()
+        if not store.get("stations"):
+            store["stations"] = asos_db.get("stations", {})
+
+        updates = 0
+        for run_time_str in asos_db["runs"].keys():
+            for var in variables:
+                for lt in lead_times:
+                    lt_key = str(lt)
+                    if run_time_str in processed.get(var, {}).get(lt_key, []):
+                        continue
+
+                    station_errors = asos._calculate_asos_station_errors(
+                        asos_db,
+                        run_time_str,
+                        "nws",
+                        var,
+                        lt
+                    )
+                    if not station_errors:
+                        continue  # do not mark processed yet
+
+                    cluster = _compute_gfs_som_cluster_for_run(som, run_time_str, forecasts_db)
+                    if cluster is None:
+                        continue
+
+                    r, c = cluster
+                    cluster_key = f"{r},{c}"
+                    clusters.setdefault(cluster_key, {})
+                    clusters[cluster_key].setdefault(var, {})
+                    clusters[cluster_key][var].setdefault(lt_key, {"sum_abs": 0.0, "sum": 0.0, "count": 0, "runs": 0})
+
+                    cluster_station.setdefault(cluster_key, {})
+                    cluster_station[cluster_key].setdefault(var, {})
+                    cluster_station[cluster_key][var].setdefault(lt_key, {})
+
+                    sum_abs = 0.0
+                    sum_err = 0.0
+                    count = 0
+                    for station_id, err in station_errors.items():
+                        sum_abs += abs(err)
+                        sum_err += err
+                        count += 1
+
+                        station_bucket = cluster_station[cluster_key][var][lt_key].setdefault(
+                            station_id, {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+                        )
+                        station_bucket["sum_abs"] += abs(err)
+                        station_bucket["sum"] += err
+                        station_bucket["count"] += 1
+
+                    clusters[cluster_key][var][lt_key]["sum_abs"] += sum_abs
+                    clusters[cluster_key][var][lt_key]["sum"] += sum_err
+                    clusters[cluster_key][var][lt_key]["count"] += count
+                    clusters[cluster_key][var][lt_key]["runs"] += 1
+
+                    processed.setdefault(var, {}).setdefault(lt_key, []).append(run_time_str)
+                    updates += 1
+
+        store["clusters"] = clusters
+        store["cluster_station"] = cluster_station
+        store["processed_runs"] = processed
+        store.setdefault("meta", {})["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_som_skill_store(store)
+
+        return {"success": True, "updates": updates}
+
+    except Exception as e:
+        logger.error(f"Failed to update SOM cluster skill: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.route("/api/era5/som-skill")
+def api_era5_som_skill():
+    """
+    Cluster ERA5 500mb heights with a SOM and relate clusters to NWS precip MAE/bias
+    over the ASOS network.
+    """
+    lead_time = int(request.args.get("lead_time", 72))
+    variable = request.args.get("variable", "precip")
+    try:
+        som = _load_or_build_era5_som(rows=6, cols=6, n_years=30, stride=6)
+        rows = som["rows"]
+        cols = som["cols"]
+        store = _load_som_skill_store()
+        clusters = store.get("clusters", {})
+
+        nodes = []
+        all_mae = []
+        all_bias = []
+        lt_key = str(lead_time)
+
+        for r in range(rows):
+            for c in range(cols):
+                cluster_key = f"{r},{c}"
+                node = {"r": r, "c": c}
+                if variable == "both":
+                    for var in ["precip", "temp"]:
+                        stats = clusters.get(cluster_key, {}).get(var, {}).get(lt_key, {})
+                        count = stats.get("count", 0)
+                        runs = stats.get("runs", 0)
+                        if count > 0:
+                            mae_mean = stats.get("sum_abs", 0.0) / count
+                            bias_mean = stats.get("sum", 0.0) / count
+                            all_mae.append(mae_mean)
+                            all_bias.append(bias_mean)
+                        else:
+                            mae_mean = None
+                            bias_mean = None
+                        node[f"{var}_mae_mean"] = round(mae_mean, 3) if mae_mean is not None else None
+                        node[f"{var}_bias_mean"] = round(bias_mean, 3) if bias_mean is not None else None
+                        node[f"{var}_count"] = int(count)
+                        node[f"{var}_runs"] = int(runs)
+                else:
+                    stats = clusters.get(cluster_key, {}).get(variable, {}).get(lt_key, {})
+                    count = stats.get("count", 0)
+                    runs = stats.get("runs", 0)
+                    if count > 0:
+                        mae_mean = stats.get("sum_abs", 0.0) / count
+                        bias_mean = stats.get("sum", 0.0) / count
+                        all_mae.append(mae_mean)
+                        all_bias.append(bias_mean)
+                    else:
+                        mae_mean = None
+                        bias_mean = None
+                    node.update({
+                        "mae_mean": round(mae_mean, 3) if mae_mean is not None else None,
+                        "bias_mean": round(bias_mean, 3) if bias_mean is not None else None,
+                        "count": int(count),
+                        "runs": int(runs)
+                    })
+                nodes.append(node)
+
+        overall_mae = sum(all_mae) / len(all_mae) if all_mae else None
+        overall_bias = sum(all_bias) / len(all_bias) if all_bias else None
+
+        latest_gfs_date, latest_gfs_cluster = _compute_latest_gfs_som_cluster(som)
+
+        result = {
+            "success": True,
+            "rows": rows,
+            "cols": cols,
+            "lead_time": lead_time,
+            "metric": f"nws_{variable}",
+            "nodes": nodes,
+            "overall_mae": round(overall_mae, 3) if overall_mae is not None else None,
+            "overall_bias": round(overall_bias, 3) if overall_bias is not None else None,
+            "latest_gfs_date": latest_gfs_date,
+            "latest_gfs_cluster": latest_gfs_cluster
+        }
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error building SOM skill analysis: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/era5/som-cluster-stations")
+def api_era5_som_cluster_stations():
+    """
+    Return per-station MAE/bias for a given SOM cluster and lead time.
+    """
+    try:
+        import warnings
+        cluster = request.args.get("cluster", "")
+        lead_time = request.args.get("lead_time", "72")
+        variable = request.args.get("variable", "precip")
+        if not cluster or "," not in cluster:
+            return jsonify({"success": False, "error": "cluster is required as r,c"})
+        r_str, c_str = cluster.split(",", 1)
+        cluster_key = f"{int(r_str)},{int(c_str)}"
+        lt_key = str(int(lead_time))
+
+        store = _load_som_skill_store()
+        stations_meta = store.get("stations", {})
+        cluster_station = store.get("cluster_station", {})
+        stats = cluster_station.get(cluster_key, {}).get(variable, {}).get(lt_key, {})
+
+        points = []
+        for station_id, s in stats.items():
+            count = s.get("count", 0)
+            if count <= 0:
+                continue
+            meta = stations_meta.get(station_id, {})
+            mae = s.get("sum_abs", 0.0) / count
+            bias = s.get("sum", 0.0) / count
+            points.append({
+                "station_id": station_id,
+                "name": meta.get("name"),
+                "lat": meta.get("lat"),
+                "lon": meta.get("lon"),
+                "mae": round(mae, 3),
+                "bias": round(bias, 3),
+                "count": int(count)
+            })
+
+        return jsonify({
+            "success": True,
+            "cluster": cluster_key,
+            "lead_time": int(lt_key),
+            "stations": points
+        })
+
+    except Exception as e:
+        logger.error(f"Error loading SOM cluster stations: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/era5/som-cluster-analogs")
+def api_era5_som_cluster_analogs():
+    """
+    Return top-N representative ERA5 anomaly dates for a SOM cluster using
+    the composite analog score (pattern + gradient + rmse similarity).
+    """
+    try:
+        cluster = request.args.get("cluster", "")
+        top_n = int(request.args.get("top_n", 5))
+        if not cluster or "," not in cluster:
+            return jsonify({"success": False, "error": "cluster is required as r,c"})
+        r_str, c_str = cluster.split(",", 1)
+        r = int(r_str)
+        c = int(c_str)
+
+        som = _load_or_build_era5_som(rows=6, cols=6, n_years=30, stride=6)
+        bmu = som["bmu"]
+        rows = som["rows"]
+        cols = som["cols"]
+        if r < 0 or c < 0 or r >= rows or c >= cols:
+            return jsonify({"success": False, "error": "cluster out of range"})
+
+        anom_cache = _load_era5_anomaly_matrix_for_som(n_years=30, stride=6)
+        dates = anom_cache["dates"]
+        anomalies = anom_cache["anomalies"]
+        lats = anom_cache["lats"]
+
+        # indices for this cluster
+        cluster_idx = r * cols + c
+        indices = np.where(bmu == cluster_idx)[0]
+        if len(indices) == 0:
+            return jsonify({"success": True, "cluster": f"{r},{c}", "analogs": []})
+
+        # centroid anomaly for cluster
+        cluster_anoms = anomalies[indices]
+        centroid = np.nanmean(cluster_anoms, axis=0)
+
+        # compute composite score for each date in cluster
+        if not _HAS_ANALOG_METRICS:
+            return jsonify({"success": False, "error": "analog_metrics not available"})
+
+        w2d = _analog_metrics.build_lat_weights(lats, centroid.shape)
+        weights_flat = w2d.flatten()
+
+        results = []
+        for idx in indices:
+            sample = anomalies[idx]
+            lat_pearson = _analog_metrics.weighted_pearson(
+                centroid.flatten(),
+                sample.flatten(),
+                weights_flat
+            )
+            grad_corr = _analog_metrics.gradient_correlation(centroid, sample)
+            rmse_sim = _analog_metrics.rmse_similarity(centroid.flatten(), sample.flatten())
+            score = _analog_metrics.compute_composite_score(lat_pearson, grad_corr, rmse_sim)
+            results.append({
+                "date": dates[idx],
+                "score": round(float(score), 4),
+                "pattern": round(float(lat_pearson), 4),
+                "circulation": round(float(grad_corr), 4),
+                "amplitude": round(float(rmse_sim), 4)
+            })
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return jsonify({
+            "success": True,
+            "cluster": f"{r},{c}",
+            "analogs": results[:max(1, top_n)]
+        })
+
+    except Exception as e:
+        logger.error(f"Error loading SOM cluster analogs: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/era5/som-cluster-mean-map")
+def api_era5_som_cluster_mean_map():
+    """
+    Render the mean 500mb height anomaly map for a SOM cluster.
+    """
+    try:
+        cluster = request.args.get("cluster", "")
+        if not cluster or "," not in cluster:
+            return jsonify({"success": False, "error": "cluster is required as r,c"})
+        r_str, c_str = cluster.split(",", 1)
+        r = int(r_str)
+        c = int(c_str)
+
+        som = _load_or_build_era5_som(rows=6, cols=6, n_years=30, stride=6)
+        bmu = som["bmu"]
+        rows = som["rows"]
+        cols = som["cols"]
+        if r < 0 or c < 0 or r >= rows or c >= cols:
+            return jsonify({"success": False, "error": "cluster out of range"})
+
+        anom_cache = _load_era5_anomaly_matrix_for_som(n_years=30, stride=6)
+        anomalies = anom_cache["anomalies"]
+        lats = anom_cache["lats"]
+        lons = anom_cache["lons"]
+
+        cluster_idx = r * cols + c
+        indices = np.where(bmu == cluster_idx)[0]
+        if len(indices) == 0:
+            return jsonify({"success": False, "error": "No samples in cluster"})
+
+        mean_anom = np.nanmean(anomalies[indices], axis=0) / 9.80665  # to dam
+
+        import warnings
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        from io import BytesIO
+        import base64
+
+        # Suppress occasional shapely runtime warnings from cartopy rendering
+        warnings.filterwarnings("ignore", category=RuntimeWarning, module="shapely")
+
+        fig = plt.figure(figsize=(12, 7))
+        ax = fig.add_subplot(1, 1, 1, projection=ccrs.NorthPolarStereo(central_longitude=-100))
+        ax.set_extent([-180, 180, 20, 90], crs=ccrs.PlateCarree())
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.5)
+        ax.gridlines(draw_labels=False, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+
+        anom_levels = np.arange(-30, 31, 2)
+        cf = ax.contourf(lons, lats, mean_anom, levels=anom_levels, cmap='RdBu_r',
+                         transform=ccrs.PlateCarree(), extend='both')
+        cbar = plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.05, shrink=0.8)
+        cbar.set_label('500mb Height Anomaly (dam)', fontsize=10)
+
+        plt.title(f'SOM Cluster Mean 500mb Anomaly | C{r + 1}-{c + 1}', fontsize=12, fontweight='bold')
+
+        buffer = BytesIO()
+        fig.savefig(buffer, format='png', bbox_inches='tight', dpi=120)
+        buffer.seek(0)
+        img_base64 = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode('utf-8')
+        plt.close(fig)
+
+        return jsonify({"success": True, "cluster": f"{r},{c}", "map_image": img_base64})
+
+    except Exception as e:
+        logger.error(f"Error rendering SOM cluster mean map: {e}")
         return jsonify({"success": False, "error": str(e)})
 
 
@@ -7212,8 +8107,16 @@ def api_asos_sync():
             logger.info("Fetching NWS forecasts for ASOS stations...")
             nws_raw = nws_batch.fetch_nws_forecasts_batch_sync(stations)
 
+            # Fetch WPC QPF to replace NWS precipitation (consistent 7-day national coverage)
+            logger.info("Fetching WPC 5km QPF for precipitation...")
+            try:
+                wpc_precip = nws_batch.fetch_wpc_qpf_for_stations_sync(stations)
+            except Exception as e:
+                logger.warning(f"WPC QPF fetch failed, using NWS precipitation: {e}")
+                wpc_precip = {}
+
             # Transform to ASOS format (temps/mslps/precips aligned with forecast_hours)
-            nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, forecast_hours, gfs_init)
+            nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, forecast_hours, gfs_init, wpc_precip=wpc_precip)
 
             # Use GFS init time for NWS (aligns verification timing)
             asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
@@ -7274,7 +8177,7 @@ def api_asos_sync():
         try:
             logger.info("Fetching NWS 6-hourly trend data...")
             # Use the same NWS raw data but transform for 6-hourly hours
-            nws_trends = nws_batch.transform_nws_to_asos_format(nws_raw, forecast_hours_trends, gfs_init)
+            nws_trends = nws_batch.transform_nws_to_asos_format(nws_raw, forecast_hours_trends, gfs_init, wpc_precip=wpc_precip)
             store_asos_trend_run(gfs_init, 'nws', nws_trends)
             results['trends']['nws'] = {'status': 'success', 'stations': len(nws_trends)}
         except Exception as e:
@@ -7317,7 +8220,12 @@ def api_asos_nws_resync():
         forecast_hours = list(range(6, 361, 6))
         nws_forecast_hours = [h for h in forecast_hours if h <= 168]
         nws_raw = nws_batch.fetch_nws_forecasts_batch_sync(stations)
-        nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init)
+        try:
+            wpc_precip = nws_batch.fetch_wpc_qpf_for_stations_sync(stations)
+        except Exception as e:
+            logger.warning(f"WPC QPF fetch failed, using NWS precipitation: {e}")
+            wpc_precip = {}
+        nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init, wpc_precip=wpc_precip)
         asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
 
         # Rebuild verification cache
@@ -7641,13 +8549,21 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 broadcast_sync_log("Fetching NWS forecasts for ASOS stations (batch mode with rate limiting)...", 'info')
                 nws_raw = nws_batch.fetch_nws_forecasts_batch_sync(stations)
 
+                # Fetch WPC QPF to replace NWS precipitation (consistent 7-day national coverage)
+                broadcast_sync_log("Fetching WPC 5km QPF for 7-day precipitation...", 'info')
+                try:
+                    wpc_precip = nws_batch.fetch_wpc_qpf_for_stations_sync(stations)
+                except Exception as _wpc_exc:
+                    broadcast_sync_log(f"WPC QPF fetch failed, using NWS precipitation: {_wpc_exc}", 'warning')
+                    wpc_precip = {}
+
                 # NWS forecasts only extend to ~7 days (168 hours), not 15 days
                 # Filter forecast_hours to only include hours <= 168
                 nws_forecast_hours = [h for h in forecast_hours if h <= 168]
 
                 # Transform to ASOS format
                 logger.info(f"Transforming NWS data with gfs_init={gfs_init} (type: {type(gfs_init)})")
-                nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init)
+                nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init, wpc_precip=wpc_precip)
 
                 # Use GFS init time for NWS forecasts (aligns verification timing)
                 asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
@@ -7668,6 +8584,18 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
             broadcast_sync_log(f"Fetched {obs_count} ASOS observations", 'success')
             asos_results['observations'] = {'status': 'synced', 'count': obs_count}
 
+            # Update SOM cluster skill after observations are refreshed
+            try:
+                broadcast_sync_log("Updating SOM cluster skill (GFS patterns + NWS precip)...", 'info')
+                som_update = update_som_cluster_skill()
+                if som_update.get("success"):
+                    broadcast_sync_log(f"SOM skill updated ({som_update.get('updates', 0)} new samples)", 'success')
+                else:
+                    broadcast_sync_log(f"SOM skill update failed: {som_update.get('error', '')}", 'warning')
+            except Exception as e:
+                broadcast_sync_log(f"SOM skill update failed: {e}", 'warning')
+                logger.warning(f"SOM skill update failed: {e}", exc_info=True)
+
             # Store 6-hourly forecasts for trend visualization (last 2 runs only)
             broadcast_sync_log("Storing 6-hourly forecast data for trend visualization...", 'info')
             try:
@@ -7678,7 +8606,7 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 # NWS trends (if available)
                 if asos_results.get('nws', {}).get('status') == 'synced':
                     nws_forecast_hours = [h for h in forecast_hours if h <= 168]
-                    nws_trends = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init)
+                    nws_trends = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init, wpc_precip=wpc_precip)
                     store_asos_trend_run(gfs_init, 'nws', nws_trends)
 
                 broadcast_sync_log("Trend visualization data stored successfully", 'success')

@@ -2,6 +2,36 @@
 
 {% block title %}Rossby Wave Analysis{% endblock %}
 
+{% block extra_css %}
+<style>
+    .som-grid {
+        display: grid;
+        gap: 6px;
+    }
+    .som-cell {
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: 8px;
+        background: #f8fafc;
+        min-height: 64px;
+    }
+    .som-cell .som-title {
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: #334155;
+    }
+    .som-cell .som-metric {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: #0f172a;
+    }
+    .som-cell .som-sub {
+        font-size: 0.75rem;
+        color: #475569;
+    }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="container mt-4">
     <h1 class="mb-4">
@@ -142,6 +172,75 @@
         </div>
     </div>
 
+    <!-- SOM Pattern Skill Card -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap">
+                    <span><i class="bi bi-grid-3x3-gap"></i> SOM Pattern Skill (ERA5 Z500)</span>
+                    <div class="d-flex align-items-center gap-2">
+                        <label for="somGridVariable" class="small text-muted mb-0">Variable:</label>
+                        <select class="form-select form-select-sm" id="somGridVariable" style="width: auto;">
+                            <option value="precip" selected>Precip</option>
+                            <option value="temp">Temp</option>
+                        </select>
+                        <label for="somLeadTime" class="small text-muted mb-0">Lead time:</label>
+                        <select class="form-select form-select-sm" id="somLeadTime" style="width: auto;">
+                            <option value="24">24h</option>
+                            <option value="48">48h</option>
+                            <option value="72" selected>72h</option>
+                            <option value="120">120h</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted small mb-2">
+                        <i class="bi bi-info-circle"></i>
+                        Clusters past 500mb height anomalies (ERA5, last 30 years) and summarizes NWS 6-hr precip MAE/bias across ASOS stations.
+                    </p>
+                    <div id="som-loading" class="text-center py-4" style="display:none;">
+                        <div class="spinner-border text-primary" role="status"></div>
+                        <p class="mt-2 text-muted">Building SOM and computing skill...</p>
+                    </div>
+                    <div id="som-error" class="alert alert-warning" style="display:none;"></div>
+                    <div id="som-summary" class="alert alert-info" style="display:none;"></div>
+                    <div id="som-grid" class="som-grid"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- SOM Cluster Map Modal -->
+    <div class="modal fade" id="somClusterModal" tabindex="-1" aria-labelledby="somClusterModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable" style="max-width: 95vw;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="somClusterModalLabel">SOM Cluster Station Bias/MAE</h5>
+                    <div class="d-flex align-items-center gap-2">
+                        <label for="somClusterVariable" class="small text-muted mb-0">Variable:</label>
+                        <select class="form-select form-select-sm" id="somClusterVariable" style="width: auto;">
+                            <option value="precip" selected>Precip</option>
+                            <option value="temp">Temp</option>
+                        </select>
+                        <label for="somClusterMetric" class="small text-muted mb-0">Metric:</label>
+                        <select class="form-select form-select-sm" id="somClusterMetric" style="width: auto;">
+                            <option value="bias" selected>Bias</option>
+                            <option value="mae">MAE</option>
+                        </select>
+                    </div>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small mb-2" id="somClusterModalSubtitle"></p>
+                    <div>
+                        <h6 class="mb-2">ASOS Station Bias/MAE Map</h6>
+                        <div id="somClusterMap" style="height: 80vh; min-height: 600px; border-radius: 8px;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Scientific Background -->
     <div class="row mb-4">
         <div class="col-12">
@@ -184,16 +283,39 @@
 let waveChart = null;
 let waveErrorChart = null;
 let amplitudeErrorChart = null;
+let somClusterMap = null;
+let somClusterMarkers = [];
+let somClusterModal = null;
+let somClusterStations = [];
+let somClusterCurrent = { r: null, c: null, leadTime: null };
 
 // Load all data on page load
 document.addEventListener('DOMContentLoaded', function() {
     loadWaveAnalysis();
     loadWaveChart();
     loadPredictabilityAnalysis();
+    loadSomSkill();
+    somClusterModal = new bootstrap.Modal(document.getElementById('somClusterModal'));
+    document.getElementById('somClusterModal').addEventListener('shown.bs.modal', () => {
+        if (somClusterMap) {
+            setTimeout(() => somClusterMap.invalidateSize(), 50);
+        }
+    });
+    document.getElementById('somClusterMetric').addEventListener('change', () => {
+        renderSomClusterMarkers();
+    });
+    document.getElementById('somClusterVariable').addEventListener('change', () => {
+        if (somClusterCurrent.r != null) {
+            openSomClusterMap(somClusterCurrent.r, somClusterCurrent.c, somClusterCurrent.leadTime);
+        }
+    });
 });
 
 // Event listeners
 document.getElementById('waveHistoryDays').addEventListener('change', loadWaveChart);
+document.getElementById('somLeadTime').addEventListener('change', loadSomSkill);
+document.getElementById('somGridVariable').addEventListener('change', loadSomSkill);
+document.getElementById('somClusterVariable').addEventListener('change', loadSomSkill);
 
 // ============================================================================
 // Current Wave State
@@ -565,6 +687,299 @@ function renderAmplitudeErrorChart(data) {
                 }
             }
         }
+    });
+}
+
+// ============================================================================
+// SOM Pattern Skill
+// ============================================================================
+
+async function loadSomSkill() {
+    const leadTime = document.getElementById('somLeadTime').value;
+    const gridVariable = document.getElementById('somGridVariable').value;
+    const loading = document.getElementById('som-loading');
+    const errorDiv = document.getElementById('som-error');
+    const summaryDiv = document.getElementById('som-summary');
+    const grid = document.getElementById('som-grid');
+
+    loading.style.display = 'block';
+    errorDiv.style.display = 'none';
+    summaryDiv.style.display = 'none';
+    grid.innerHTML = '';
+
+    try {
+        const response = await fetch(`/api/era5/som-skill?lead_time=${leadTime}&variable=${gridVariable}`);
+        const data = await response.json();
+
+        loading.style.display = 'none';
+
+        if (!data.success) {
+            errorDiv.textContent = data.error || 'Error loading SOM data';
+            errorDiv.style.display = 'block';
+            return;
+        }
+
+        const rows = data.rows;
+        const cols = data.cols;
+        const nodes = data.nodes || [];
+
+        const maeValues = nodes.filter(n => n.mae_mean !== null).map(n => n.mae_mean);
+        const minMae = maeValues.length ? Math.min(...maeValues) : 0;
+        const maxMae = maeValues.length ? Math.max(...maeValues) : 1;
+
+        grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+
+        function colorForMae(value) {
+            if (value === null || value === undefined) return '#f1f5f9';
+            const maxMae = (gridVariable === 'temp') ? 10 : 1;
+            const t = Math.max(0, Math.min(1, value / maxMae));
+            // Green -> Yellow -> Orange -> Red
+            if (t < 0.33) return '#86efac';   // light green
+            if (t < 0.66) return '#facc15';   // yellow
+            if (t < 0.85) return '#fb923c';   // orange
+            return '#ef4444';                 // red
+        }
+
+        const isCurrent = (node) => (
+            data.latest_gfs_cluster &&
+            node.r === data.latest_gfs_cluster[0] &&
+            node.c === data.latest_gfs_cluster[1]
+        );
+
+        nodes.forEach(node => {
+            const cell = document.createElement('div');
+            cell.className = 'som-cell';
+            cell.style.background = colorForMae(node.mae_mean);
+            if (isCurrent(node)) {
+                cell.style.outline = '3px solid #1d4ed8';
+                cell.style.boxShadow = '0 0 0 2px rgba(29, 78, 216, 0.15)';
+            }
+            cell.style.cursor = 'pointer';
+
+            const title = document.createElement('div');
+            title.className = 'som-title';
+            title.textContent = `C${node.r + 1}-${node.c + 1}` + (isCurrent(node) ? ' • Current' : '');
+
+            const metric = document.createElement('div');
+            metric.className = 'som-metric';
+            const mae = node.mae_mean;
+            const bias = node.bias_mean;
+            const runCount = node.runs ?? 0;
+            metric.textContent = mae !== null && mae !== undefined
+                ? `MAE ${gridVariable === 'temp' ? mae.toFixed(1) + '°F' : mae.toFixed(2) + '\"'}`
+                : 'MAE N/A';
+
+            const sub = document.createElement('div');
+            sub.className = 'som-sub';
+            if (bias !== null && bias !== undefined) {
+                const sign = bias > 0 ? '+' : '';
+                const biasText = gridVariable === 'temp' ? `${sign}${bias.toFixed(1)}°F` : `${sign}${bias.toFixed(2)}\"`;
+                sub.textContent = `Bias ${biasText}`;
+            } else {
+                sub.textContent = 'Bias N/A';
+            }
+
+            const countLine = document.createElement('div');
+            countLine.className = 'som-sub';
+            countLine.textContent = `runs=${runCount}`;
+
+            cell.appendChild(title);
+            cell.appendChild(metric);
+            cell.appendChild(sub);
+            cell.appendChild(countLine);
+            grid.appendChild(cell);
+
+            cell.addEventListener('click', () => {
+                openSomClusterMap(node.r, node.c, leadTime);
+            });
+        });
+
+        const ranked = nodes.filter(n => n.mae_mean !== null).sort((a, b) => a.mae_mean - b.mae_mean);
+        const best = ranked.slice(0, 3);
+        const worst = ranked.slice(-3).reverse();
+
+        const bestStr = best.map(n => `C${n.r + 1}-${n.c + 1} (${gridVariable === 'temp' ? n.mae_mean.toFixed(1) + '°F' : n.mae_mean.toFixed(2) + '\"'})`).join(', ');
+        const worstStr = worst.map(n => `C${n.r + 1}-${n.c + 1} (${gridVariable === 'temp' ? n.mae_mean.toFixed(1) + '°F' : n.mae_mean.toFixed(2) + '\"'})`).join(', ');
+
+        const latest = data.latest_gfs_cluster
+            ? `Latest GFS pattern: C${data.latest_gfs_cluster[0] + 1}-${data.latest_gfs_cluster[1] + 1} on ${data.latest_gfs_date}`
+            : (data.latest_cluster ? `Latest ERA5 pattern: C${data.latest_cluster[0] + 1}-${data.latest_cluster[1] + 1} on ${data.latest_date}` : 'Latest pattern: N/A');
+
+        summaryDiv.innerHTML = `
+            <strong>Best patterns:</strong> ${bestStr || 'N/A'}<br>
+            <strong>Worst patterns:</strong> ${worstStr || 'N/A'}<br>
+            <strong>${latest}</strong>
+        `;
+        summaryDiv.style.display = 'block';
+
+    } catch (error) {
+        loading.style.display = 'none';
+        errorDiv.textContent = 'Error loading SOM data: ' + error;
+        errorDiv.style.display = 'block';
+    }
+}
+
+function initSomClusterMap() {
+    if (somClusterMap) return;
+    somClusterMap = L.map('somClusterMap', {
+        zoomControl: true,
+        scrollWheelZoom: true
+    }).setView([39.8283, -98.5795], 4);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors',
+        maxZoom: 18
+    }).addTo(somClusterMap);
+}
+
+function clearSomClusterMarkers() {
+    somClusterMarkers.forEach(m => somClusterMap.removeLayer(m));
+    somClusterMarkers = [];
+}
+
+async function openSomClusterMap(r, c, leadTime) {
+    const subtitle = document.getElementById('somClusterModalSubtitle');
+    const gridVariable = document.getElementById('somGridVariable').value;
+    const modalVarSelect = document.getElementById('somClusterVariable');
+    if (modalVarSelect) {
+        modalVarSelect.value = gridVariable;
+    }
+    const variable = gridVariable;
+    subtitle.textContent = `Cluster C${r + 1}-${c + 1} | Lead time ${leadTime}h | NWS ${variable} bias (color) & MAE (size)`;
+    somClusterCurrent = { r, c, leadTime };
+
+    initSomClusterMap();
+    clearSomClusterMarkers();
+    somClusterModal.show();
+    setTimeout(() => {
+        if (somClusterMap) {
+            somClusterMap.invalidateSize();
+        }
+    }, 150);
+
+    try {
+        const stationsResp = await fetch(`/api/era5/som-cluster-stations?cluster=${r},${c}&lead_time=${leadTime}&variable=${variable}`);
+        const data = await stationsResp.json();
+        if (!data.success) {
+            subtitle.textContent = `Cluster C${r + 1}-${c + 1} | Error: ${data.error || 'failed to load'}`;
+            return;
+        }
+
+        somClusterStations = data.stations;
+        renderSomClusterMarkers();
+        if (!data.stations || data.stations.length === 0) {
+            subtitle.textContent = `Cluster C${r + 1}-${c + 1} | No station data yet for ${leadTime}h (${variable})`;
+        }
+
+    } catch (error) {
+        subtitle.textContent = `Cluster C${r + 1}-${c + 1} | Error: ${error}`;
+    }
+}
+
+function getMaeColor(value, variable) {
+    const fixedMin = 0;
+    const fixedMax = (variable === 'precip') ? 1 : 10;
+    const ratio = Math.max(0, Math.min(1, (value - fixedMin) / (fixedMax - fixedMin)));
+
+    if (ratio < 0.5) {
+        const t = ratio * 2;
+        const r = Math.round(34 + t * (234 - 34));
+        const g = Math.round(197 + t * (179 - 197));
+        const b = Math.round(94 + t * (8 - 94));
+        return `rgb(${r}, ${g}, ${b})`;
+    } else {
+        const t = (ratio - 0.5) * 2;
+        const r = Math.round(234 + t * (239 - 234));
+        const g = Math.round(179 + t * (68 - 179));
+        const b = Math.round(8 + t * (68 - 8));
+        return `rgb(${r}, ${g}, ${b})`;
+    }
+}
+
+function getBiasColor(value, variable) {
+    const fixedMax = (variable === 'precip') ? 1 : 10;
+    const fixedMin = -fixedMax;
+    const clampedValue = Math.max(fixedMin, Math.min(fixedMax, value));
+    const ratio = clampedValue / fixedMax;  // -1 to 1
+    if (variable === 'precip') {
+        const gradientRatio = (ratio + 1) / 2;  // 0 to 1
+        if (gradientRatio < 0.5) {
+            const t = gradientRatio * 2;
+            const r = Math.round(139 + t * (255 - 139));
+            const g = Math.round(69 + t * (255 - 69));
+            const b = Math.round(19 + t * (255 - 19));
+            return `rgb(${r}, ${g}, ${b})`;
+        } else {
+            const t = (gradientRatio - 0.5) * 2;
+            const r = Math.round(255 - t * (255 - 34));
+            const g = Math.round(255 - t * (255 - 139));
+            const b = Math.round(255 - t * (255 - 34));
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+    }
+    if (ratio < 0) {
+        const t = 1 + ratio;  // 0 to 1
+        const r = Math.round(59 + t * (255 - 59));
+        const g = Math.round(130 + t * (255 - 130));
+        const b = Math.round(246 + t * (255 - 246));
+        return `rgb(${r}, ${g}, ${b})`;
+    } else {
+        const t = ratio;  // 0 to 1
+        const r = Math.round(255 + t * (239 - 255));
+        const g = Math.round(255 + t * (68 - 255));
+        const b = Math.round(255 + t * (68 - 255));
+        return `rgb(${r}, ${g}, ${b})`;
+    }
+}
+
+function getMarkerColor(value, metric, variable) {
+    return metric === 'bias' ? getBiasColor(value, variable) : getMaeColor(value, variable);
+}
+
+function radiusForMetric(value, metric, variable) {
+    const maxScale = (variable === 'precip') ? 1 : 10;
+    if (metric === 'bias') {
+        const absValue = Math.abs(value);
+        const normalized = Math.min(absValue / maxScale, 1);
+        return 3 + normalized * 4.5;
+    } else {
+        const normalized = Math.min(value / maxScale, 1);
+        return 3 + normalized * 4.5;
+    }
+}
+
+function renderSomClusterMarkers() {
+    if (!somClusterMap) return;
+    clearSomClusterMarkers();
+
+    const metric = document.getElementById('somClusterMetric').value;
+    const variable = document.getElementById('somClusterVariable').value;
+    const subtitle = document.getElementById('somClusterModalSubtitle');
+    if (somClusterCurrent.r !== null) {
+        subtitle.textContent = `Cluster C${somClusterCurrent.r + 1}-${somClusterCurrent.c + 1} | Lead time ${somClusterCurrent.leadTime}h | NWS ${variable} ${metric.toUpperCase()} (color + size)`;
+    }
+
+    somClusterStations.forEach(s => {
+        if (s.lat == null || s.lon == null) return;
+        const value = metric === 'bias' ? s.bias : s.mae;
+        if (value == null) return;
+
+        const marker = L.circleMarker([s.lat, s.lon], {
+            radius: radiusForMetric(value, metric, variable),
+            fillColor: getMarkerColor(value, metric, variable),
+            color: '#333',
+            weight: 1,
+            opacity: 0.8,
+            fillOpacity: 0.9
+        }).addTo(somClusterMap);
+
+        marker.bindTooltip(
+            `<strong>${s.station_id}</strong> ${s.name || ''}<br>` +
+                `MAE: ${s.mae.toFixed(2)}${variable === 'temp' ? '°F' : '\"'}<br>` +
+                `Bias: ${s.bias > 0 ? '+' : ''}${s.bias.toFixed(2)}${variable === 'temp' ? '°F' : '\"'}<br>` +
+                `n=${s.count}`
+        );
+        somClusterMarkers.push(marker);
     });
 }
 </script>

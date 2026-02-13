@@ -2961,3 +2961,157 @@ def _calculate_asos_mean_mae(
     except Exception as e:
         logger.error(f"Error calculating ASOS mean MAE: {e}")
         return None
+
+
+def _calculate_asos_mean_error_stats(
+    db: dict,
+    run_time_str: str,
+    model: str,
+    variable: str,
+    lead_time_hours: int
+) -> Optional[dict]:
+    """
+    Calculate mean MAE and bias across all ASOS stations for a specific run.
+
+    Returns dict with keys: mae, bias, count (stations), or None if insufficient data.
+    """
+    try:
+        run_data = db.get("runs", {}).get(run_time_str)
+        if not run_data:
+            return None
+
+        forecast_hours = run_data.get("forecast_hours", [])
+        if lead_time_hours not in forecast_hours:
+            return None
+
+        fcst_idx = forecast_hours.index(lead_time_hours)
+
+        var_map = {
+            'temp': ('temps', 'temp'),
+            'mslp': ('mslps', 'mslp'),
+            'precip': ('precips', 'precip_6hr')
+        }
+
+        if variable not in var_map:
+            return None
+
+        fcst_key, obs_key = var_map[variable]
+
+        init_time = datetime.fromisoformat(run_time_str)
+        if init_time.tzinfo is None:
+            init_time = init_time.replace(tzinfo=timezone.utc)
+
+        valid_time = init_time + timedelta(hours=lead_time_hours)
+        now = datetime.now(timezone.utc)
+        if valid_time >= now:
+            return None
+
+        errors = []
+        stations = db.get("stations", {})
+        model_data = run_data.get(model.lower())
+
+        if not model_data:
+            return None
+
+        for station_id, fcst_data in model_data.items():
+            if station_id not in stations:
+                continue
+
+            fcst_values = fcst_data.get(fcst_key, [])
+            if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                continue
+
+            fcst_val = fcst_values[fcst_idx]
+
+            obs = get_stored_observation(db, station_id, valid_time)
+            if obs is None or obs.get(obs_key) is None:
+                continue
+
+            obs_val = obs[obs_key]
+
+            if variable == 'precip' and not should_include_precip(fcst_val, obs_val):
+                continue
+
+            errors.append(fcst_val - obs_val)
+
+        if len(errors) >= 10:
+            mae = sum(abs(e) for e in errors) / len(errors)
+            bias = sum(errors) / len(errors)
+            return {"mae": mae, "bias": bias, "count": len(errors)}
+        return None
+
+    except Exception as e:
+        logger.error(f"Error calculating ASOS mean error stats: {e}")
+        return None
+
+
+def _calculate_asos_station_errors(
+    db: dict,
+    run_time_str: str,
+    model: str,
+    variable: str,
+    lead_time_hours: int
+) -> dict:
+    """
+    Return per-station forecast errors (fcst - obs) for a run/model/variable/lead time.
+    """
+    errors = {}
+    try:
+        run_data = db.get("runs", {}).get(run_time_str)
+        if not run_data:
+            return errors
+
+        forecast_hours = run_data.get("forecast_hours", [])
+        if lead_time_hours not in forecast_hours:
+            return errors
+
+        fcst_idx = forecast_hours.index(lead_time_hours)
+
+        var_map = {
+            'temp': ('temps', 'temp'),
+            'mslp': ('mslps', 'mslp'),
+            'precip': ('precips', 'precip_6hr')
+        }
+        if variable not in var_map:
+            return errors
+
+        fcst_key, obs_key = var_map[variable]
+
+        init_time = datetime.fromisoformat(run_time_str)
+        if init_time.tzinfo is None:
+            init_time = init_time.replace(tzinfo=timezone.utc)
+
+        valid_time = init_time + timedelta(hours=lead_time_hours)
+        now = datetime.now(timezone.utc)
+        if valid_time >= now:
+            return errors
+
+        stations = db.get("stations", {})
+        model_data = run_data.get(model.lower())
+        if not model_data:
+            return errors
+
+        for station_id, fcst_data in model_data.items():
+            if station_id not in stations:
+                continue
+
+            fcst_values = fcst_data.get(fcst_key, [])
+            if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                continue
+
+            fcst_val = fcst_values[fcst_idx]
+            obs = get_stored_observation(db, station_id, valid_time)
+            if obs is None or obs.get(obs_key) is None:
+                continue
+
+            obs_val = obs[obs_key]
+            if variable == 'precip' and not should_include_precip(fcst_val, obs_val):
+                continue
+
+            errors[station_id] = fcst_val - obs_val
+
+        return errors
+
+    except Exception as e:
+        logger.error(f"Error calculating ASOS station errors: {e}")
+        return errors
