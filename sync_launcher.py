@@ -6,6 +6,73 @@ import os
 import sys
 from datetime import datetime
 import traceback
+import subprocess
+
+IMESSAGE_RECIPIENT = os.environ.get("IMESSAGE_RECIPIENT", "")
+
+
+def _send_imessage(recipient: str, message: str) -> None:
+    """Send an iMessage via Messages.app using osascript (macOS only)."""
+    script = f'''
+    tell application "Messages"
+        set targetService to first service whose service type is iMessage
+        set targetBuddy to buddy "{recipient}" of targetService
+        send "{message}" to targetBuddy
+    end tell
+    '''
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        # Avoid raising from the notifier; log failure in the sync log
+        pass
+
+
+def _check_results(results: dict) -> list[str]:
+    """
+    Inspect sync results for soft failures and return a list of warning strings.
+    Returns an empty list if everything looks healthy.
+    """
+    warnings = []
+
+    if not isinstance(results, dict):
+        return ["Sync returned unexpected result type"]
+
+    if results.get("success") is False:
+        warnings.append("Sync flagged success=False")
+
+    for err in results.get("errors", []):
+        warnings.append(f"Sync error: {err}")
+
+    asos = results.get("asos", {})
+    models = asos.get("models", {})
+
+    for model in ("gfs", "aifs", "ifs", "nws"):
+        m = models.get(model, {})
+        status = m.get("status")
+        stations = m.get("stations")
+        if status and status != "synced":
+            warnings.append(f"{model.upper()} status: {status}")
+        if isinstance(stations, int) and stations == 0:
+            warnings.append(f"{model.upper()} synced 0 stations")
+
+    obs = models.get("observations", {})
+    obs_status = obs.get("status")
+    obs_count = obs.get("count")
+    if obs_status and obs_status != "synced":
+        warnings.append(f"Observations status: {obs_status}")
+    if isinstance(obs_count, int) and obs_count == 0:
+        warnings.append("Observations synced 0 records")
+
+    fairfax = results.get("fairfax", {})
+    if isinstance(fairfax, dict) and fairfax.get("status") not in ("synced", "current", None):
+        warnings.append(f"Fairfax status: {fairfax.get('status')}")
+
+    return warnings
 
 # Change to script directory
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,9 +94,24 @@ with open(log_file, 'w') as f:
         from app import run_master_sync
         results = run_master_sync()
         f.write(f"Master sync results:\\n{results}\\n")
+        warnings = _check_results(results)
+        if warnings:
+            notify_msg = (
+                f"Weather sync issues on {datetime.now().strftime('%Y-%m-%d %H:%M')}\\n"
+                + "\\n".join(f"• {w}" for w in warnings)
+                + f"\\nLog: {log_file}"
+            )
+            _send_imessage(IMESSAGE_RECIPIENT, notify_msg)
     except Exception as e:
-        f.write(f"Error running master sync: {e}\n")
+        err_msg = f"Error running master sync: {e}"
+        f.write(err_msg + "\n")
         f.write(traceback.format_exc() + "\n")
+        notify_msg = (
+            f"Weather sync error on {datetime.now().strftime('%Y-%m-%d %H:%M')}\\n"
+            f"{err_msg}\\n"
+            f"Log: {log_file}"
+        )
+        _send_imessage(IMESSAGE_RECIPIENT, notify_msg)
 
     f.write("\n" + "=" * 50 + "\n")
     f.write(f"Sync completed at: {datetime.now()}\n")
