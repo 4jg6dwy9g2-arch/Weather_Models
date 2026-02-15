@@ -563,7 +563,7 @@
                     <div class="col-md-3">
                         <div class="card">
                             <div class="card-body">
-                                <h6 class="text-muted mb-1">EOF Analogs</h6>
+                                <h6 class="text-muted mb-1">Method</h6>
                                 <h4 id="conus-som-cluster" class="mb-0">--</h4>
                                 <small class="text-muted" id="conus-som-cluster-info"></small>
                             </div>
@@ -1907,11 +1907,9 @@ function updateConusSummaryStats(data, variable) {
     }
 
     document.getElementById('conus-som-cluster').textContent =
-        data.n_eofs != null ? `${data.n_eofs} EOFs` : 'N/A';
+        data.method || 'composite';
     document.getElementById('conus-som-cluster-info').textContent =
-        data.seasonal_matches != null
-            ? `${data.seasonal_matches} seasonal / ${data.total_matches} total · ${data.variance_explained}% var`
-            : '';
+        data.analog_dates ? `${data.analog_dates.length} analogs selected` : '';
 }
 
 // ── CONUS station map (Leaflet) ──────────────────────────────────────────────
@@ -2061,15 +2059,24 @@ function renderConusHeatmap(data, variable, display = 'anomaly') {
         });
 
         let tooltipBody;
+        const normal = variable === 'precip' ? s.precip_normal_14d_in : null;
+        const normalStr = (normal != null && isFinite(normal)) ? `${normal.toFixed(2)}"` : 'N/A';
         if (display === 'flood') {
-            tooltipBody = `Flood risk: ${pct.toFixed(0)}% of analogs<br><small style="color:#666">(&gt;175% of normal precip)</small>`;
+            tooltipBody = `Flood risk: ${pct.toFixed(0)}% of analogs<br>` +
+                          `<small style="color:#666">(&gt;175% of normal precip)</small>` +
+                          `<br>Normal (14d): ${normalStr}`;
         } else if (display === 'drought') {
-            tooltipBody = `Drought risk: ${pct.toFixed(0)}% of analogs<br><small style="color:#666">(&lt;25% of normal precip)</small>`;
+            tooltipBody = `Drought risk: ${pct.toFixed(0)}% of analogs<br>` +
+                          `<small style="color:#666">(&lt;25% of normal precip)</small>` +
+                          `<br>Normal (14d): ${normalStr}`;
         } else {
             const sign    = val != null && val >= 0 ? '+' : '';
             const valStr  = val != null ? `${sign}${val.toFixed(2)}${unit}` : 'N/A';
             const pctSign = pct >= 0 ? '+' : '';
             tooltipBody   = `Anomaly: ${valStr} (${pctSign}${pct.toFixed(1)}%)`;
+            if (variable === 'precip') {
+                tooltipBody += `<br>Normal (14d): ${normalStr}`;
+            }
         }
 
         marker.bindTooltip(
@@ -2092,8 +2099,8 @@ function updateConusAnalogTable(data) {
     // Update analog header text
     const hdr = document.getElementById('conus-cluster-header');
     if (hdr) {
-        const varStr = data.variance_explained != null ? ` · ${data.variance_explained}% variance` : '';
-        hdr.textContent = `${data.seasonal_matches} seasonal matches${varStr}`;
+        const methodStr = data.method ? ` · ${data.method}` : '';
+        hdr.textContent = `${data.analog_dates ? data.analog_dates.length : 0} analogs${methodStr}`;
     }
 
     const currentDate = new Date(data.current_date);

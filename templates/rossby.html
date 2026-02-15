@@ -227,6 +227,11 @@
                             <option value="bias" selected>Bias</option>
                             <option value="mae">MAE</option>
                         </select>
+                        <label class="small text-muted mb-0">Lead time:</label>
+                        <div class="btn-group btn-group-sm" role="group" aria-label="Lead time navigation">
+                            <button type="button" class="btn btn-outline-secondary" id="somLeadPrev">Back</button>
+                            <button type="button" class="btn btn-outline-secondary" id="somLeadNext">Next</button>
+                        </div>
                     </div>
                     <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
@@ -234,7 +239,7 @@
                     <p class="text-muted small mb-2" id="somClusterModalSubtitle"></p>
                     <div>
                         <h6 class="mb-2">ASOS Station Bias/MAE Map</h6>
-                        <div id="somClusterMap" style="height: 80vh; min-height: 600px; border-radius: 8px;"></div>
+                        <div id="somClusterMap" style="height: 65vh; min-height: 450px; border-radius: 8px;"></div>
                     </div>
                 </div>
             </div>
@@ -304,18 +309,25 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('somClusterMetric').addEventListener('change', () => {
         renderSomClusterMarkers();
     });
-    document.getElementById('somClusterVariable').addEventListener('change', () => {
+    document.getElementById('somClusterVariable').addEventListener('change', (e) => {
         if (somClusterCurrent.r != null) {
-            openSomClusterMap(somClusterCurrent.r, somClusterCurrent.c, somClusterCurrent.leadTime);
+            openSomClusterMap(
+                somClusterCurrent.r,
+                somClusterCurrent.c,
+                somClusterCurrent.leadTime,
+                e.target.value
+            );
         }
     });
+    document.getElementById('somLeadPrev').addEventListener('click', () => shiftSomClusterLeadTime(-1));
+    document.getElementById('somLeadNext').addEventListener('click', () => shiftSomClusterLeadTime(1));
 });
 
 // Event listeners
 document.getElementById('waveHistoryDays').addEventListener('change', loadWaveChart);
 document.getElementById('somLeadTime').addEventListener('change', loadSomSkill);
 document.getElementById('somGridVariable').addEventListener('change', loadSomSkill);
-document.getElementById('somClusterVariable').addEventListener('change', loadSomSkill);
+// Note: keep modal variable independent from the SOM grid selection
 
 // ============================================================================
 // Current Wave State
@@ -790,7 +802,8 @@ async function loadSomSkill() {
             grid.appendChild(cell);
 
             cell.addEventListener('click', () => {
-                openSomClusterMap(node.r, node.c, leadTime);
+                const gridVar = document.getElementById('somGridVariable').value;
+                openSomClusterMap(node.r, node.c, leadTime, gridVar);
             });
         });
 
@@ -837,14 +850,33 @@ function clearSomClusterMarkers() {
     somClusterMarkers = [];
 }
 
-async function openSomClusterMap(r, c, leadTime) {
+function getSomLeadTimes() {
+    const select = document.getElementById('somLeadTime');
+    if (!select) return [24, 48, 72, 120];
+    return Array.from(select.options)
+        .map(opt => parseInt(opt.value, 10))
+        .filter(v => !Number.isNaN(v));
+}
+
+function shiftSomClusterLeadTime(delta) {
+    if (somClusterCurrent.r == null) return;
+    const leadTimes = getSomLeadTimes();
+    const currentIdx = leadTimes.indexOf(parseInt(somClusterCurrent.leadTime, 10));
+    if (currentIdx === -1) return;
+    const nextIdx = Math.max(0, Math.min(leadTimes.length - 1, currentIdx + delta));
+    if (nextIdx === currentIdx) return;
+    const variable = document.getElementById('somClusterVariable')?.value || null;
+    openSomClusterMap(somClusterCurrent.r, somClusterCurrent.c, leadTimes[nextIdx], variable);
+}
+
+async function openSomClusterMap(r, c, leadTime, variableOverride = null) {
     const subtitle = document.getElementById('somClusterModalSubtitle');
     const gridVariable = document.getElementById('somGridVariable').value;
     const modalVarSelect = document.getElementById('somClusterVariable');
+    const variable = variableOverride || (modalVarSelect ? modalVarSelect.value : null) || gridVariable;
     if (modalVarSelect) {
-        modalVarSelect.value = gridVariable;
+        modalVarSelect.value = variable;
     }
-    const variable = gridVariable;
     subtitle.textContent = `Cluster C${r + 1}-${c + 1} | Lead time ${leadTime}h | NWS ${variable} bias (color) & MAE (size)`;
     somClusterCurrent = { r, c, leadTime };
 
@@ -853,6 +885,7 @@ async function openSomClusterMap(r, c, leadTime) {
     somClusterModal.show();
     setTimeout(() => {
         if (somClusterMap) {
+            somClusterMap.setView([39.8283, -98.5795], 4);
             somClusterMap.invalidateSize();
         }
     }, 150);

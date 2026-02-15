@@ -24,7 +24,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Paths
-NWS_GRID_CACHE_PATH = Path(__file__).resolve().parent / "data" / "nws_grid_cache.json"
+DATA_DIR = Path("/Volumes/T7/Weather_Models/data")
+NWS_GRID_CACHE_PATH = DATA_DIR / "nws_grid_cache.json"
 
 # NWS API configuration
 NWS_API = "https://api.weather.gov"

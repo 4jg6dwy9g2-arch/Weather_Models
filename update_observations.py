@@ -19,7 +19,7 @@ from app import calculate_all_verification, save_forecasts_db, load_forecasts_db
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-FORECASTS_FILE = Path(__file__).parent / "data" / "forecasts.json"
+FORECASTS_FILE = Path("/Volumes/T7/Weather_Models/data") / "forecasts.json"
 
 
 def update_observations_for_run(location_name: str, run_id: str, run_data: dict) -> bool:

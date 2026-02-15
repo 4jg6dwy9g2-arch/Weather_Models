@@ -23,7 +23,7 @@ print(f"Using run: {run_time.strftime('%Y-%m-%d %HZ')} + {lead_hours}h")
 
 # Load verification cache
 print("\nLoading ASOS verification cache...")
-with open(Path(__file__).parent.parent / 'data' / 'asos_verification_cache.json', 'r') as f:
+with open(Path("/Volumes/T7/Weather_Models/data") / 'asos_verification_cache.json', 'r') as f:
     cache = json.load(f)
 
 # Load station metadata

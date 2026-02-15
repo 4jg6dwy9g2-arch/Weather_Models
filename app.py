@@ -49,11 +49,12 @@ NWS_HEADERS = {
     "Accept": "application/geo+json"
 }
 
-NWS_CACHE_PATH = Path(__file__).resolve().parent / "data" / "nws_forecast_cache.json"
-VERIF_TS_CACHE_PATH = Path(__file__).resolve().parent / "data" / "verification_time_series_cache.json"
-VERIF_LEAD_CACHE_PATH = Path(__file__).resolve().parent / "data" / "verification_lead_time_cache.json"
-COCORAHs_CACHE_PATH = Path(__file__).resolve().parent / "data" / "cocorahs_daily_cache.json"
-BIAS_HISTORY_CACHE_PATH = Path(__file__).resolve().parent / "data" / "bias_history_cache.json"
+DATA_DIR = Path("/Volumes/T7/Weather_Models/data")
+NWS_CACHE_PATH = DATA_DIR / "nws_forecast_cache.json"
+VERIF_TS_CACHE_PATH = DATA_DIR / "verification_time_series_cache.json"
+VERIF_LEAD_CACHE_PATH = DATA_DIR / "verification_lead_time_cache.json"
+COCORAHs_CACHE_PATH = DATA_DIR / "cocorahs_daily_cache.json"
+BIAS_HISTORY_CACHE_PATH = DATA_DIR / "bias_history_cache.json"
 import asos
 import rossby_waves
 import nws_batch
@@ -79,18 +80,18 @@ except Exception:  # pragma: no cover - optional dependency
 from pangu_integration import pangu_bp, cleanup_database, load_runs_db
 
 # Single JSON file for storing all forecast data
-FORECASTS_FILE = Path(__file__).parent / "data" / "forecasts.json"
+FORECASTS_FILE = DATA_DIR / "forecasts.json"
 
 # ASOS forecast trends storage file (last 2 runs with 6-hourly data)
-ASOS_TRENDS_FILE = Path(__file__).parent / "data" / "asos_forecast_trends.json"
+ASOS_TRENDS_FILE = DATA_DIR / "asos_forecast_trends.json"
 
 # ERA5 analog forecast history (tracks predictions over time)
-ANALOG_HISTORY_FILE = Path(__file__).parent / "data" / "analog_forecast_history.json"
+ANALOG_HISTORY_FILE = DATA_DIR / "analog_forecast_history.json"
 # Full cached result from the most recent auto-sync (allows instant UI load)
-ANALOG_LATEST_FILE = Path(__file__).parent / "data" / "analog_latest_result.json"
-SOM_CACHE_FILE = Path(__file__).parent / "data" / "era5_som_cache_6x6_30y_anom.npz"
-SOM_SKILL_FILE = Path(__file__).parent / "data" / "som_cluster_skill.json"
-EOF_CACHE_FILE = Path(__file__).parent / "data" / "era5_eof_cache_30y.npz"
+ANALOG_LATEST_FILE = DATA_DIR / "analog_latest_result.json"
+SOM_CACHE_FILE = DATA_DIR / "era5_som_cache_6x6_30y_anom.npz"
+SOM_SKILL_FILE = DATA_DIR / "som_cluster_skill.json"
+EOF_CACHE_FILE = DATA_DIR / "era5_eof_cache_30y.npz"
 
 _SOM_CACHE: dict | None = None
 _SOM_SKILL_CACHE: dict = {}
@@ -5483,72 +5484,30 @@ def api_era5_analogs_conus():
 
         top_n           = int(request.args.get('top_n', 10))
         variable_filter = request.args.get('variable', 'both')
+        method          = request.args.get('method', 'composite')
 
-        # ========== STEP 1: EOF ANALOG SELECTION ==========
+        # ========== STEP 1: PATTERN MATCHING ==========
 
-        if not _HAS_ANALOG_METRICS:
-            return jsonify({"success": False, "error": "analog_metrics module not available"})
+        core = _find_analogs_core(top_n=top_n, method=method)
 
-        # Load EOF decomposition (builds automatically on first call)
-        eof_cache = _load_or_build_era5_eofs(n_years=30, stride=6, n_eofs=20)
+        top_analogs      = core['top_analogs']
+        init_time        = core['init_time']
+        current_date_str = core['current_date_str']
+        current_wave_num = core['current_wave_num']
+        current_doy      = init_time.dayofyear
 
-        # Project today's GFS F000 z500 anomaly onto EOF space
-        current_date_str, gfs_pcs, gfs_raw_flat = _compute_gfs_eof_projection(eof_cache)
-        if gfs_pcs is None:
-            return jsonify({"success": False, "error": "Could not project current GFS pattern onto EOFs"})
+        analog_dates     = [pd.Timestamp(a['date']) for a in top_analogs]
+        analog_date_strs = [a['date'] for a in top_analogs]
+        analog_correlations = [
+            {
+                'date':            a['date'],
+                'correlation':     a.get('correlation'),
+                'composite_score': a.get('composite_score'),
+            }
+            for a in top_analogs
+        ]
 
-        # Load historical anomaly matrix for correlation scoring
-        anom_cache = _load_era5_anomaly_matrix_for_som(n_years=30, stride=6)
-        dates_all  = eof_cache['dates']          # list[str] YYYY-MM-DD
-        all_pcs    = eof_cache['pcs']            # (n_days, n_eofs)
-        anomalies  = anom_cache['anomalies']     # (n_days, lat, lon)
-        lats_som   = anom_cache['lats']
-
-        # Euclidean distance in EOF PC space (noise-filtered, latitude-weighted via PCA)
-        dists = np.sqrt(((all_pcs - gfs_pcs[None, :]) ** 2).sum(axis=1))  # (n_days,)
-
-        # ±45-day seasonal filter
-        init_time   = pd.Timestamp(current_date_str)
-        current_doy = init_time.dayofyear
-        WINDOW      = 45
-
-        def _doy_gap(d):
-            diff = abs(pd.Timestamp(d).dayofyear - current_doy) % 365
-            return min(diff, 365 - diff)
-
-        seasonal_mask    = np.array([_doy_gap(d) <= WINDOW for d in dates_all])
-        seasonal_indices = np.where(seasonal_mask)[0]
-        if len(seasonal_indices) < max(3, top_n):
-            seasonal_indices = np.arange(len(dates_all))  # fallback: no seasonal filter
-
-        # Sort by distance ascending → best analogs first
-        seasonal_dists = dists[seasonal_indices]
-        sorted_order   = np.argsort(seasonal_dists)
-        top_indices    = seasonal_indices[sorted_order[:top_n]]
-
-        # Compute weighted pattern correlation vs current GFS anomaly for display
-        w2d          = _analog_metrics.build_lat_weights(lats_som, anomalies[0].shape)
-        weights_flat = w2d.flatten()
-
-        scored = []
-        for i in top_indices:
-            sample      = anomalies[i].flatten()
-            corr        = _analog_metrics.weighted_pearson(gfs_raw_flat, sample, weights_flat)
-            scored.append({
-                'date':            str(dates_all[i]),
-                'composite_score': round(float(corr), 4),
-                'correlation':     round(float(corr), 4),
-            })
-
-        analog_dates        = [pd.Timestamp(s['date']) for s in scored]
-        analog_date_strs    = [s['date']               for s in scored]
-        analog_correlations = scored
-
-        n_eofs        = int(eof_cache["meta"].get("n_eofs", 20))
-        var_explained = float(eof_cache["explained_variance"].sum())
-
-        logger.info(f"EOF analog ({n_eofs} EOFs, {100*var_explained:.1f}% var): "
-                    f"{int(seasonal_mask.sum())} seasonal, top {top_n} selected")
+        logger.info(f"Composite analog ({method}): top {top_n} selected for CONUS grid")
 
         # ========== STEP 2: LOAD CONUS DATA, COMPUTE GRIDS, INTERPOLATE TO STATIONS ==========
 
@@ -5557,10 +5516,8 @@ def api_era5_analogs_conus():
         result = {
             "success":             True,
             "current_date":        current_date_str,
-            "n_eofs":              n_eofs,
-            "variance_explained":  round(100 * var_explained, 1),
-            "total_matches":       len(dates_all),
-            "seasonal_matches":    int(seasonal_mask.sum()),
+            "current_wave_number": current_wave_num,
+            "method":              method,
             "analog_dates":        analog_date_strs,
             "analog_correlations": analog_correlations,
             "stations":            [],
@@ -5571,6 +5528,7 @@ def api_era5_analogs_conus():
         _grid_lons     = None   # increasing (-125→-66)
         _precip_anom_in  = None   # (lat, lon) array, inches
         _precip_anom_pct = None   # (lat, lon) array, percent
+        _precip_norm_in  = None   # (lat, lon) array, inches (14-day normal)
         _precip_prob_flood   = None   # (lat, lon) array, 0–100 %
         _precip_prob_drought = None   # (lat, lon) array, 0–100 %
         _temp_anom_f     = None   # (lat, lon) array, °F
@@ -5597,6 +5555,7 @@ def api_era5_analogs_conus():
                 _grid_lons = precip_ds.longitude.values  # -125→-66 (increasing)
                 _precip_anom_in  = anomaly_precip / 25.4
                 _precip_anom_pct = np.where(np.isfinite(anomaly_percent), anomaly_percent, np.nan)
+                _precip_norm_in  = np.where(np.isfinite(clim_precip), clim_precip / 25.4, np.nan)
 
                 logger.info("Computing exceedance probabilities...")
                 _precip_prob_flood, _precip_prob_drought = compute_analog_exceedance_probs(
@@ -5663,6 +5622,7 @@ def api_era5_analogs_conus():
 
                 interp_precip_in     = _make_interp(_precip_anom_in)
                 interp_precip_pct    = _make_interp(_precip_anom_pct)
+                interp_precip_norm   = _make_interp(_precip_norm_in)
                 interp_prob_flood    = _make_interp(_precip_prob_flood)
                 interp_prob_drought  = _make_interp(_precip_prob_drought)
                 interp_temp_f        = _make_interp(_temp_anom_f)
@@ -5687,6 +5647,7 @@ def api_era5_analogs_conus():
 
                     prec_in_vals    = _interp_vec(interp_precip_in)
                     prec_pct_vals   = _interp_vec(interp_precip_pct)
+                    prec_norm_vals  = _interp_vec(interp_precip_norm)
                     flood_vals      = _interp_vec(interp_prob_flood)
                     drought_vals    = _interp_vec(interp_prob_drought)
                     temp_f_vals     = _interp_vec(interp_temp_f)
@@ -5707,6 +5668,7 @@ def api_era5_analogs_conus():
                         if interp_precip_in is not None:
                             entry['precip_anomaly_in']  = _f(prec_in_vals,  i, 3)
                             entry['precip_anomaly_pct'] = _f(prec_pct_vals, i, 1)
+                            entry['precip_normal_14d_in'] = _f(prec_norm_vals, i, 2)
                             entry['prob_flood']   = _f(flood_vals,   i, 1)
                             entry['prob_drought'] = _f(drought_vals, i, 1)
                         if interp_temp_f is not None:
@@ -6016,12 +5978,14 @@ def _compute_latest_gfs_som_cluster(som: dict) -> tuple[str | None, tuple[int, i
         std = som["std"]
         std_safe = np.where(std == 0, 1.0, std)
         flat = (flat - mean) / std_safe
-        if np.any(~np.isfinite(flat)):
-            flat = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Only use grid points where GFS has valid data (lat>70°N is NaN in GFS)
+        valid_mask = np.isfinite(flat)
+        flat_v = flat[valid_mask]
 
         weights = som["weights"]
         weights_flat = weights.reshape(weights.shape[0] * weights.shape[1], -1)
-        dists = ((weights_flat - flat) ** 2).sum(axis=1)
+        dists = ((weights_flat[:, valid_mask] - flat_v) ** 2).sum(axis=1)
         idx = int(np.argmin(dists))
         return latest_run.split("T")[0], (idx // som["cols"], idx % som["cols"])
 
@@ -6198,10 +6162,13 @@ def _compute_gfs_eof_projection(eof_cache: dict) -> tuple[str | None, np.ndarray
         std       = eof_cache["std"]
         std_safe  = np.where(std == 0, 1.0, std)
         flat_std  = (raw_flat - mean) / std_safe
-        flat_std  = np.nan_to_num(flat_std, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Only project over grid points where GFS has valid data (lat>70°N is NaN)
+        valid_mask = np.isfinite(flat_std)
+        flat_std_v = flat_std[valid_mask]
 
         eofs      = eof_cache["eofs"]          # (n_eofs, n_features)
-        pc_scores = eofs @ flat_std            # (n_eofs,)
+        pc_scores = eofs[:, valid_mask] @ flat_std_v   # (n_eofs,)
 
         return latest_run.split("T")[0], pc_scores, raw_flat
 
@@ -6338,12 +6305,14 @@ def _compute_gfs_som_cluster_for_run(
         std = som["std"]
         std_safe = np.where(std == 0, 1.0, std)
         flat = (flat - mean) / std_safe
-        if np.any(~np.isfinite(flat)):
-            flat = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Only use grid points where GFS has valid data (lat>70°N is NaN in GFS)
+        valid_mask = np.isfinite(flat)
+        flat_v = flat[valid_mask]
 
         weights = som["weights"]
         weights_flat = weights.reshape(weights.shape[0] * weights.shape[1], -1)
-        dists = ((weights_flat - flat) ** 2).sum(axis=1)
+        dists = ((weights_flat[:, valid_mask] - flat_v) ** 2).sum(axis=1)
         idx = int(np.argmin(dists))
         return (idx // som["cols"], idx % som["cols"])
 
