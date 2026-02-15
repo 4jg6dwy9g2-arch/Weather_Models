@@ -88,11 +88,12 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 STATIONS_CACHE_FILE = CACHE_DIR / "stations.json"
 STATIONS_CACHE_TTL_DAYS = 7
 
-# ASOS forecasts storage file (in project directory)
-ASOS_FORECASTS_FILE = Path(__file__).parent / "data" / "asos_forecasts.json"
+# ASOS forecasts storage file (on T7 external drive)
+DATA_DIR = Path("/Volumes/T7/Weather_Models/data")
+ASOS_FORECASTS_FILE = DATA_DIR / "asos_forecasts.json"
 
 # ASOS verification cache file (precomputed stats)
-ASOS_VERIFICATION_CACHE_FILE = Path(__file__).parent / "data" / "asos_verification_cache.json"
+ASOS_VERIFICATION_CACHE_FILE = DATA_DIR / "asos_verification_cache.json"
 
 # Retention period for stored forecasts
 FORECASTS_RETENTION_DAYS = 21
