@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+    METAR pressure perturbation cache rebuilder — runs every hour to keep
+    the 5-min gravity-wave map fresh (~2,500 stations, hours delay vs days).
+
+    Installation:
+        cp com.weathermodels.metar-perturbation.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.weathermodels.metar-perturbation.plist
+
+    Verify it loaded:
+        launchctl list | grep metar-perturbation
+
+    Uninstall:
+        launchctl unload ~/Library/LaunchAgents/com.weathermodels.metar-perturbation.plist
+        rm ~/Library/LaunchAgents/com.weathermodels.metar-perturbation.plist
+
+    To find your Python path:
+        which python3
+        # Current path: /Users/kennypratt/anaconda3/bin/python3
+-->
+<dict>
+    <key>Label</key>
+    <string>com.weathermodels.metar-perturbation</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kennypratt/anaconda3/bin/python3</string>
+        <string>/Users/kennypratt/Documents/Weather_Models/metar_perturbation_launcher.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/kennypratt/Documents/Weather_Models</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>IMESSAGE_RECIPIENT</key>
+        <string>+16103480997</string>
+    </dict>
+
+    <!-- Run every hour (3600 seconds) -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Also run immediately when loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/metar_perturbation.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/metar_perturbation.err.log</string>
+</dict>
+</plist>

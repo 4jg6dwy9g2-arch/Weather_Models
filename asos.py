@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 # Stations known to report cumulative or unreliable precip that breaks 6-hr totals
 PRECIP_EXCLUDE_STATIONS = {"SMD", "ADF"}  # ADF gauge stuck at 2.56/5.12" (tipping bucket overflow)
 
+# Stations that report p01i in millimeters instead of the standard inches.
+# Verified by observing hourly maxima of 3–19 in the database — impossible as inches
+# but physically reasonable as mm (0.12–0.77").  All other PA* Alaska stations top
+# out at ≤0.48", confirming PAAK is the sole outlier.
+# Their raw sums are divided by 25.4 before being returned.
+PRECIP_MM_STATIONS = {"PAAK"}
+
 # ASOS tipping-bucket gauges overflow at 256 tips × 0.01"/tip = 2.56 inches.
 # When the internal counter wraps the sensor reports 2.56, 5.12, 7.68, … inches
 # rather than the true accumulation.  These are not real precipitation and must
@@ -95,6 +102,15 @@ ASOS_FORECASTS_FILE = DATA_DIR / "asos_forecasts.json"
 # ASOS verification cache file (precomputed stats)
 ASOS_VERIFICATION_CACHE_FILE = DATA_DIR / "asos_verification_cache.json"
 
+# 1-minute ASOS station-pressure archive (from IEM ASOS1MIN network)
+ASOS_1MIN_PRESSURE_FILE = DATA_DIR / "asos_1min_pressure.json"
+ASOS_1MIN_STATIONS_FILE = DATA_DIR / "asos_1min_stations.json"
+IEM_ASOS_1MIN_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py"
+IEM_ASOS_1MIN_GEOJSON_URL = "https://mesonet.agron.iastate.edu/geojson/network/ASOS1MIN.geojson"
+
+# 5-minute METAR pressure archive (dedicated, independent of verification data)
+ASOS_METAR_PRESSURE_FILE = DATA_DIR / "asos_metar_pressure.json"
+
 # Retention period for stored forecasts
 FORECASTS_RETENTION_DAYS = 21
 
@@ -106,6 +122,14 @@ _asos_forecasts_db_mtime: float | None = None
 
 _verification_cache_data: dict | None = None
 _verification_cache_mtime: float | None = None
+
+_asos_1min_pressure_cache: dict | None = None
+_asos_1min_pressure_mtime: float | None = None
+
+_asos_1min_stations_cache: list | None = None  # list of 3-char station IDs
+
+_asos_metar_pressure_cache: dict | None = None
+_asos_metar_pressure_mtime: float | None = None
 
 # US states with ASOS networks
 US_STATES = [
@@ -980,7 +1004,10 @@ def calculate_6hr_precip_total(db: dict, station_id: str, end_time: datetime) ->
     if not hourly_max:
         return None
 
-    return sum(hourly_max.values())
+    total = sum(hourly_max.values())
+    if station_id in PRECIP_MM_STATIONS:
+        total /= 25.4  # stored in mm, return inches
+    return total
 
 
 def get_stored_observation(db: dict, station_id: str, target_time: datetime, max_delta_minutes: int = 30) -> Optional[dict]:
@@ -3116,3 +3143,396 @@ def _calculate_asos_station_errors(
     except Exception as e:
         logger.error(f"Error calculating ASOS station errors: {e}")
         return errors
+
+
+# ---------------------------------------------------------------------------
+# 1-minute ASOS pressure data (IEM ASOS1MIN network)
+# ---------------------------------------------------------------------------
+
+def load_asos_1min_pressure_cache() -> dict | None:
+    """Load 1-min pressure cache from disk with in-memory mtime caching."""
+    global _asos_1min_pressure_cache, _asos_1min_pressure_mtime
+    if not ASOS_1MIN_PRESSURE_FILE.exists():
+        return None
+    try:
+        current_mtime = ASOS_1MIN_PRESSURE_FILE.stat().st_mtime
+        if _asos_1min_pressure_cache is not None and _asos_1min_pressure_mtime == current_mtime:
+            return _asos_1min_pressure_cache
+        with open(ASOS_1MIN_PRESSURE_FILE) as f:
+            data = json.load(f)
+        _asos_1min_pressure_cache = data
+        _asos_1min_pressure_mtime = current_mtime
+        return data
+    except Exception as e:
+        logger.error(f"Error loading 1-min pressure cache: {e}")
+        return None
+
+
+def fetch_asos_1min_station_list() -> list[str]:
+    """
+    Fetch the canonical list of station IDs in IEM's ASOS1MIN network.
+
+    Returns a sorted list of 3-char station IDs (e.g. ["0J4", "IAD", ...]).
+    Result is cached in memory and on disk (asos_1min_stations.json) so
+    subsequent calls are instant.  The disk cache is refreshed if older than
+    30 days, since the network membership changes rarely.
+    """
+    global _asos_1min_stations_cache
+    if _asos_1min_stations_cache is not None:
+        return _asos_1min_stations_cache
+
+    # Try loading from disk cache first
+    cache_max_age_days = 30
+    if ASOS_1MIN_STATIONS_FILE.exists():
+        try:
+            age_days = (datetime.now(timezone.utc).timestamp() - ASOS_1MIN_STATIONS_FILE.stat().st_mtime) / 86400
+            if age_days < cache_max_age_days:
+                data = json.loads(ASOS_1MIN_STATIONS_FILE.read_text())
+                if isinstance(data, list) and data:
+                    _asos_1min_stations_cache = data
+                    return data
+        except Exception:
+            pass
+
+    # Fetch fresh list from IEM GeoJSON
+    try:
+        req = urllib.request.Request(
+            IEM_ASOS_1MIN_GEOJSON_URL,
+            headers={"User-Agent": "WeatherModels/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            geojson = json.load(resp)
+        station_ids = sorted(
+            f["properties"]["sid"]
+            for f in geojson.get("features", [])
+            if f.get("properties", {}).get("sid")
+        )
+        if station_ids:
+            ASOS_1MIN_STATIONS_FILE.write_text(json.dumps(station_ids))
+            _asos_1min_stations_cache = station_ids
+            logger.info(f"Fetched ASOS1MIN station list: {len(station_ids)} stations")
+            return station_ids
+    except Exception as e:
+        logger.warning(f"Failed to fetch ASOS1MIN station list: {e}")
+
+    # Fall back to existing disk cache even if stale
+    if ASOS_1MIN_STATIONS_FILE.exists():
+        try:
+            data = json.loads(ASOS_1MIN_STATIONS_FILE.read_text())
+            if isinstance(data, list) and data:
+                _asos_1min_stations_cache = data
+                return data
+        except Exception:
+            pass
+
+    return []
+
+
+def fetch_asos_1min_pressure(station_ids: list, start_dt: datetime, end_dt: datetime) -> dict:
+    """
+    Fetch 1-minute station pressure from IEM ASOS1MIN network.
+
+    station_ids: list of 3-char IEM station IDs (e.g. "IAD", not "KIAD")
+    Returns: dict mapping station_id -> list of [timestamp_str, pressure_mb]
+    """
+    if not station_ids:
+        return {}
+
+    result = {}
+    chunk_size = 20  # Smaller batches reduce IEM timeout risk on long time windows
+
+    for chunk_start in range(0, len(station_ids), chunk_size):
+        chunk = station_ids[chunk_start:chunk_start + chunk_size]
+
+        # Build query string with repeated station= parameters
+        # IEM asos1min.py accepts minimal query parameters
+        params = [
+            ("tz", "UTC"),
+            ("year1", str(start_dt.year)),
+            ("month1", str(start_dt.month)),
+            ("day1", str(start_dt.day)),
+            ("hour1", str(start_dt.hour)),
+            ("minute1", str(start_dt.minute)),
+            ("year2", str(end_dt.year)),
+            ("month2", str(end_dt.month)),
+            ("day2", str(end_dt.day)),
+            ("hour2", str(end_dt.hour)),
+            ("minute2", str(end_dt.minute)),
+            ("vars", "pres1"),
+        ]
+        for sid in chunk:
+            params.append(("station", sid))
+
+        query_string = urllib.parse.urlencode(params)
+        url = f"{IEM_ASOS_1MIN_URL}?{query_string}"
+
+        text = None
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(15 * attempt)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "WeatherModels/1.0"})
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    logger.warning(f"1-min pressure fetch failed (chunk {chunk_start // chunk_size}): {e}")
+        if text is None:
+            continue
+
+        time.sleep(3)  # stay friendly to IEM between chunks
+
+        # CSV columns: station, station_name, valid(UTC), pres1
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("station"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 4:
+                continue
+            sid = parts[0].strip()
+            ts_str = parts[2].strip()   # valid(UTC)
+            pres_str = parts[3].strip()  # pres1 in inHg
+            if pres_str in ("M", "", "T", "None"):
+                continue
+            try:
+                pres_inhg = float(pres_str)
+                pres_mb = round(pres_inhg * 33.8639, 2)
+                if pres_mb < 850 or pres_mb > 1100:
+                    continue
+                if sid not in result:
+                    result[sid] = []
+                result[sid].append([ts_str, pres_mb])
+            except (ValueError, TypeError):
+                continue
+
+    return result
+
+
+def sync_asos_1min_pressure(lookback_hours: int = 72) -> dict:
+    """
+    Sync 1-minute ASOS pressure data for all known METAR stations.
+
+    Fetches from IEM for the window [now - lookback_hours, now - 23h] since
+    the 1-min archive has approximately a 30-hour NCEI processing delay.
+    Merges with existing cache and trims to the lookback window.
+
+    Returns a summary dict.
+    """
+    global _asos_1min_pressure_cache, _asos_1min_pressure_mtime
+
+    now = datetime.now(timezone.utc)
+    # 1-min data has ~28-30h NCEI processing delay; don't request more recent
+    # than 30h ago to avoid getting empty responses for unprocessed data.
+    fetch_end = now - timedelta(hours=30)
+    fetch_start = now - timedelta(hours=lookback_hours)
+
+    # Load existing cache
+    existing = load_asos_1min_pressure_cache() or {}
+    stations_data = existing.get("stations", {})
+
+    # Always fetch the full lookback window.  Stations have varying IEM
+    # processing delays (24-42h), so an incremental approach based on the
+    # latest stored time misses stations whose data only becomes available
+    # later.  The merge logic below handles de-duplication cheaply.
+
+    if fetch_start >= fetch_end:
+        logger.info("1-min pressure cache already up-to-date")
+        return {"status": "up_to_date", "stations_updated": 0}
+
+    # Use the canonical IEM ASOS1MIN station list (~917 stations) instead of
+    # the full METAR database (~2500+).  This avoids wasting requests on
+    # stations IEM doesn't archive at 1-minute resolution.
+    one_min_ids = fetch_asos_1min_station_list()
+    if not one_min_ids:
+        return {"status": "no_stations", "stations_updated": 0}
+
+    logger.info(
+        f"Fetching 1-min ASOS pressure: {len(one_min_ids)} stations, "
+        f"{fetch_start.strftime('%Y-%m-%dT%H:%MZ')} → {fetch_end.strftime('%Y-%m-%dT%H:%MZ')}"
+    )
+    new_data = fetch_asos_1min_pressure(one_min_ids, fetch_start, fetch_end)
+
+    if not new_data:
+        logger.warning("1-min pressure fetch returned no data")
+        return {"status": "no_data", "stations_updated": 0}
+
+    # Merge new observations into existing cache, trim to lookback window
+    cutoff = now - timedelta(hours=lookback_hours)
+    updated_count = 0
+
+    for one_min_id, new_readings in new_data.items():
+        existing_obs = {r[0]: r[1] for r in stations_data.get(one_min_id, {}).get("obs", [])}
+        for ts_str, pres_mb in new_readings:
+            existing_obs[ts_str] = pres_mb
+
+        # Trim to lookback window
+        trimmed = []
+        for ts_str, pres_mb in existing_obs.items():
+            try:
+                ts_norm = ts_str.replace(" ", "T")
+                if not ts_norm.endswith("Z") and "+" not in ts_norm:
+                    ts_norm += "+00:00"
+                dt = datetime.fromisoformat(ts_norm)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt >= cutoff:
+                    trimmed.append([ts_str, pres_mb])
+            except Exception:
+                continue
+        trimmed.sort(key=lambda x: x[0])
+
+        if trimmed:
+            stations_data[one_min_id] = {"obs": trimmed}
+            updated_count += 1
+
+    cache_data = {
+        "updated": now.isoformat(),
+        "lookback_hours": lookback_hours,
+        "stations": stations_data,
+    }
+    with open(ASOS_1MIN_PRESSURE_FILE, "w") as f:
+        json.dump(cache_data, f)
+
+    # Invalidate in-memory cache
+    _asos_1min_pressure_cache = None
+    _asos_1min_pressure_mtime = None
+
+    logger.info(
+        f"1-min pressure sync complete: {updated_count} stations updated "
+        f"({len(new_data)} with new data)"
+    )
+    return {
+        "status": "success",
+        "stations_updated": updated_count,
+        "stations_with_new_data": len(new_data),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5-minute METAR pressure archive (dedicated, separate from verification data)
+# ---------------------------------------------------------------------------
+
+def load_asos_metar_pressure_cache() -> dict | None:
+    """Load the 5-min METAR pressure cache with in-memory mtime caching."""
+    global _asos_metar_pressure_cache, _asos_metar_pressure_mtime
+    if not ASOS_METAR_PRESSURE_FILE.exists():
+        return None
+    try:
+        mtime = ASOS_METAR_PRESSURE_FILE.stat().st_mtime
+        if _asos_metar_pressure_cache is not None and _asos_metar_pressure_mtime == mtime:
+            return _asos_metar_pressure_cache
+        with open(ASOS_METAR_PRESSURE_FILE) as f:
+            data = json.load(f)
+        _asos_metar_pressure_cache = data
+        _asos_metar_pressure_mtime = mtime
+        return data
+    except Exception as e:
+        logger.warning(f"Error loading asos_metar_pressure.json: {e}")
+        return None
+
+
+def sync_asos_metar_pressure(lookback_hours: int = 24) -> dict:
+    """
+    Fetch recent 5-min METAR altimeter data from IEM for all ASOS stations
+    and store in the dedicated asos_metar_pressure.json file.
+
+    Completely independent of asos_forecasts.json — station metadata is
+    embedded in the pressure file so the perturbation rebuild needs nothing
+    from the verification database.
+    """
+    global _asos_metar_pressure_cache, _asos_metar_pressure_mtime
+
+    now = datetime.now(timezone.utc)
+    fetch_start = now - timedelta(hours=lookback_hours)
+    fetch_end   = now
+
+    # Station list: pull from verification db if available (already has lat/lon),
+    # otherwise fall back to a fresh IEM fetch.
+    db = load_asos_forecasts_db()
+    stations_meta = db.get("stations", {})
+    if not stations_meta:
+        try:
+            stations_meta = get_stations_dict()
+        except Exception as e:
+            logger.error(f"sync_asos_metar_pressure: could not get station list: {e}")
+            return {"status": "no_stations", "stations_updated": 0}
+
+    station_ids = list(stations_meta.keys())
+    logger.info(
+        f"Fetching METAR pressure (alti only) for {len(station_ids)} stations, "
+        f"{fetch_start.strftime('%Y-%m-%dT%H:%MZ')} → {fetch_end.strftime('%Y-%m-%dT%H:%MZ')}"
+    )
+
+    chunk_size = 50
+    all_obs: dict[str, list] = {}
+    for i in range(0, len(station_ids), chunk_size):
+        chunk = station_ids[i:i + chunk_size]
+        try:
+            chunk_obs = fetch_observations(chunk, fetch_start, fetch_end, variables=['alti'])
+            all_obs.update(chunk_obs)
+        except Exception as e:
+            logger.error(f"METAR pressure chunk {i // chunk_size} failed: {e}")
+
+    # Load existing cache so we can merge & trim
+    existing = load_asos_metar_pressure_cache() or {}
+    stations_data: dict = existing.get("stations", {})
+    cutoff = now - timedelta(hours=lookback_hours)
+    updated_count = 0
+
+    for sid, obs_list in all_obs.items():
+        meta = stations_meta.get(sid, {})
+        # Existing obs keyed by "YYYY-MM-DD HH:MM" timestamp
+        existing_obs: dict[str, float] = {
+            r[0]: r[1] for r in stations_data.get(sid, {}).get("obs", [])
+        }
+
+        for obs in obs_list:
+            mslp = obs.get("mslp")
+            vt   = obs.get("valid_time")
+            if mslp is None or vt is None:
+                continue
+            # valid_time is ISO string from fetch_observations, e.g. "2026-02-17T10:00:00+00:00"
+            ts_str = vt[:16].replace("T", " ")  # → "2026-02-17 10:00"
+            existing_obs[ts_str] = mslp
+
+        # Trim to lookback window
+        trimmed: list = []
+        for ts_str, pres_mb in existing_obs.items():
+            try:
+                ts_norm = ts_str.replace(" ", "T") + "+00:00"
+                dt = datetime.fromisoformat(ts_norm)
+                if dt >= cutoff:
+                    trimmed.append([ts_str, pres_mb])
+            except Exception:
+                continue
+        trimmed.sort(key=lambda x: x[0])
+
+        if trimmed:
+            stations_data[sid] = {
+                "lat":   meta.get("lat"),
+                "lon":   meta.get("lon"),
+                "name":  meta.get("name", sid),
+                "state": meta.get("state", ""),
+                "obs":   trimmed,
+            }
+            updated_count += 1
+
+    cache_data = {
+        "updated":       now.isoformat(),
+        "lookback_hours": lookback_hours,
+        "stations":      stations_data,
+    }
+    with open(ASOS_METAR_PRESSURE_FILE, "w") as f:
+        json.dump(cache_data, f)
+
+    # Invalidate in-memory cache
+    _asos_metar_pressure_cache = None
+    _asos_metar_pressure_mtime = None
+
+    logger.info(f"METAR pressure sync complete: {updated_count} stations updated")
+    return {
+        "status": "success",
+        "stations_updated": updated_count,
+    }
