@@ -57,6 +57,7 @@ COCORAHs_CACHE_PATH = DATA_DIR / "cocorahs_daily_cache.json"
 BIAS_HISTORY_CACHE_PATH = DATA_DIR / "bias_history_cache.json"
 import asos
 import rossby_waves
+import gravity_wave_detection as _gwd
 import nws_batch
 
 try:
@@ -8316,6 +8317,93 @@ def api_asos_gravity_waves():
     except Exception as e:
         logger.error(f"Error computing gravity-wave perturbations: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/asos/gravity-wave-structures')
+def api_gravity_wave_structures():
+    """
+    Detect gravity wave structures in the perturbation field at a given frame.
+
+    Query params:
+        source  - 'metar' (default) or '1min'
+        frame   - frame index (-1 = latest)
+
+    Returns contour paths, detected structures, and propagation vector.
+    """
+    try:
+        source    = request.args.get('source', 'metar').strip().lower()
+        frame_idx = int(request.args.get('frame', -1))
+
+        if source == 'metar':
+            cached = load_asos_metar_perturbation_cache()
+        else:
+            cached = load_asos_pressure_perturbation_cache()
+
+        if not cached or not cached.get('stations') or not cached.get('frames'):
+            return jsonify({'success': False, 'error': 'No perturbation data available'}), 404
+
+        stations = cached['stations']
+        frames   = cached['frames']
+        n_frames = len(frames)
+
+        if frame_idx < 0:
+            frame_idx = n_frames - 1
+        frame_idx = max(0, min(frame_idx, n_frames - 1))
+
+        grid_lats_1d, grid_lons_1d, grid_lats_2d, grid_lons_2d = _gwd.make_grid()
+
+        def _collect(idx):
+            lats, lons, vals = [], [], []
+            for s in stations:
+                vals_list = s.get('values', [])
+                v = vals_list[idx] if idx < len(vals_list) else None
+                if v is None:
+                    continue
+                lat, lon = s.get('lat'), s.get('lon')
+                if lat is None or lon is None:
+                    continue
+                lats.append(lat); lons.append(lon); vals.append(v)
+            return lats, lons, vals
+
+        lats, lons, vals = _collect(frame_idx)
+        if len(vals) < 50:
+            return jsonify({'success': False,
+                            'error': f'Only {len(vals)} valid stations at frame {frame_idx}'}), 404
+
+        grid   = _gwd.interpolate_stations(lats, lons, vals, grid_lats_2d, grid_lons_2d)
+        smooth = _gwd.smooth_field(grid, sigma_deg=1.0)
+
+        threshold  = _gwd.adaptive_threshold(smooth, sigma=1.5)
+        structures = _gwd.detect_structures(smooth, grid_lats_2d, grid_lons_2d,
+                                            threshold=threshold, min_area_km2=15_000)
+        contours   = _gwd.get_contour_paths(smooth, grid_lats_2d, grid_lons_2d)
+
+        # Propagation: compare with previous frame
+        propagation = None
+        if frame_idx > 0:
+            prev_lats, prev_lons, prev_vals = _collect(frame_idx - 1)
+            if len(prev_vals) >= 50:
+                prev_grid   = _gwd.interpolate_stations(prev_lats, prev_lons, prev_vals,
+                                                        grid_lats_2d, grid_lons_2d)
+                prev_smooth = _gwd.smooth_field(prev_grid, sigma_deg=1.0)
+                cadence_min = int(cached.get('cadence_minutes', 5) or 5)
+                propagation = _gwd.estimate_propagation(prev_smooth, smooth,
+                                                        dt_seconds=cadence_min * 60)
+
+        return jsonify({
+            'success':     True,
+            'frame_idx':   frame_idx,
+            'frame_time':  frames[frame_idx],
+            'n_stations':  len(vals),
+            'threshold_mb': round(threshold, 3),
+            'structures':  structures,
+            'contours':    contours,
+            'propagation': propagation,
+        })
+
+    except Exception as e:
+        logger.error(f'gravity-wave-structures error: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/asos/station-pressure-detail')
