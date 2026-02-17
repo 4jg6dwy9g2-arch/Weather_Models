@@ -839,26 +839,30 @@ def fetch_and_store_observations():
         logger.info("No past valid times to fetch observations for")
         return 0
 
-    # Filter out times we already have observations for (for most stations)
-    existing_obs = db.get("observations", {})
-    times_to_fetch = []
+    # Use a high-water mark to avoid re-fetching the entire 20-day window every sync.
+    #
+    # The old per-timestamp skip check compared forecast valid times (exact hour boundaries
+    # like 12:00:00Z) against stored observation keys (actual ASOS report times like 11:53:00Z).
+    # These almost never matched, so every sync refetched the full ~20-day window.
+    last_fetch_end_str = db.get("last_obs_fetch_end")
+    if last_fetch_end_str:
+        last_fetch_end = datetime.fromisoformat(last_fetch_end_str)
+        if last_fetch_end.tzinfo is None:
+            last_fetch_end = last_fetch_end.replace(tzinfo=timezone.utc)
+        # Only fetch times after our last fetch (with 1h overlap for safety)
+        min_time = last_fetch_end - timedelta(hours=1)
+    else:
+        # Initial backfill: start from oldest needed valid time
+        min_time = min(valid_times_needed) - timedelta(hours=1)
 
-    for vt in sorted(valid_times_needed):
-        vt_iso = vt.isoformat()
-        # Check if we have observations for this time for at least half the stations
-        stations_with_obs = sum(1 for sid in existing_obs if vt_iso in existing_obs.get(sid, {}))
-        if stations_with_obs < len(stations) * 0.5:
-            times_to_fetch.append(vt)
+    max_time = now + timedelta(hours=1)
 
-    if not times_to_fetch:
+    new_times = [vt for vt in valid_times_needed if vt >= min_time]
+    if not new_times:
         logger.info("Already have observations for all valid times")
         return 0
 
-    # Determine time range to fetch
-    min_time = min(times_to_fetch) - timedelta(hours=1)
-    max_time = max(times_to_fetch) + timedelta(hours=1)
-
-    logger.info(f"Fetching ASOS observations from {min_time} to {max_time} for {len(times_to_fetch)} valid times")
+    logger.info(f"Fetching ASOS observations from {min_time} to {max_time} for {len(new_times)} valid times")
 
     # Fetch observations in chunks of stations sequentially (rate limiter makes parallelization ineffective)
     station_ids = list(stations.keys())
@@ -902,6 +906,9 @@ def fetch_and_store_observations():
             if any(v is not None for v in obs_data.values()):
                 db["observations"][station_id][obs_time_str] = obs_data
                 obs_count += 1
+
+    # Update high-water mark so subsequent syncs only fetch new data
+    db["last_obs_fetch_end"] = max_time.isoformat()
 
     # Cleanup old data and save
     db = cleanup_old_runs(db)
