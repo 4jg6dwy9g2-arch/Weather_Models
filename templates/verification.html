@@ -168,7 +168,7 @@
                                         <div class="chart-container chart-container-small">
                                             <canvas id="asosObsTempChart"></canvas>
                                         </div>
-                                        <div class="chart-container mt-3" style="height: 180px;">
+                                        <div class="chart-container mt-3" style="height: 300px;">
                                             <canvas id="asosObsTempBiasChart"></canvas>
                                         </div>
                                     </div>
@@ -181,7 +181,7 @@
                                         <div class="chart-container chart-container-small">
                                             <canvas id="asosObsPrecipChart"></canvas>
                                         </div>
-                                        <div class="chart-container mt-3" style="height: 180px;">
+                                        <div class="chart-container mt-3" style="height: 300px;">
                                             <canvas id="asosObsPrecipBiasChart"></canvas>
                                         </div>
                                     </div>
@@ -640,8 +640,94 @@ function renderAsosObsCharts(data) {
 
     const obsTemps = data.obs_temps || [];
     const obsPrecip = data.obs_precips || [];
-    const tempBias = data.temp_bias || [];
-    const precipBias = data.precip_bias || [];
+    const modelBiases = data.model_biases || {};
+
+    const modelStyles = {
+        gfs: { label: 'GFS', bg: '#0d6efd', border: '#0d6efd' },
+        aifs: { label: 'AIFS', bg: '#0dcaf0', border: '#0dcaf0' },
+        ifs: { label: 'IFS', bg: '#20c997', border: '#20c997' },
+        nws: { label: 'NWS', bg: '#6c757d', border: '#6c757d' }
+    };
+    const modelOrder = ['gfs', 'aifs', 'ifs', 'nws'];
+
+    function buildBiasDatasets(kind, unitText) {
+        const datasets = [];
+
+        // Build rank layers per timestamp so largest |bias| is drawn first (bottom layer),
+        // then progressively smaller biases are drawn above it.
+        const hasModelBiases = modelOrder.some(m => {
+            const values = modelBiases[m]?.[kind];
+            return values && values.some(v => v !== null && v !== undefined);
+        });
+
+        if (hasModelBiases) {
+            const rankData = modelOrder.map(() => []);
+            const rankBg = modelOrder.map(() => []);
+            const rankBorder = modelOrder.map(() => []);
+            const rankModel = modelOrder.map(() => []);
+
+            for (let i = 0; i < labels.length; i++) {
+                const entries = [];
+                for (const modelKey of modelOrder) {
+                    const value = modelBiases[modelKey]?.[kind]?.[i];
+                    if (value === null || value === undefined) continue;
+                    entries.push({ modelKey, value });
+                }
+
+                // Draw smaller magnitudes on upper layers so they stay visible.
+                entries.sort((a, b) => Math.abs(a.value) - Math.abs(b.value));
+
+                for (let r = 0; r < modelOrder.length; r++) {
+                    const e = entries[r];
+                    if (e) {
+                        rankData[r].push(e.value);
+                        rankBg[r].push(modelStyles[e.modelKey].bg);
+                        rankBorder[r].push(modelStyles[e.modelKey].border);
+                        rankModel[r].push(e.modelKey);
+                    } else {
+                        rankData[r].push(null);
+                        rankBg[r].push('rgba(0,0,0,0)');
+                        rankBorder[r].push('rgba(0,0,0,0)');
+                        rankModel[r].push(null);
+                    }
+                }
+            }
+
+            for (let r = 0; r < modelOrder.length; r++) {
+                if (!rankData[r].some(v => v !== null && v !== undefined)) continue;
+                datasets.push({
+                    label: `Layer ${r + 1}`,
+                    data: rankData[r],
+                    backgroundColor: rankBg[r],
+                    borderColor: rankBorder[r],
+                    borderWidth: 1,
+                    grouped: false,
+                    barPercentage: 0.95,
+                    categoryPercentage: 1.0,
+                    modelByIndex: rankModel[r]
+                });
+            }
+        }
+
+        // Backward-compatible fallback if model_biases is not present
+        if (!datasets.length) {
+            const fallbackData = kind === 'temp_bias' ? (data.temp_bias || []) : (data.precip_bias || []);
+            const selectedStyle = modelStyles[(data.model || 'gfs').toLowerCase()] || modelStyles.gfs;
+            datasets.push({
+                label: `${(data.model || 'gfs').toUpperCase()} Bias (${unitText})`,
+                data: fallbackData,
+                backgroundColor: selectedStyle.bg,
+                borderColor: selectedStyle.border,
+                borderWidth: 1,
+                grouped: false,
+                barPercentage: 0.95,
+                categoryPercentage: 1.0,
+                modelByIndex: labels.map(() => (data.model || 'gfs').toLowerCase())
+            });
+        }
+
+        return datasets;
+    }
 
     // Temperature observations
     if (currentAsosObsTempChart) currentAsosObsTempChart.destroy();
@@ -699,13 +785,7 @@ function renderAsosObsCharts(data) {
         type: 'bar',
         data: {
             labels,
-            datasets: [{
-                label: `${data.model.toUpperCase()} Bias (°F)`,
-                data: tempBias,
-                backgroundColor: 'rgba(13, 110, 253, 0.7)',
-                borderColor: '#0d6efd',
-                borderWidth: 1
-            }]
+            datasets: buildBiasDatasets('temp_bias', '°F')
         },
         options: {
             responsive: true,
@@ -715,13 +795,27 @@ function renderAsosObsCharts(data) {
                 intersect: false
             },
             plugins: {
-                legend: { position: 'top' }
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const ds = context.dataset;
+                            const modelKey = ds.modelByIndex ? ds.modelByIndex[context.dataIndex] : null;
+                            const modelName = modelKey && modelStyles[modelKey]
+                                ? modelStyles[modelKey].label
+                                : 'Model';
+                            const val = context.parsed.y;
+                            if (val === null || val === undefined) return `${modelName}: --`;
+                            const sign = val > 0 ? '+' : '';
+                            return `${modelName}: ${sign}${val.toFixed(2)} °F`;
+                        }
+                    }
+                }
             },
             scales: {
                 y: {
                     grid: { color: '#e0e0e0' },
-                    title: { display: true, text: 'Bias (°F)' },
-                    beginAtZero: true
+                    title: { display: true, text: 'Bias (°F)' }
                 },
                 x: {
                     grid: { display: false },
@@ -786,13 +880,7 @@ function renderAsosObsCharts(data) {
         type: 'bar',
         data: {
             labels,
-            datasets: [{
-                label: `${data.model.toUpperCase()} Bias (in)`,
-                data: precipBias,
-                backgroundColor: 'rgba(32, 201, 151, 0.7)',
-                borderColor: '#20c997',
-                borderWidth: 1
-            }]
+            datasets: buildBiasDatasets('precip_bias', 'in')
         },
         options: {
             responsive: true,
@@ -802,13 +890,27 @@ function renderAsosObsCharts(data) {
                 intersect: false
             },
             plugins: {
-                legend: { position: 'top' }
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const ds = context.dataset;
+                            const modelKey = ds.modelByIndex ? ds.modelByIndex[context.dataIndex] : null;
+                            const modelName = modelKey && modelStyles[modelKey]
+                                ? modelStyles[modelKey].label
+                                : 'Model';
+                            const val = context.parsed.y;
+                            if (val === null || val === undefined) return `${modelName}: --`;
+                            const sign = val > 0 ? '+' : '';
+                            return `${modelName}: ${sign}${val.toFixed(3)} in`;
+                        }
+                    }
+                }
             },
             scales: {
                 y: {
                     grid: { color: '#e0e0e0' },
-                    title: { display: true, text: 'Bias (in)' },
-                    beginAtZero: true
+                    title: { display: true, text: 'Bias (in)' }
                 },
                 x: {
                     grid: { display: false },

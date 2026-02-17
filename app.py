@@ -3,7 +3,7 @@ Weather Forecast Comparison Flask App
 Compare GFS and ECMWF AIFS model forecasts.
 """
 
-from flask import Flask, render_template, jsonify, request, Response
+from flask import Flask, render_template, jsonify, request, Response, send_file
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -78,12 +78,15 @@ except Exception:  # pragma: no cover - optional dependency
     sun = None
     ZoneInfo = None
 from pangu_integration import pangu_bp, cleanup_database, load_runs_db
+import radar as _radar
 
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = DATA_DIR / "forecasts.json"
 
 # ASOS forecast trends storage file (last 2 runs with 6-hourly data)
 ASOS_TRENDS_FILE = DATA_DIR / "asos_forecast_trends.json"
+ASOS_PRESSURE_PERTURBATION_FILE = DATA_DIR / "asos_pressure_perturbations.json"
+ASOS_METAR_PERTURBATION_FILE    = DATA_DIR / "asos_metar_perturbations.json"
 
 # ERA5 analog forecast history (tracks predictions over time)
 ANALOG_HISTORY_FILE = DATA_DIR / "analog_forecast_history.json"
@@ -7294,6 +7297,1272 @@ def api_asos_stations():
         return jsonify({"success": False, "error": str(e)})
 
 
+def _db_id_to_1min_id(db_id: str) -> str:
+    """Convert a 4-char METAR station ID (KIAD / PHOG) to 3-char 1-min ID (IAD / HOG)."""
+    if len(db_id) == 4 and db_id[0] in ("K", "P"):
+        return db_id[1:]
+    return db_id
+
+
+def _floor_to_cadence(dt: datetime, cadence_minutes: int) -> datetime:
+    """Floor a datetime to the nearest cadence boundary in UTC."""
+    dt_utc = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    minute = (dt_utc.minute // cadence_minutes) * cadence_minutes
+    return dt_utc.replace(minute=minute)
+
+
+def _lookup_station_meta(stations_meta: dict, sid: str) -> dict:
+    """Lookup station metadata with basic ID normalization fallbacks."""
+    if sid in stations_meta:
+        return stations_meta.get(sid, {})
+    if sid.startswith("K") and len(sid) == 4:
+        return stations_meta.get(sid[1:], {})
+    if len(sid) == 3:
+        return stations_meta.get(f"K{sid}", {})
+    return {}
+
+
+def _parse_iso_utc(ts_str: str) -> datetime:
+    """Parse ISO timestamps into UTC, tolerating trailing 'Z'."""
+    txt = ts_str.strip()
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    dt = datetime.fromisoformat(txt)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
+def _moving_average_nan(arr: np.ndarray, n: int) -> np.ndarray:
+    """Centered moving average that tolerates NaNs."""
+    n = max(1, int(n))
+    if n == 1:
+        return arr.copy()
+    kernel = np.ones(n, dtype=np.float64)
+    pad = n // 2
+
+    valid = np.isfinite(arr).astype(np.float64)
+    arr0 = np.where(np.isfinite(arr), arr, 0.0)
+
+    if len(arr0) > 1 and pad > 0:
+        arr_pad = np.pad(arr0, (pad, pad), mode="reflect")
+        valid_pad = np.pad(valid, (pad, pad), mode="reflect")
+        num = np.convolve(arr_pad, kernel, mode="valid")
+        den = np.convolve(valid_pad, kernel, mode="valid")
+        # For even windows, "valid" with symmetric padding yields len(arr)+1; trim to len(arr).
+        if len(num) > len(arr):
+            num = num[:len(arr)]
+            den = den[:len(arr)]
+    else:
+        num = np.convolve(arr0, kernel, mode="same")
+        den = np.convolve(valid, kernel, mode="same")
+
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    mask = den >= max(1.0, n * 0.5)
+    out[mask] = num[mask] / den[mask]
+    return out
+
+
+def _build_frame_series_with_gap_mask(
+    ts: np.ndarray,
+    vals: np.ndarray,
+    frame_ts: np.ndarray,
+    cadence_sec: float,
+    max_gap_sec: float = 1800.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Interpolate station values to frame times and return a validity mask based on
+    nearest-observation distance (prevents sparse stations from blinking).
+    """
+    frame_vals = np.full(frame_ts.shape, np.nan, dtype=np.float64)
+    nearest_dist = np.full(frame_ts.shape, np.inf, dtype=np.float64)
+
+    if len(ts) == 0:
+        return frame_vals, np.zeros(frame_ts.shape, dtype=bool)
+
+    idx = np.searchsorted(ts, frame_ts)
+    for i, j in enumerate(idx):
+        d1 = np.inf
+        d2 = np.inf
+        if j < len(ts):
+            d1 = abs(ts[j] - frame_ts[i])
+        if j > 0:
+            d2 = abs(ts[j - 1] - frame_ts[i])
+        nearest_dist[i] = min(d1, d2)
+
+    # Determine where we trust interpolation (within max gap of any observation).
+    valid_mask = nearest_dist <= max(max_gap_sec, cadence_sec * 2.0)
+
+    # Direct sample assignment where very close (helps preserve sharp features).
+    direct_tol = max(cadence_sec * 0.75, 120.0)
+    for i, j in enumerate(idx):
+        cand = []
+        if j < len(ts):
+            cand.append(j)
+        if j > 0:
+            cand.append(j - 1)
+        if not cand:
+            continue
+        best = min(cand, key=lambda k: abs(ts[k] - frame_ts[i]))
+        if abs(ts[best] - frame_ts[i]) <= direct_tol:
+            frame_vals[i] = vals[best]
+
+    # Interpolate between first/last valid observations.
+    x = np.arange(len(frame_vals), dtype=np.float64)
+    finite = np.isfinite(frame_vals)
+    if finite.sum() >= 2:
+        fi = np.where(finite)[0]
+        left = fi[0]
+        right = fi[-1]
+        frame_vals[left:right + 1] = np.interp(
+            x[left:right + 1], fi.astype(np.float64), frame_vals[fi]
+        )
+    else:
+        # Fallback: interpolate from raw obs projected to frame index domain.
+        fx = np.interp(ts, (frame_ts[0], frame_ts[-1]), (0.0, float(len(frame_vals) - 1)))
+        if len(fx) >= 2:
+            left = int(max(0, math.floor(fx.min())))
+            right = int(min(len(frame_vals) - 1, math.ceil(fx.max())))
+            frame_vals[left:right + 1] = np.interp(
+                x[left:right + 1], fx.astype(np.float64), vals.astype(np.float64)
+            )
+
+    return frame_vals, valid_mask
+
+
+def _is_station_consistent_5min(
+    points: list[tuple[datetime, float]],
+    lookback_hours: int = 48,
+    min_ratio: float = 0.9,
+    max_allowed_gap_min: float = 15.0,
+) -> bool:
+    """
+    Return True if a station reports close to 5-minute cadence consistently.
+    """
+    if len(points) < 12:
+        return False
+    end_t = points[-1][0]
+    start_t = end_t - timedelta(hours=lookback_hours)
+    recent = [dt for dt, _ in points if dt >= start_t]
+    if len(recent) < 12:
+        return False
+
+    diffs = []
+    for a, b in zip(recent[:-1], recent[1:]):
+        dmin = (b - a).total_seconds() / 60.0
+        if dmin <= 0:
+            continue
+        diffs.append(dmin)
+    if len(diffs) < 10:
+        return False
+
+    # Accept slight timing jitter around 5-minute reporting.
+    near_5 = sum(1 for d in diffs if 4.0 <= d <= 6.5)
+    ratio = near_5 / len(diffs)
+    if ratio < min_ratio:
+        return False
+
+    # Reject stations with frequent long outages that cause frame blinking.
+    if np.percentile(np.array(diffs, dtype=np.float64), 95) > max_allowed_gap_min:
+        return False
+
+    return True
+
+
+def _detrend_and_center(series: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """Remove residual linear drift and center a perturbation series around zero."""
+    out = series.copy()
+    idx = np.where(valid_mask & np.isfinite(out))[0]
+    if len(idx) >= 8:
+        x = idx.astype(np.float64)
+        y = out[idx].astype(np.float64)
+        try:
+            slope, intercept = np.polyfit(x, y, 1)
+            trend = slope * np.arange(len(out), dtype=np.float64) + intercept
+            out = out - trend
+        except Exception:
+            pass
+    idx2 = np.where(valid_mask & np.isfinite(out))[0]
+    if len(idx2) >= 3:
+        out = out - float(np.median(out[idx2]))
+    return out
+
+
+def _compute_station_perturbation(
+    obs_ts: np.ndarray,
+    obs_vals: np.ndarray,
+    disp_frame_ts: np.ndarray,
+    pad_frame_ts: np.ndarray,
+    n_pad: int,
+    cadence_sec: float,
+    short_n: int,
+    win_n: int,
+    method: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Map observations onto a padded frame grid, run the filter, return the
+    display-window slice.  Using real observation data in the padding region
+    (rather than synthetic reflect-padding) eliminates boundary bias.
+
+    Returns (p_prime, valid_mask) both of length len(disp_frame_ts).
+    """
+    pad_vals, pad_mask = _build_frame_series_with_gap_mask(
+        obs_ts, obs_vals, pad_frame_ts, cadence_sec, max_gap_sec=3600.0
+    )
+
+    if method == "bandpass":
+        lp_short  = _moving_average_nan(pad_vals, short_n)
+        lp_long   = _moving_average_nan(pad_vals, win_n)
+        pad_prime = lp_short - lp_long
+    else:
+        baseline  = _moving_average_nan(pad_vals, win_n)
+        pad_prime = pad_vals - baseline
+
+    pad_prime[~pad_mask] = np.nan
+
+    # Slice out the display portion — the n_pad buffer on each side ensures the
+    # filter used real data at the display boundaries, so no edge masking is needed.
+    n = len(disp_frame_ts)
+    p_prime    = pad_prime[n_pad : n_pad + n]
+    valid_mask = pad_mask[n_pad : n_pad + n]
+    return p_prime, valid_mask
+
+
+def rebuild_asos_pressure_perturbation_cache(
+    hours: int = 24,
+    cadence_minutes: int = 5,
+    short_minutes: int = 10,
+    long_minutes: int = 180,
+) -> dict:
+    """
+    Build a standard ASOS pressure-perturbation snapshot.
+
+    Standard method:
+        p' = LP(short_minutes) - LP(long_minutes)
+    """
+    hours = max(1, min(72, int(hours)))
+    cadence_minutes = max(1, min(30, int(cadence_minutes)))
+    short_minutes = max(1, int(short_minutes))
+    long_minutes = max(short_minutes + 1, int(long_minutes))
+
+    db = asos.load_asos_forecasts_db()
+    stations_meta = db.get("stations", {})
+    if not stations_meta:
+        try:
+            stations_meta = asos.get_stations_dict()
+        except Exception:
+            stations_meta = {}
+
+    one_min_cache = asos.load_asos_1min_pressure_cache()
+    one_min_stations = one_min_cache.get("stations", {}) if one_min_cache else {}
+    if not one_min_stations:
+        raise ValueError("No 1-min ASOS pressure data available (runs overnight)")
+
+    station_raw = {}
+    total_obs_stations = len(one_min_stations)
+    stations_with_coords = 0
+    stations_with_points = 0
+    stations_with_consistent_cadence = 0
+    latest_time = None
+
+    for sid, sid_data in one_min_stations.items():
+        meta = _lookup_station_meta(stations_meta, sid)
+        lat = meta.get("lat")
+        lon = meta.get("lon")
+        if lat is None or lon is None:
+            continue
+        stations_with_coords += 1
+
+        points = []
+        for entry in sid_data.get("obs", []):
+            try:
+                ts_str, pres_mb = entry[0], entry[1]
+                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                points.append((dt, float(pres_mb)))
+            except Exception:
+                continue
+
+        if len(points) < 6:
+            continue
+        stations_with_points += 1
+        stations_with_consistent_cadence += 1
+        points.sort(key=lambda x: x[0])
+        station_raw[sid] = {
+            "station_id": sid,
+            "name": meta.get("name", sid),
+            "state": meta.get("state", ""),
+            "lat": lat,
+            "lon": lon,
+            "points": points,
+        }
+        if latest_time is None or points[-1][0] > latest_time:
+            latest_time = points[-1][0]
+
+    if not station_raw or latest_time is None:
+        raise ValueError("No station pressure observations available")
+
+    cadence_sec = cadence_minutes * 60
+    short_n = max(1, int(round(short_minutes / cadence_minutes)))
+    win_n   = max(short_n + 1, int(round(long_minutes / cadence_minutes)))
+    n_pad   = win_n // 2 + 2   # just past the reflect zone; ~100 min at 5-min cadence
+
+    # Step end_time back by n_pad frames so the padded future window contains real
+    # observations, giving the centered LP filter valid data on both sides at the boundary.
+    raw_end  = _floor_to_cadence(latest_time, cadence_minutes)
+    end_time = raw_end - timedelta(minutes=cadence_minutes * n_pad)
+    start_time = end_time - timedelta(hours=hours)
+
+    frame_times = []
+    t = start_time
+    while t <= end_time:
+        frame_times.append(t)
+        t += timedelta(minutes=cadence_minutes)
+    frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
+
+    # Padded frame grid: n_pad extra frames on each side supply real observation
+    # data to the centered filter, eliminating boundary bias entirely.
+    pad_frame_start = start_time - timedelta(minutes=cadence_minutes * n_pad)
+    pad_frame_end   = end_time   + timedelta(minutes=cadence_minutes * n_pad)
+    pad_frame_times = []
+    t = pad_frame_start
+    while t <= pad_frame_end:
+        pad_frame_times.append(t)
+        t += timedelta(minutes=cadence_minutes)
+    pad_frame_ts = np.array([int(ft.timestamp()) for ft in pad_frame_times], dtype=np.float64)
+
+    # Observation selection: just outside the padded frame grid.
+    pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
+    pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
+
+    stations_out = []
+    stations_with_window = 0
+    stations_with_valid_frames = 0
+    for sid, payload in station_raw.items():
+        pts = payload["points"]
+        sel = [(dt, p) for dt, p in pts if pad_start <= dt <= pad_end]
+        if len(sel) < 6:
+            continue
+        stations_with_window += 1
+
+        ts = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
+        vals = np.array([p for _, p in sel], dtype=np.float64)
+
+        p_prime, valid_mask = _compute_station_perturbation(
+            ts, vals, frame_ts, pad_frame_ts, n_pad, cadence_sec,
+            short_n, win_n, "bandpass"
+        )
+        if valid_mask.sum() < 6:
+            continue
+        stations_with_valid_frames += 1
+
+        p_prime = _detrend_and_center(p_prime, valid_mask)
+
+        values = [None if not np.isfinite(v) else round(float(v), 3) for v in p_prime]
+        if all(v is None for v in values):
+            continue
+        # Null out individual frames with implausibly large perturbations (bad sensor / QC failure)
+        values = [None if (v is not None and abs(v) > 20) else v for v in values]
+        if all(v is None for v in values):
+            continue
+
+        station_entry = {
+            "station_id": payload["station_id"],
+            "name": payload["name"],
+            "state": payload["state"],
+            "lat": payload["lat"],
+            "lon": payload["lon"],
+            "values": values,
+        }
+        stations_out.append(station_entry)
+
+    if not stations_out:
+        raise ValueError(
+            "No perturbation values computed "
+            f"(obs_stations={total_obs_stations}, coords={stations_with_coords}, "
+            f"points={stations_with_points}, cadence={stations_with_consistent_cadence}, "
+            f"window={stations_with_window}, valid={stations_with_valid_frames})"
+        )
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "hours": hours,
+        "window_minutes": long_minutes,
+        "cadence_minutes": cadence_minutes,
+        "frames": [ft.isoformat() for ft in frame_times],
+        "latest_time": latest_time.isoformat(),
+        "method": {
+            "name": "band-pass perturbation",
+            "equation": f"p' = LP({short_minutes}m) - LP({long_minutes}m)",
+            "notes": "Standard gravity-wave perturbation cache for ASOS MSLP.",
+            "short_minutes": short_minutes,
+            "long_minutes": long_minutes,
+        },
+        "stations": stations_out,
+    }
+
+    return payload
+
+
+def append_asos_pressure_perturbation_history(latest_payload: dict) -> dict:
+    """
+    Append newly available frames from latest_payload into the persistent history file.
+    """
+    existing = load_asos_pressure_perturbation_cache()
+    if not existing or not existing.get("frames") or not existing.get("stations"):
+        with open(ASOS_PRESSURE_PERTURBATION_FILE, "w") as f:
+            json.dump(latest_payload, f)
+        return {
+            "station_count": len(latest_payload.get("stations", [])),
+            "frame_count": len(latest_payload.get("frames", [])),
+            "appended_frames": len(latest_payload.get("frames", [])),
+            "latest_time": latest_payload.get("latest_time"),
+            "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
+        }
+
+    old_frames = existing.get("frames", [])
+    new_frames = latest_payload.get("frames", [])
+    if not new_frames:
+        return {
+            "station_count": len(existing.get("stations", [])),
+            "frame_count": len(old_frames),
+            "appended_frames": 0,
+            "latest_time": existing.get("latest_time"),
+            "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
+        }
+
+    old_last = old_frames[-1] if old_frames else None
+    append_start = 0
+    if old_last is not None:
+        append_start = len(new_frames)
+        for i, ft in enumerate(new_frames):
+            if ft > old_last:
+                append_start = i
+                break
+    new_tail_frames = new_frames[append_start:]
+    n_new = len(new_tail_frames)
+
+    if n_new <= 0:
+        # Keep method metadata fresh even when there are no new frames.
+        existing["generated_at"] = latest_payload.get("generated_at", existing.get("generated_at"))
+        existing["latest_time"] = latest_payload.get("latest_time", existing.get("latest_time"))
+        existing["method"] = latest_payload.get("method", existing.get("method"))
+        with open(ASOS_PRESSURE_PERTURBATION_FILE, "w") as f:
+            json.dump(existing, f)
+        return {
+            "station_count": len(existing.get("stations", [])),
+            "frame_count": len(old_frames),
+            "appended_frames": 0,
+            "latest_time": existing.get("latest_time"),
+            "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
+        }
+
+    existing["frames"] = old_frames + new_tail_frames
+    existing["generated_at"] = latest_payload.get("generated_at", existing.get("generated_at"))
+    existing["latest_time"] = latest_payload.get("latest_time", existing.get("latest_time"))
+    existing["window_minutes"] = latest_payload.get("window_minutes", existing.get("window_minutes", 180))
+    existing["cadence_minutes"] = latest_payload.get("cadence_minutes", existing.get("cadence_minutes", 5))
+    existing["method"] = latest_payload.get("method", existing.get("method"))
+
+    old_frame_count = len(old_frames)
+    existing_stations = existing.get("stations", [])
+    by_sid = {s.get("station_id"): s for s in existing_stations if s.get("station_id")}
+
+    # Pad existing stations for newly appended frame slots.
+    for s in existing_stations:
+        vals = s.get("values", [])
+        if len(vals) < old_frame_count:
+            vals.extend([None] * (old_frame_count - len(vals)))
+        vals.extend([None] * n_new)
+        s["values"] = vals
+
+    # Write latest values into new slots.
+    for new_s in latest_payload.get("stations", []):
+        sid = new_s.get("station_id")
+        if not sid:
+            continue
+
+        tail_vals = (new_s.get("values", []) or [])[append_start:]
+        if len(tail_vals) < n_new:
+            tail_vals.extend([None] * (n_new - len(tail_vals)))
+        elif len(tail_vals) > n_new:
+            tail_vals = tail_vals[:n_new]
+
+        if sid not in by_sid:
+            vals = [None] * old_frame_count + tail_vals
+            station_entry = {
+                "station_id": sid,
+                "name": new_s.get("name", sid),
+                "state": new_s.get("state", ""),
+                "lat": new_s.get("lat"),
+                "lon": new_s.get("lon"),
+                "values": vals,
+            }
+            existing_stations.append(station_entry)
+            by_sid[sid] = station_entry
+            continue
+
+        target = by_sid[sid]
+        target["name"] = new_s.get("name", target.get("name", sid))
+        target["state"] = new_s.get("state", target.get("state", ""))
+        if new_s.get("lat") is not None:
+            target["lat"] = new_s.get("lat")
+        if new_s.get("lon") is not None:
+            target["lon"] = new_s.get("lon")
+
+        vals = target.get("values", [])
+        start_idx = old_frame_count
+        for i, v in enumerate(tail_vals):
+            if start_idx + i < len(vals):
+                vals[start_idx + i] = v
+        target["values"] = vals
+
+    existing["stations"] = existing_stations
+    with open(ASOS_PRESSURE_PERTURBATION_FILE, "w") as f:
+        json.dump(existing, f)
+
+    return {
+        "station_count": len(existing_stations),
+        "frame_count": len(existing.get("frames", [])),
+        "appended_frames": n_new,
+        "latest_time": existing.get("latest_time"),
+        "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
+    }
+
+
+def build_and_append_asos_pressure_perturbation_history(
+    hours: int = 24,
+    cadence_minutes: int = 5,
+    short_minutes: int = 10,
+    long_minutes: int = 180,
+) -> dict:
+    """Build latest snapshot and append newly available frames into history."""
+    latest = rebuild_asos_pressure_perturbation_cache(
+        hours=hours,
+        cadence_minutes=cadence_minutes,
+        short_minutes=short_minutes,
+        long_minutes=long_minutes,
+    )
+    stats = append_asos_pressure_perturbation_history(latest)
+    return {
+        "station_count": len(latest.get("stations", [])),
+        "frame_count": len(latest.get("frames", [])),  # snapshot frame count
+        "latest_time": latest.get("latest_time"),  # snapshot latest
+        "history_station_count": stats.get("station_count"),
+        "history_frame_count": stats.get("frame_count"),
+        "appended_frames": stats.get("appended_frames"),
+        "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
+    }
+
+
+def load_asos_pressure_perturbation_cache(hours: int | None = None) -> dict | None:
+    """Load saved ASOS pressure perturbation cache if present."""
+    if not ASOS_PRESSURE_PERTURBATION_FILE.exists():
+        return None
+    try:
+        with open(ASOS_PRESSURE_PERTURBATION_FILE) as f:
+            data = json.load(f)
+        if not data:
+            return None
+
+        if hours is None:
+            return data
+
+        frames = data.get("frames", [])
+        if not frames:
+            return data
+        cadence = int(data.get("cadence_minutes", 5) or 5)
+        need = int(max(1, hours * 60 // max(1, cadence)) + 1)
+        if need >= len(frames):
+            return data
+
+        start_idx = len(frames) - need
+        sliced = {
+            **data,
+            "hours": hours,
+            "frames": frames[start_idx:],
+            "stations": [],
+        }
+        for s in data.get("stations", []):
+            vals = s.get("values", [])
+            sliced["stations"].append({
+                "station_id": s.get("station_id"),
+                "name": s.get("name"),
+                "state": s.get("state", ""),
+                "lat": s.get("lat"),
+                "lon": s.get("lon"),
+                "values": vals[start_idx:] if isinstance(vals, list) else [],
+            })
+        return sliced
+    except Exception as e:
+        logger.warning(f"Error loading ASOS pressure perturbation cache: {e}")
+        return None
+
+
+def rebuild_asos_metar_perturbation_cache(
+    hours: int = 24,
+    cadence_minutes: int = 5,
+    short_minutes: int = 10,
+    long_minutes: int = 180,
+) -> dict:
+    """
+    Build a pressure-perturbation snapshot from the regular 5-min METAR observations
+    already stored in asos_forecasts.json.  Near-real-time (~hours old) with ~2500 stations.
+    Same algorithm as rebuild_asos_pressure_perturbation_cache but uses METAR mslp.
+    """
+    hours          = max(1, min(240, int(hours)))
+    cadence_minutes = max(1, min(30, int(cadence_minutes)))
+    short_minutes   = max(1, int(short_minutes))
+    long_minutes    = max(short_minutes + 1, int(long_minutes))
+
+    pressure_cache = asos.load_asos_metar_pressure_cache()
+    if not pressure_cache or not pressure_cache.get("stations"):
+        raise ValueError("No METAR pressure data available — run sync_asos_metar_pressure() first")
+
+    stations_data = pressure_cache["stations"]
+    station_raw = {}
+    latest_time = None
+
+    for sid, sid_data in stations_data.items():
+        lat = sid_data.get("lat")
+        lon = sid_data.get("lon")
+        if lat is None or lon is None:
+            continue
+
+        points = []
+        for entry in sid_data.get("obs", []):
+            try:
+                ts_str, pres_mb = entry[0], entry[1]
+                dt = _parse_iso_utc(ts_str.replace(" ", "T") + "+00:00")
+                points.append((dt, float(pres_mb)))
+            except Exception:
+                continue
+
+        if len(points) < 6:
+            continue
+        points.sort(key=lambda x: x[0])
+        station_raw[sid] = {
+            "station_id": sid,
+            "name":  sid_data.get("name", sid),
+            "state": sid_data.get("state", ""),
+            "lat":   lat,
+            "lon":   lon,
+            "points": points,
+        }
+        if latest_time is None or points[-1][0] > latest_time:
+            latest_time = points[-1][0]
+
+    if not station_raw or latest_time is None:
+        raise ValueError("No METAR pressure observations available")
+
+    cadence_sec = cadence_minutes * 60
+    short_n = max(1, int(round(short_minutes / cadence_minutes)))
+    win_n   = max(short_n + 1, int(round(long_minutes / cadence_minutes)))
+    n_pad   = win_n // 2 + 2
+
+    raw_end    = _floor_to_cadence(latest_time, cadence_minutes)
+    end_time   = raw_end - timedelta(minutes=cadence_minutes * n_pad)
+    start_time = end_time - timedelta(hours=hours)
+
+    frame_times = []
+    t = start_time
+    while t <= end_time:
+        frame_times.append(t)
+        t += timedelta(minutes=cadence_minutes)
+    frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
+
+    pad_frame_start = start_time - timedelta(minutes=cadence_minutes * n_pad)
+    pad_frame_end   = end_time   + timedelta(minutes=cadence_minutes * n_pad)
+    pad_frame_times = []
+    t = pad_frame_start
+    while t <= pad_frame_end:
+        pad_frame_times.append(t)
+        t += timedelta(minutes=cadence_minutes)
+    pad_frame_ts = np.array([int(pt.timestamp()) for pt in pad_frame_times], dtype=np.float64)
+
+    pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
+    pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
+
+    stations_out = []
+    for sid, payload in station_raw.items():
+        pts = payload["points"]
+        sel = [(dt, p) for dt, p in pts if pad_start <= dt <= pad_end]
+        if len(sel) < 6:
+            continue
+
+        ts   = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
+        vals = np.array([p for _, p in sel],               dtype=np.float64)
+
+        p_prime, valid_mask = _compute_station_perturbation(
+            ts, vals, frame_ts, pad_frame_ts, n_pad, cadence_sec, short_n, win_n, "bandpass"
+        )
+        if valid_mask.sum() < 6:
+            continue
+
+        p_prime = _detrend_and_center(p_prime, valid_mask)
+        values  = [None if not np.isfinite(v) else round(float(v), 3) for v in p_prime]
+        if all(v is None for v in values):
+            continue
+        # Null out individual frames with implausibly large perturbations (bad sensor / QC failure)
+        values = [None if (v is not None and abs(v) > 20) else v for v in values]
+        if all(v is None for v in values):
+            continue
+
+        stations_out.append({
+            "station_id": payload["station_id"],
+            "name":       payload["name"],
+            "state":      payload["state"],
+            "lat":        payload["lat"],
+            "lon":        payload["lon"],
+            "values":     values,
+        })
+
+    if not stations_out:
+        raise ValueError("No METAR perturbation values computed")
+
+    return {
+        "generated_at":   datetime.now(timezone.utc).isoformat(),
+        "source":         "metar",
+        "hours":          hours,
+        "window_minutes": long_minutes,
+        "cadence_minutes": cadence_minutes,
+        "frames":         [ft.isoformat() for ft in frame_times],
+        "latest_time":    latest_time.isoformat(),
+        "method": {
+            "name":          "band-pass perturbation",
+            "equation":      f"p' = LP({short_minutes}m) - LP({long_minutes}m)",
+            "short_minutes": short_minutes,
+            "long_minutes":  long_minutes,
+        },
+        "stations": stations_out,
+    }
+
+
+def load_asos_metar_perturbation_cache(hours: int | None = None) -> dict | None:
+    """Load METAR perturbation cache, rebuilding if the dedicated pressure file is newer."""
+    # Rebuild if stale (pressure obs updated more recently than the perturbation cache)
+    metar_file = asos.ASOS_METAR_PRESSURE_FILE
+    if metar_file.exists() and ASOS_METAR_PERTURBATION_FILE.exists():
+        if metar_file.stat().st_mtime > ASOS_METAR_PERTURBATION_FILE.stat().st_mtime:
+            try:
+                payload = rebuild_asos_metar_perturbation_cache(hours=24)
+                with open(ASOS_METAR_PERTURBATION_FILE, "w") as f:
+                    json.dump(payload, f)
+            except Exception as e:
+                logger.warning(f"METAR perturbation rebuild failed: {e}")
+
+    if not ASOS_METAR_PERTURBATION_FILE.exists():
+        try:
+            payload = rebuild_asos_metar_perturbation_cache(hours=24)
+            with open(ASOS_METAR_PERTURBATION_FILE, "w") as f:
+                json.dump(payload, f)
+        except Exception as e:
+            logger.warning(f"METAR perturbation initial build failed: {e}")
+            return None
+
+    try:
+        with open(ASOS_METAR_PERTURBATION_FILE) as f:
+            data = json.load(f)
+        if hours is None or not data.get("frames"):
+            return data
+        frames = data["frames"]
+        cadence = int(data.get("cadence_minutes", 5) or 5)
+        need = int(max(1, hours * 60 // max(1, cadence)) + 1)
+        if need >= len(frames):
+            return data
+        start_idx = len(frames) - need
+        sliced = {**data, "hours": hours, "frames": frames[start_idx:], "stations": []}
+        for s in data.get("stations", []):
+            vals = s.get("values", [])
+            sliced["stations"].append({**s, "values": vals[start_idx:] if isinstance(vals, list) else []})
+        return sliced
+    except Exception as e:
+        logger.warning(f"Error loading METAR perturbation cache: {e}")
+        return None
+
+
+@app.route('/api/asos/gravity-waves')
+def api_asos_gravity_waves():
+    """
+    Build a 24h loop-ready pressure-perturbation dataset from ASOS MSLP observations.
+
+    Perturbation is computed as:
+        p' = p(t) - mean(p) over a centered running window.
+    """
+    try:
+        raw_hours = request.args.get("hours", "24").strip().lower()
+        if raw_hours == "max":
+            requested_hours = 24 * 366
+        else:
+            requested_hours = int(raw_hours)
+        window_minutes = int(request.args.get("window_minutes", 180))
+        cadence_minutes = int(request.args.get("cadence_minutes", 5))
+        method = request.args.get("method", "bandpass").strip().lower()
+        if method not in {"running_mean", "bandpass"}:
+            method = "bandpass"
+
+        source = request.args.get("source", "metar").strip().lower()
+        if source not in {"metar", "1min"}:
+            source = "metar"
+
+        requested_hours = max(1, min(24 * 366, requested_hours))
+        # Keep on-the-fly computation bounded; historical requests should come from cache.
+        hours = max(1, min(72, requested_hours))
+        window_minutes = max(30, min(720, window_minutes))
+        cadence_minutes = max(1, min(30, cadence_minutes))
+
+        # Fast path: use precomputed standard band-pass cache.
+        if method == "bandpass" and window_minutes == 180 and cadence_minutes == 5:
+            if source == "metar":
+                cached = load_asos_metar_perturbation_cache(hours=requested_hours)
+                if cached and cached.get("stations") and cached.get("frames"):
+                    return jsonify({"success": True, **cached})
+                # Cache missing/stale — rebuild from METAR obs now.
+                try:
+                    payload = rebuild_asos_metar_perturbation_cache(hours=24)
+                    with open(ASOS_METAR_PERTURBATION_FILE, "w") as _f:
+                        json.dump(payload, _f)
+                    cached = load_asos_metar_perturbation_cache(hours=requested_hours)
+                    if cached and cached.get("stations") and cached.get("frames"):
+                        return jsonify({"success": True, **cached})
+                except Exception as _cache_exc:
+                    logger.warning(f"METAR gravity-wave cache rebuild failed: {_cache_exc}")
+                return jsonify({"success": False, "error": "METAR pressure perturbation cache unavailable"}), 404
+            else:
+                cached = load_asos_pressure_perturbation_cache(hours=requested_hours)
+                if cached and cached.get("stations") and cached.get("frames"):
+                    return jsonify({"success": True, **cached})
+                # If cache is missing/stale, try rebuilding once so the tab can render immediately.
+                try:
+                    build_and_append_asos_pressure_perturbation_history(
+                        hours=24, cadence_minutes=5, short_minutes=10, long_minutes=180
+                    )
+                    cached = load_asos_pressure_perturbation_cache(hours=requested_hours)
+                    if cached and cached.get("stations") and cached.get("frames"):
+                        return jsonify({"success": True, **cached})
+                except Exception as _cache_exc:
+                    logger.warning(f"Gravity-wave cache rebuild fallback failed: {_cache_exc}")
+
+        db = asos.load_asos_forecasts_db()
+        stations_meta = db.get("stations", {})
+        if not stations_meta:
+            try:
+                stations_meta = asos.get_stations_dict()
+            except Exception:
+                stations_meta = {}
+
+        one_min_cache = asos.load_asos_1min_pressure_cache()
+        one_min_stations = one_min_cache.get("stations", {}) if one_min_cache else {}
+        if not one_min_stations:
+            return jsonify({"success": False, "error": "No 1-min ASOS pressure data available (runs overnight)"}), 404
+
+        station_raw = {}
+        dbg_total_obs_stations = len(one_min_stations)
+        dbg_stations_with_coords = 0
+        dbg_stations_with_points = 0
+        dbg_stations_with_consistent_cadence = 0
+        latest_time = None
+
+        for sid, sid_data in one_min_stations.items():
+            meta = _lookup_station_meta(stations_meta, sid)
+            lat = meta.get("lat")
+            lon = meta.get("lon")
+            if lat is None or lon is None:
+                continue
+            dbg_stations_with_coords += 1
+
+            points = []
+            for entry in sid_data.get("obs", []):
+                try:
+                    ts_str, pres_mb = entry[0], entry[1]
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                    points.append((dt, float(pres_mb)))
+                except Exception:
+                    continue
+
+            if len(points) < 6:
+                continue
+            dbg_stations_with_points += 1
+            dbg_stations_with_consistent_cadence += 1
+            points.sort(key=lambda x: x[0])
+            station_raw[sid] = {
+                "meta": {
+                    "station_id": sid,
+                    "name": meta.get("name", sid),
+                    "state": meta.get("state", ""),
+                    "lat": lat,
+                    "lon": lon,
+                },
+                "points": points,
+            }
+            if latest_time is None or points[-1][0] > latest_time:
+                latest_time = points[-1][0]
+
+        if not station_raw or latest_time is None:
+            return jsonify({"success": False, "error": "No station pressure observations available"}), 404
+
+        cadence_sec = cadence_minutes * 60
+        if method == "bandpass":
+            short_n = max(1, int(round(10 / cadence_minutes)))
+            win_n   = max(short_n + 1, int(round(180 / cadence_minutes)))
+        else:
+            short_n = 0
+            win_n   = max(3, int(round(window_minutes / cadence_minutes)))
+        n_pad = win_n // 2 + 2   # just past the reflect zone; ~100 min at 5-min cadence
+
+        # Step end_time back by n_pad frames so the padded future window contains real
+        # observations, giving the centered LP filter valid data on both sides at the boundary.
+        raw_end  = _floor_to_cadence(latest_time, cadence_minutes)
+        end_time = raw_end - timedelta(minutes=cadence_minutes * n_pad)
+        start_time = end_time - timedelta(hours=hours)
+
+        frame_times = []
+        t = start_time
+        while t <= end_time:
+            frame_times.append(t)
+            t += timedelta(minutes=cadence_minutes)
+        frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
+
+        # Padded frame grid: n_pad extra frames on each side supply real observation
+        # data to the centered filter, eliminating boundary bias entirely.
+        pad_frame_start = start_time - timedelta(minutes=cadence_minutes * n_pad)
+        pad_frame_end   = end_time   + timedelta(minutes=cadence_minutes * n_pad)
+        pad_frame_times = []
+        t = pad_frame_start
+        while t <= pad_frame_end:
+            pad_frame_times.append(t)
+            t += timedelta(minutes=cadence_minutes)
+        pad_frame_ts = np.array([int(ft.timestamp()) for ft in pad_frame_times], dtype=np.float64)
+
+        # Observation selection: just outside the padded frame grid.
+        pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
+        pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
+
+        stations_out = []
+        dbg_stations_with_window = 0
+        dbg_stations_with_valid_frames = 0
+        for sid, payload in station_raw.items():
+            pts = payload["points"]
+            sel = [(dt, p) for dt, p in pts if pad_start <= dt <= pad_end]
+            if len(sel) < 6:
+                continue
+            dbg_stations_with_window += 1
+
+            ts = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
+            vals = np.array([p for _, p in sel], dtype=np.float64)
+
+            # Project observations onto the regular frame grid (nearest obs within tolerance).
+            p_prime, valid_mask = _compute_station_perturbation(
+                ts, vals, frame_ts, pad_frame_ts, n_pad, cadence_sec,
+                short_n, win_n, method
+            )
+            if valid_mask.sum() < 6:
+                continue
+            dbg_stations_with_valid_frames += 1
+            p_prime = _detrend_and_center(p_prime, valid_mask)
+            values = [None if not np.isfinite(v) else round(float(v), 3) for v in p_prime]
+            if all(v is None for v in values):
+                continue
+            # Null out individual frames with implausibly large perturbations (bad sensor / QC failure)
+            values = [None if (v is not None and abs(v) > 20) else v for v in values]
+            if all(v is None for v in values):
+                continue
+
+            station_entry = payload["meta"].copy()
+            station_entry["values"] = values
+            stations_out.append(station_entry)
+
+        if not stations_out:
+            return jsonify({
+                "success": False,
+                "error": "No perturbation values computed for selected window",
+                "debug": {
+                    "obs_stations": dbg_total_obs_stations,
+                    "with_coords": dbg_stations_with_coords,
+                    "with_points": dbg_stations_with_points,
+                    "with_5min_cadence": dbg_stations_with_consistent_cadence,
+                    "with_window_points": dbg_stations_with_window,
+                    "with_valid_frames": dbg_stations_with_valid_frames,
+                    "hours_requested": requested_hours,
+                    "hours_computed": hours,
+                    "window_minutes": window_minutes,
+                    "cadence_minutes": cadence_minutes,
+                    "method": method,
+                }
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "hours": hours,
+            "window_minutes": window_minutes,
+            "cadence_minutes": cadence_minutes,
+            "frames": [ft.isoformat() for ft in frame_times],
+            "latest_time": latest_time.isoformat(),
+            "method": {
+                "name": "band-pass perturbation" if method == "bandpass" else "running-mean perturbation",
+                "equation": "p' = LP(10m) - LP(180m)" if method == "bandpass" else "p' = p - running_mean(p)",
+                "notes": (
+                    "Perturbation uses a difference-of-means band-pass filter (~10-180 min periods)."
+                    if method == "bandpass"
+                    else (
+                        "Perturbation is computed from station MSLP by subtracting a centered running "
+                        f"mean over {window_minutes} minutes."
+                    )
+                ),
+            },
+            "stations": stations_out,
+        })
+    except Exception as e:
+        logger.error(f"Error computing gravity-wave perturbations: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/asos/station-pressure-detail')
+def api_asos_station_pressure_detail():
+    """Return raw obs, LP(10m), LP(180m) baseline, and perturbation for a single station."""
+    try:
+        station_id = request.args.get('station_id', '').strip().upper()
+        if not station_id:
+            return jsonify({"success": False, "error": "station_id required"}), 400
+
+        source          = request.args.get('source', 'metar').strip().lower()
+        if source not in {'metar', '1min'}:
+            source = 'metar'
+        hours          = max(1, min(72, int(request.args.get('hours', 24))))
+        cadence_minutes = 5
+        short_minutes   = 10
+        long_minutes    = 180
+
+        # --- METAR source: use dedicated 5-min pressure file ---
+        if source == 'metar':
+            pressure_cache = asos.load_asos_metar_pressure_cache()
+            sid_data = (pressure_cache or {}).get("stations", {}).get(station_id, {})
+            points = []
+            for entry in sid_data.get("obs", []):
+                try:
+                    ts_str, pres_mb = entry[0], entry[1]
+                    dt = _parse_iso_utc(ts_str.replace(" ", "T") + "+00:00")
+                    points.append((dt, float(pres_mb)))
+                except Exception:
+                    continue
+            if len(points) < 6:
+                return jsonify({"success": False, "error": f"No METAR pressure data for {station_id}"}), 404
+
+            meta = {
+                "name":  sid_data.get("name", station_id),
+                "state": sid_data.get("state", ""),
+                "lat":   sid_data.get("lat"),
+                "lon":   sid_data.get("lon"),
+            }
+
+            points.sort(key=lambda x: x[0])
+            latest_time = points[-1][0]
+
+            cadence_sec = cadence_minutes * 60
+            short_n = max(1, int(round(short_minutes / cadence_minutes)))
+            win_n   = max(short_n + 1, int(round(long_minutes / cadence_minutes)))
+            n_pad   = win_n // 2 + 2
+
+            raw_end  = _floor_to_cadence(latest_time, cadence_minutes)
+            end_time = raw_end - timedelta(minutes=cadence_minutes * n_pad)
+            start_time = end_time - timedelta(hours=hours)
+
+            frame_times = []
+            t = start_time
+            while t <= end_time:
+                frame_times.append(t)
+                t += timedelta(minutes=cadence_minutes)
+            frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
+
+            pad_frame_start = start_time  - timedelta(minutes=cadence_minutes * n_pad)
+            pad_frame_end   = end_time    + timedelta(minutes=cadence_minutes * n_pad)
+            pad_frame_times = []
+            t = pad_frame_start
+            while t <= pad_frame_end:
+                pad_frame_times.append(t)
+                t += timedelta(minutes=cadence_minutes)
+            pad_frame_ts = np.array([int(pt.timestamp()) for pt in pad_frame_times], dtype=np.float64)
+
+            pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
+            pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
+            sel = [(dt, p) for dt, p in points if pad_start <= dt <= pad_end]
+            if len(sel) < 6:
+                return jsonify({"success": False, "error": "Insufficient METAR observations in display window"}), 404
+
+            obs_ts   = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
+            obs_vals = np.array([p for _, p in sel],               dtype=np.float64)
+
+            pad_raw, pad_mask = _build_frame_series_with_gap_mask(
+                obs_ts, obs_vals, pad_frame_ts, cadence_sec, max_gap_sec=3600.0
+            )
+            lp_short_pad = _moving_average_nan(pad_raw, short_n)
+            lp_long_pad  = _moving_average_nan(pad_raw, win_n)
+            pad_prime    = lp_short_pad - lp_long_pad
+            pad_prime[~pad_mask] = np.nan
+
+            n = len(frame_ts)
+            raw_disp      = pad_raw[n_pad : n_pad + n]
+            lp_short_disp = lp_short_pad[n_pad : n_pad + n]
+            lp_long_disp  = lp_long_pad[n_pad : n_pad + n]
+            prime_disp    = pad_prime[n_pad : n_pad + n]
+
+            def _to_list(arr):
+                return [None if not np.isfinite(v) else round(float(v), 3) for v in arr]
+
+            disp_obs = [
+                {"t": dt.isoformat(), "v": round(p, 3)}
+                for dt, p in points
+                if start_time <= dt <= end_time
+            ]
+
+            return jsonify({
+                "success": True,
+                "source": "metar",
+                "station_id": station_id,
+                "name": meta.get("name", station_id),
+                "state": meta.get("state", ""),
+                "lat": meta.get("lat"),
+                "lon": meta.get("lon"),
+                "frames": [ft.isoformat() for ft in frame_times],
+                "raw": _to_list(raw_disp),
+                "lp_short": _to_list(lp_short_disp),
+                "lp_long": _to_list(lp_long_disp),
+                "perturbation": _to_list(prime_disp),
+                "obs": disp_obs,
+            })
+
+        # --- 1-min source: use IEM 1-min pressure archive ---
+        db = asos.load_asos_forecasts_db()
+        stations_meta = db.get("stations", {})
+        meta = _lookup_station_meta(stations_meta, station_id)
+
+        one_min_cache = asos.load_asos_1min_pressure_cache()
+        one_min_stations = one_min_cache.get("stations", {}) if one_min_cache else {}
+        one_min_id = _db_id_to_1min_id(station_id)
+
+        points = []
+        if one_min_id in one_min_stations:
+            for entry in one_min_stations[one_min_id].get("obs", []):
+                try:
+                    ts_str, pres_mb = entry[0], entry[1]
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                    points.append((dt, float(pres_mb)))
+                except Exception:
+                    continue
+        else:
+            # Raw 1-min observations not in current cache (typically a failed IEM batch
+            # request during the overnight sync).  Fall back to the precomputed perturbation
+            # history, which still holds valid values from the last successful sync for
+            # this station.
+            pert_cache = load_asos_pressure_perturbation_cache(hours=hours)
+            if pert_cache and pert_cache.get("stations"):
+                station_entry = next(
+                    (s for s in pert_cache["stations"] if s.get("station_id") == one_min_id),
+                    None,
+                )
+                if station_entry:
+                    pert_values = station_entry.get("values", [])
+                    non_null = [v for v in pert_values if v is not None]
+                    if len(non_null) >= 6:
+                        return jsonify({
+                            "success": True,
+                            "perturbation_only": True,
+                            "station_id": station_id,
+                            "name": station_entry.get("name") or meta.get("name", station_id),
+                            "state": station_entry.get("state") or meta.get("state", ""),
+                            "lat": station_entry.get("lat") or meta.get("lat"),
+                            "lon": station_entry.get("lon") or meta.get("lon"),
+                            "frames": pert_cache.get("frames", []),
+                            "perturbation": pert_values,
+                        })
+            return jsonify({"success": False, "error": f"No 1-min pressure data for {station_id}"}), 404
+
+        points.sort(key=lambda x: x[0])
+
+        if len(points) < 6:
+            return jsonify({"success": False, "error": "Insufficient pressure observations"}), 404
+
+        latest_time = points[-1][0]
+
+        cadence_sec = cadence_minutes * 60
+        short_n = max(1, int(round(short_minutes / cadence_minutes)))
+        win_n   = max(short_n + 1, int(round(long_minutes / cadence_minutes)))
+        n_pad   = win_n // 2 + 2
+
+        raw_end  = _floor_to_cadence(latest_time, cadence_minutes)
+        end_time = raw_end - timedelta(minutes=cadence_minutes * n_pad)
+        start_time = end_time - timedelta(hours=hours)
+
+        frame_times = []
+        t = start_time
+        while t <= end_time:
+            frame_times.append(t)
+            t += timedelta(minutes=cadence_minutes)
+        frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
+
+        pad_frame_start = start_time  - timedelta(minutes=cadence_minutes * n_pad)
+        pad_frame_end   = end_time    + timedelta(minutes=cadence_minutes * n_pad)
+        pad_frame_times = []
+        t = pad_frame_start
+        while t <= pad_frame_end:
+            pad_frame_times.append(t)
+            t += timedelta(minutes=cadence_minutes)
+        pad_frame_ts = np.array([int(pt.timestamp()) for pt in pad_frame_times], dtype=np.float64)
+
+        pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
+        pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
+        sel = [(dt, p) for dt, p in points if pad_start <= dt <= pad_end]
+        if len(sel) < 6:
+            return jsonify({"success": False, "error": "Insufficient observations in display window"}), 404
+
+        obs_ts   = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
+        obs_vals = np.array([p for _, p in sel],               dtype=np.float64)
+
+        # Build padded frame series for each signal
+        pad_raw, pad_mask = _build_frame_series_with_gap_mask(
+            obs_ts, obs_vals, pad_frame_ts, cadence_sec, max_gap_sec=3600.0
+        )
+        lp_short_pad = _moving_average_nan(pad_raw, short_n)
+        lp_long_pad  = _moving_average_nan(pad_raw, win_n)
+        pad_prime    = lp_short_pad - lp_long_pad
+        pad_prime[~pad_mask] = np.nan
+
+        n = len(frame_ts)
+        raw_disp      = pad_raw[n_pad : n_pad + n]
+        lp_short_disp = lp_short_pad[n_pad : n_pad + n]
+        lp_long_disp  = lp_long_pad[n_pad : n_pad + n]
+        prime_disp    = pad_prime[n_pad : n_pad + n]
+
+        def _to_list(arr):
+            return [None if not np.isfinite(v) else round(float(v), 3) for v in arr]
+
+        # Actual observations within the display window for scatter plot
+        disp_obs = [
+            {"t": dt.isoformat(), "v": round(p, 3)}
+            for dt, p in points
+            if start_time <= dt <= end_time
+        ]
+
+        return jsonify({
+            "success": True,
+            "station_id": station_id,
+            "name": meta.get("name", station_id),
+            "state": meta.get("state", ""),
+            "lat": meta.get("lat"),
+            "lon": meta.get("lon"),
+            "frames": [ft.isoformat() for ft in frame_times],
+            "raw": _to_list(raw_disp),
+            "lp_short": _to_list(lp_short_disp),
+            "lp_long": _to_list(lp_long_disp),
+            "perturbation": _to_list(prime_disp),
+            "obs": disp_obs,
+        })
+    except Exception as e:
+        logger.error(f"Error fetching station pressure detail: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/asos/station-forecast')
 def api_asos_station_forecast():
     """Get forecast data for a specific ASOS station (all models)."""
@@ -7874,7 +9143,7 @@ def api_asos_station_observations():
 
 @app.route('/api/asos/station-obs-timeseries')
 def api_asos_station_obs_timeseries():
-    """Return per-time observations and model bias for a station/lead time."""
+    """Return per-time observations and bias time series for all models."""
     station_id = request.args.get('station_id', '').upper()
     model = request.args.get('model', 'gfs').lower()
     lead_time = int(request.args.get('lead_time', 24))
@@ -7894,11 +9163,12 @@ def api_asos_station_obs_timeseries():
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=30) if period == "monthly" else None
 
-        times = []
-        obs_temps = []
-        obs_precips = []
-        temp_bias = []
-        precip_bias = []
+        models = ["gfs", "aifs", "ifs", "nws"]
+        if model not in models:
+            model = "gfs"
+
+        station_obs = db.get("observations", {}).get(station_id, {})
+        records = []
 
         for run_key, run_data in runs.items():
             try:
@@ -7913,20 +9183,11 @@ def api_asos_station_obs_timeseries():
                 continue
             idx = forecast_hours.index(lead_time)
 
-            model_data = run_data.get(model, {})
-            fcst = model_data.get(station_id)
-            if not fcst:
-                continue
-
             valid_time = init_time + timedelta(hours=lead_time)
             if valid_time >= now:
                 continue
             if cutoff and valid_time < cutoff:
                 continue
-
-            # ASOS temps often report around :52; use wider window to match synoptic times.
-            # Use a wider window for temperature (ASOS often reports at :52)
-            station_obs = db.get("observations", {}).get(station_id, {})
 
             def _nearest_var(var_key, max_delta_minutes=90):
                 best_val = None
@@ -7949,31 +9210,57 @@ def api_asos_station_obs_timeseries():
             # For precip, use 6-hr accumulation logic (synoptic times)
             obs = asos.get_stored_observation(db, station_id, valid_time, max_delta_minutes=70)
             obs_precip = obs.get("precip_6hr") if obs else None
-            if not obs:
+
+            temp_biases = {}
+            precip_biases = {}
+            for m in models:
+                model_data = run_data.get(m, {})
+                fcst = model_data.get(station_id)
+                if not fcst:
+                    temp_biases[m] = None
+                    precip_biases[m] = None
+                    continue
+
+                fcst_temps = fcst.get("temps", [])
+                fcst_precips = fcst.get("precips", [])
+                fcst_temp = fcst_temps[idx] if idx < len(fcst_temps) else None
+                fcst_precip = fcst_precips[idx] if idx < len(fcst_precips) else None
+
+                temp_biases[m] = (fcst_temp - obs_temp) if (fcst_temp is not None and obs_temp is not None) else None
+                precip_biases[m] = (fcst_precip - obs_precip) if (fcst_precip is not None and obs_precip is not None) else None
+
+            # Keep timestamps where at least one variable/model bias is available.
+            if (
+                obs_temp is None and obs_precip is None
+                and all(v is None for v in temp_biases.values())
+                and all(v is None for v in precip_biases.values())
+            ):
                 continue
 
-            fcst_temps = fcst.get("temps", [])
-            fcst_precips = fcst.get("precips", [])
-            fcst_temp = fcst_temps[idx] if idx < len(fcst_temps) else None
-            fcst_precip = fcst_precips[idx] if idx < len(fcst_precips) else None
+            records.append((
+                valid_time.astimezone(timezone.utc).isoformat(),
+                obs_temp,
+                obs_precip,
+                temp_biases,
+                precip_biases,
+            ))
 
-
-            times.append(valid_time.astimezone(timezone.utc).isoformat())
-            obs_temps.append(obs_temp)
-            obs_precips.append(obs_precip)
-            temp_bias.append(
-                (fcst_temp - obs_temp) if (fcst_temp is not None and obs_temp is not None) else None
-            )
-            precip_bias.append(
-                (fcst_precip - obs_precip) if (fcst_precip is not None and obs_precip is not None) else None
-            )
-
-        if not times:
+        if not records:
             return jsonify({"success": False, "error": "No observations available for this station/lead time"}), 404
 
         # Sort by time
-        zipped = sorted(zip(times, obs_temps, obs_precips, temp_bias, precip_bias), key=lambda x: x[0])
-        times, obs_temps, obs_precips, temp_bias, precip_bias = zip(*zipped)
+        records.sort(key=lambda x: x[0])
+        times = [r[0] for r in records]
+        obs_temps = [r[1] for r in records]
+        obs_precips = [r[2] for r in records]
+
+        model_biases = {
+            m: {
+                "temp_bias": [r[3].get(m) for r in records],
+                "precip_bias": [r[4].get(m) for r in records],
+            }
+            for m in models
+        }
 
         return jsonify({
             "success": True,
@@ -7984,8 +9271,9 @@ def api_asos_station_obs_timeseries():
             "times": list(times),
             "obs_temps": list(obs_temps),
             "obs_precips": list(obs_precips),
-            "temp_bias": list(temp_bias),
-            "precip_bias": list(precip_bias)
+            "temp_bias": model_biases[model]["temp_bias"],
+            "precip_bias": model_biases[model]["precip_bias"],
+            "model_biases": model_biases
         })
     except Exception as e:
         logger.error(f"Error building station obs time series: {e}")
@@ -9435,6 +10723,479 @@ def api_rebuild_eof_cache():
     t = threading.Thread(target=_rebuild, daemon=True, name="eof-rebuild")
     t.start()
     return jsonify({"success": True, "message": "EOF cache rebuild started in background"})
+
+
+# ── NEXRAD MRMS radar endpoints ───────────────────────────────────────────────
+
+@app.route("/api/radar/metadata")
+def radar_metadata():
+    """Return valid time, geographic bounds, and cache status for the radar PNG."""
+    fresh = _radar.is_cache_fresh()
+    if not fresh:
+        # Return metadata even if stale so the frontend knows bounds
+        pass
+    r = _radar._cache   # read under lock for metadata (png_bytes not needed here)
+    with _radar._cache_lock:
+        vt    = _radar._cache["valid_time"]
+        err   = _radar._cache["error"]
+        ready = _radar._cache["png_bytes"] is not None
+
+    return jsonify({
+        "ready":      ready,
+        "valid_time": vt.isoformat() if vt else None,
+        "error":      err,
+        "bounds": [
+            [_radar.MRMS_BOUNDS["south"], _radar.MRMS_BOUNDS["west"]],
+            [_radar.MRMS_BOUNDS["north"], _radar.MRMS_BOUNDS["east"]],
+        ],
+        "cache_ttl": _radar.CACHE_TTL,
+    })
+
+
+@app.route("/api/radar/composite.png")
+def radar_composite_png():
+    """Serve the current MRMS reflectivity composite as a PNG."""
+    with _radar._cache_lock:
+        png_bytes  = _radar._cache["png_bytes"]
+        valid_time = _radar._cache["valid_time"]
+
+    if png_bytes is None:
+        return Response("Radar data not yet available", status=503,
+                        mimetype="text/plain")
+
+    resp = Response(png_bytes, mimetype="image/png")
+    resp.headers["Cache-Control"] = f"public, max-age={_radar.CACHE_TTL}"
+    resp.headers["X-Radar-Valid-Time"] = (
+        valid_time.isoformat() if valid_time else "unknown"
+    )
+    return resp
+
+
+# Start background MRMS refresh so the first request doesn't block.
+_radar.start_background_refresh()
+
+
+# ── Archived radar frame endpoints ────────────────────────────────────────────
+
+RADAR_FRAMES_DIR = DATA_DIR / "radar_frames"
+
+RADAR_ARCHIVE_PRODUCTS = frozenset([
+    "precip",
+    "klwx_sr_bref", "klwx_sr_bvel", "klwx_bdhc",
+    "tiad_bref1", "tiad_brefl", "tiad_bvel",
+])
+
+
+@app.route("/api/radar/frames/<product>/index")
+def radar_frames_index(product):
+    """Return the frame index for an archived radar product."""
+    if product not in RADAR_ARCHIVE_PRODUCTS:
+        return Response("Unknown product", status=404, mimetype="text/plain")
+    index_file = RADAR_FRAMES_DIR / product / "index.json"
+    if not index_file.exists():
+        return jsonify({"product": product, "frames": [], "ready": False})
+    try:
+        data = json.loads(index_file.read_text())
+        data["ready"] = len(data.get("frames", [])) > 0
+        return jsonify(data)
+    except Exception as e:
+        logger.error("Failed to read radar index for %s: %s", product, e)
+        return jsonify({"product": product, "frames": [], "ready": False})
+
+
+@app.route("/api/radar/frames/<product>/<filename>")
+def radar_frames_file(product, filename):
+    """Serve an archived radar PNG frame (immutable, aggressive caching)."""
+    if product not in RADAR_ARCHIVE_PRODUCTS:
+        return Response("Unknown product", status=404, mimetype="text/plain")
+    if (
+        not filename.endswith(".png")
+        or "/" in filename
+        or "\\" in filename
+        or ".." in filename
+    ):
+        return Response("Invalid filename", status=400, mimetype="text/plain")
+    frame_path = RADAR_FRAMES_DIR / product / filename
+    if not frame_path.exists():
+        return Response("Frame not found", status=404, mimetype="text/plain")
+    try:
+        png_bytes = frame_path.read_bytes()
+    except OSError as e:
+        logger.error("Could not read frame %s/%s: %s", product, filename, e)
+        return Response("Frame unavailable", status=503, mimetype="text/plain")
+    resp = Response(png_bytes, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+# ── GOES-R GLM lightning endpoint ─────────────────────────────────────────────
+
+import xml.etree.ElementTree as _ET
+import tempfile as _tempfile
+
+_GLM_BUCKET = {
+    "goes19": "https://noaa-goes19.s3.amazonaws.com",  # GOES-East (primary)
+    "goes18": "https://noaa-goes18.s3.amazonaws.com",  # GOES-West
+}
+_GLM_WINDOW_MIN = 10  # minutes of history to keep
+
+_glm_state = {sat: {"last_key": None, "flashes": []} for sat in _GLM_BUCKET}
+_glm_updated: Optional[str] = None
+_glm_lock    = threading.Lock()
+_glm_nc_lock = threading.Lock()  # netCDF4/HDF5 is not fully thread-safe
+
+
+def _glm_key_time(key: str) -> datetime:
+    """Parse valid_time from a GLM S3 key filename (OR_GLM-L2-LCFA_Gxx_sYYYYDDDHHMMSSf_…)."""
+    fname = key.rsplit("/", 1)[-1]
+    start = fname.split("_s")[1][:13]  # YYYYDDDHHMMSSS → first 13 chars = YYYYDDDHHMMSSf
+    return datetime.strptime(start[:13], "%Y%j%H%M%S").replace(tzinfo=timezone.utc)
+
+
+def _list_glm_keys(satellite: str, cutoff: datetime) -> list:
+    """Return all GLM S3 keys between cutoff and now, sorted ascending."""
+    bucket = _GLM_BUCKET[satellite]
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    now = datetime.now(timezone.utc)
+
+    # Build the set of hour-prefixes we need to query
+    prefixes, t = set(), cutoff
+    while t <= now + timedelta(minutes=1):
+        doy = t.timetuple().tm_yday
+        prefixes.add(f"GLM-L2-LCFA/{t.year}/{doy:03d}/{t.hour:02d}/")
+        t += timedelta(hours=1)
+
+    all_keys = []
+    for prefix in sorted(prefixes):
+        try:
+            r = requests.get(f"{bucket}?prefix={prefix}", timeout=10)
+            root = _ET.fromstring(r.text)
+            all_keys.extend(el.text for el in root.findall(".//s3:Key", ns) if el.text and el.text.endswith(".nc"))
+        except Exception as exc:
+            logger.warning("GLM key listing failed for %s %s: %s", satellite, prefix, exc)
+
+    return sorted(k for k in all_keys if _glm_key_time(k) >= cutoff)
+
+
+def _parse_glm_nc(url: str, file_start: datetime) -> list:
+    """Download one GLM NetCDF and return list of flash dicts with lat/lon/t."""
+    import netCDF4 as _nc4
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    with _tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as fh:
+        fh.write(r.content)
+        tmp = fh.name
+    try:
+        with _glm_nc_lock:  # HDF5 open/close not thread-safe
+            ds = _nc4.Dataset(tmp)
+            lats    = ds.variables["flash_lat"][:].tolist()
+            lons    = ds.variables["flash_lon"][:].tolist()
+            offsets = ds.variables["flash_time_offset_of_first_event"][:].tolist()
+            ds.close()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    flashes = []
+    for lat, lon, off in zip(lats, lons, offsets):
+        t = file_start + timedelta(seconds=float(off))
+        flashes.append({"lat": round(float(lat), 4), "lon": round(float(lon), 4), "t": t.isoformat()})
+    return flashes
+
+
+def _refresh_glm_cache() -> list:
+    """Incrementally fetch new GLM files and return combined flash list."""
+    global _glm_updated
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=_GLM_WINDOW_MIN)
+
+    for satellite, state in _glm_state.items():
+        bucket = _GLM_BUCKET[satellite]
+        try:
+            keys = _list_glm_keys(satellite, cutoff)
+        except Exception as exc:
+            logger.warning("Could not list GLM keys for %s: %s", satellite, exc)
+            keys = []
+
+        # Only download files we haven't processed yet
+        new_keys = [k for k in keys if state["last_key"] is None or k > state["last_key"]]
+
+        if new_keys:
+            # Parallel download for fast first load
+            def _fetch(key):
+                file_start = _glm_key_time(key)
+                return key, _parse_glm_nc(f"{bucket}/{key}", file_start)
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(_fetch, k): k for k in new_keys}
+                results = {}
+                for fut in as_completed(futures):
+                    try:
+                        key, flashes = fut.result()
+                        results[key] = flashes
+                    except Exception as exc:
+                        logger.warning("GLM parse failed for %s %s: %s", satellite, futures[fut], exc)
+
+            for key in new_keys:
+                if key in results:
+                    state["flashes"].extend(results[key])
+            state["last_key"] = new_keys[-1]
+
+        # Prune to the rolling window
+        state["flashes"] = [
+            f for f in state["flashes"]
+            if datetime.fromisoformat(f["t"]) >= cutoff
+        ]
+
+    _glm_updated = now.isoformat()
+    combined = _glm_state["goes19"]["flashes"] + _glm_state["goes18"]["flashes"]
+    return combined
+
+
+_LIGHTNING_DIR = DATA_DIR / "lightning"
+
+
+@app.route("/api/lightning/history")
+def lightning_history():
+    """Return archived CONUS flashes from the last N hours (max 24). Served from JSONL archive."""
+    try:
+        hours = max(1, min(int(request.args.get("hours", 1)), 24))
+    except ValueError:
+        hours = 1
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    flashes = []
+    now = datetime.now(timezone.utc)
+    for delta in range(2):  # today + yesterday
+        day  = (now - timedelta(days=delta)).strftime("%Y%m%d")
+        path = _LIGHTNING_DIR / f"{day}.jsonl"
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text().splitlines():
+                try:
+                    f = json.loads(line)
+                    if datetime.fromisoformat(f["t"]) >= cutoff:
+                        flashes.append(f)
+                except Exception:
+                    pass
+        except OSError:
+            pass
+    return jsonify({"flashes": flashes, "count": len(flashes), "hours": hours})
+
+
+@app.route("/api/lightning/fairfax")
+def lightning_fairfax():
+    """Return lightning strikes within 50 mi of Fairfax VA in the last 60 minutes."""
+    path = _LIGHTNING_DIR / "fairfax_proximity.json"
+    if not path.exists():
+        return jsonify({"flashes": [], "count": 0, "radius_mi": 50})
+    try:
+        flashes = json.loads(path.read_text())
+        cutoff  = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+        flashes = [f for f in flashes if f["t"] >= cutoff]
+    except Exception:
+        flashes = []
+    return jsonify({"flashes": flashes, "count": len(flashes), "radius_mi": 50})
+
+
+@app.route("/api/lightning")
+def lightning_flashes():
+    """Return GOES-R GLM flash locations for the last 15 minutes (both East + West)."""
+    with _glm_lock:
+        flashes = _refresh_glm_cache()
+    return jsonify({"flashes": flashes, "count": len(flashes), "updated": _glm_updated,
+                    "window_min": _GLM_WINDOW_MIN})
+
+
+@app.route("/api/lightning/window")
+def lightning_window():
+    """Return archived GLM flashes within a time window centered on a given timestamp.
+
+    Query params:
+      t          — ISO 8601 center time (required)
+      window_min — total window width in minutes (default 10, max 60)
+    """
+    t_str = request.args.get("t", "")
+    try:
+        center = datetime.fromisoformat(t_str)
+        if center.tzinfo is None:
+            center = center.replace(tzinfo=timezone.utc)
+    except Exception:
+        return jsonify({"error": "invalid or missing 't' parameter"}), 400
+
+    try:
+        window_min = max(1, min(int(request.args.get("window_min", 10)), 60))
+    except ValueError:
+        window_min = 10
+
+    half    = timedelta(minutes=window_min / 2)
+    t_start = center - half
+    t_end   = center + half
+
+    flashes = []
+    for delta in range(2):   # handle midnight boundary
+        day  = (center - timedelta(days=delta)).strftime("%Y%m%d")
+        path = _LIGHTNING_DIR / f"{day}.jsonl"
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text().splitlines():
+                try:
+                    f  = json.loads(line)
+                    ft = datetime.fromisoformat(f["t"])
+                    if t_start <= ft <= t_end:
+                        flashes.append(f)
+                except Exception:
+                    pass
+        except OSError:
+            pass
+
+    return jsonify({
+        "flashes":    flashes,
+        "count":      len(flashes),
+        "center":     center.isoformat(),
+        "window_min": window_min,
+    })
+
+
+@app.route("/api/radar/export-gif", methods=["POST"])
+def export_radar_gif():
+    """Generate an animated GIF of the current loop cropped to the requested viewport.
+
+    Request JSON:
+      product_key  — archive subdirectory key (e.g. "precip", "klwx_sr_bref")
+      frames       — list of {f: filename, t: ISO timestamp}
+      bounds       — {south, north, west, east} in decimal degrees (Leaflet viewport)
+      delay_ms     — ms per frame (default 500)
+    """
+    import io as _io
+    import math as _math
+    from PIL import Image, ImageDraw
+
+    try:
+        body        = request.get_json(force=True)
+        product_key = body["product_key"]
+        frame_list  = body["frames"]
+        vp          = body["bounds"]
+        delay_ms    = max(100, min(int(body.get("delay_ms", 500)), 5000))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    # Geographic bounds and projection type for each archived product.
+    # mercator=True  → rows are linearly spaced in Mercator y (MRMS, post-reprojection)
+    # mercator=False → rows are linearly spaced in latitude  (WMS EPSG:4326)
+    _PRODUCT_META = {
+        "precip":       {"bounds": {"south": 20.005, "north": 54.995, "west": -130.005, "east": -60.005}, "mercator": True},
+        "klwx_sr_bref": {"bounds": {"south": 33.977, "north": 43.976, "west": -82.487,  "east": -72.488}, "mercator": False},
+        "klwx_sr_bvel": {"bounds": {"south": 33.977, "north": 43.976, "west": -82.487,  "east": -72.488}, "mercator": False},
+        "klwx_bdhc":    {"bounds": {"south": 33.977, "north": 43.976, "west": -82.487,  "east": -72.488}, "mercator": False},
+        "tiad_bref1":   {"bounds": {"south": 38.084, "north": 40.084, "west": -78.529,  "east": -76.529}, "mercator": False},
+        "tiad_brefl":   {"bounds": {"south": 35.084, "north": 43.084, "west": -81.529,  "east": -73.529}, "mercator": False},
+        "tiad_bvel":    {"bounds": {"south": 38.084, "north": 40.084, "west": -78.529,  "east": -76.529}, "mercator": False},
+    }
+
+    meta = _PRODUCT_META.get(product_key)
+    if not meta:
+        return jsonify({"error": f"Unknown product key: {product_key!r}"}), 400
+
+    pb           = meta["bounds"]
+    use_mercator = meta["mercator"]
+
+    # Clamp requested viewport to the product's coverage area
+    south = max(vp.get("south", pb["south"]), pb["south"])
+    north = min(vp.get("north", pb["north"]), pb["north"])
+    west  = max(vp.get("west",  pb["west"]),  pb["west"])
+    east  = min(vp.get("east",  pb["east"]),  pb["east"])
+
+    if south >= north or west >= east:
+        return jsonify({"error": "Viewport does not overlap product bounds"}), 400
+
+    def _merc_y(lat_deg):
+        return _math.log(_math.tan(_math.pi / 4 + _math.radians(lat_deg) / 2))
+
+    product_dir = DATA_DIR / "radar_frames" / product_key
+    gif_frames  = []
+
+    for frame in frame_list[:288]:   # hard cap at 288 frames
+        frame_path = product_dir / frame.get("f", "")
+        if not frame_path.exists():
+            continue
+        try:
+            img  = Image.open(frame_path).convert("RGBA")
+            W, H = img.size
+
+            # Compute crop box in pixel coordinates
+            if use_mercator:
+                y_n    = _merc_y(pb["north"])
+                y_s    = _merc_y(pb["south"])
+                top    = int((y_n - _merc_y(north)) / (y_n - y_s) * H)
+                bottom = int((y_n - _merc_y(south)) / (y_n - y_s) * H)
+            else:
+                lat_range = pb["north"] - pb["south"]
+                top    = int((pb["north"] - north) / lat_range * H)
+                bottom = int((pb["north"] - south) / lat_range * H)
+
+            lon_range = pb["east"] - pb["west"]
+            left  = int((west - pb["west"]) / lon_range * W)
+            right = int((east - pb["west"]) / lon_range * W)
+
+            top, bottom = max(0, top),   min(H, bottom)
+            left, right = max(0, left),  min(W, right)
+            if bottom <= top or right <= left:
+                continue
+
+            cropped = img.crop((left, top, right, bottom))
+
+            # Scale down if wider than 900 px to keep GIF file size reasonable
+            cW, cH = cropped.size
+            if cW > 900:
+                scale   = 900 / cW
+                cropped = cropped.resize((900, int(cH * scale)), Image.LANCZOS)
+
+            # Composite radar (RGBA) onto the dark map background colour
+            bg        = Image.new("RGBA", cropped.size, (26, 26, 46, 255))
+            composite = Image.alpha_composite(bg, cropped)
+
+            # Burn timestamp into the bottom-left corner
+            t_str = frame.get("t", "")
+            if t_str:
+                try:
+                    dt    = datetime.fromisoformat(t_str)
+                    label = dt.strftime("%Y-%m-%d %H:%M UTC")
+                    draw  = ImageDraw.Draw(composite)
+                    tw    = len(label) * 7 + 8
+                    draw.rectangle([(4, composite.height - 22), (tw, composite.height - 4)],
+                                   fill=(0, 0, 0, 180))
+                    draw.text((6, composite.height - 20), label, fill=(255, 255, 255))
+                except Exception:
+                    pass
+
+            gif_frames.append(composite.convert("RGB").quantize(colors=256,
+                                                                  dither=Image.Dither.NONE))
+        except Exception as e:
+            logger.warning("GIF export: skipping frame %s: %s", frame.get("f"), e)
+
+    if not gif_frames:
+        return jsonify({"error": "No frames could be read for this product"}), 500
+
+    buf = _io.BytesIO()
+    gif_frames[0].save(
+        buf, format="GIF",
+        save_all=True,
+        append_images=gif_frames[1:],
+        loop=0,
+        duration=delay_ms,
+        optimize=False,
+    )
+    buf.seek(0)
+
+    ts       = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    filename = f"radar_{product_key}_{ts}.gif"
+    return send_file(buf, mimetype="image/gif", as_attachment=True,
+                     download_name=filename)
 
 
 if __name__ == '__main__':

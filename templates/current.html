@@ -339,6 +339,117 @@
         to { transform: rotate(360deg); }
     }
 
+    .weather-tabs {
+        border-bottom: 1px solid #e5e7eb;
+        margin-bottom: 20px;
+    }
+    .weather-tabs .nav-link {
+        color: #4b5563;
+        border: none;
+        border-bottom: 3px solid transparent;
+        border-radius: 0;
+        padding: 10px 22px;
+        font-weight: 500;
+        background: none;
+    }
+    .weather-tabs .nav-link:hover {
+        color: #2f6b86;
+        border-bottom-color: #b3d4e4;
+    }
+    .weather-tabs .nav-link.active {
+        color: #2f6b86;
+        border-bottom-color: #2f6b86;
+        background: none;
+    }
+
+    #radar-map {
+        height: 620px;
+        border-radius: 12px;
+        overflow: hidden;
+        background: #1a2a3a;
+    }
+    #gravity-map {
+        height: 620px;
+        border-radius: 12px;
+        overflow: hidden;
+        background: #0f172a;
+    }
+    .gravity-card {
+        border-radius: 16px;
+        border: 1px solid #e5e7eb;
+        background: #ffffff;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        overflow: hidden;
+    }
+    .gravity-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px;
+        background: #f8fafc;
+        border-bottom: 1px solid #e5e7eb;
+        flex-wrap: wrap;
+    }
+    .gravity-status {
+        font-size: 0.88rem;
+        color: #4b5563;
+    }
+    #loop-controls {
+        background: #0f172a;
+        border-bottom: 1px solid #1e293b;
+        padding: 8px 14px;
+    }
+    #loop-controls select {
+        background: #1e293b;
+        color: #e2e8f0;
+        border: 1px solid #334155;
+        border-radius: 4px;
+        padding: 2px 6px;
+        font-size: 0.8rem;
+    }
+    #loop-scrubber {
+        flex: 1;
+        min-width: 80px;
+        accent-color: #3b82f6;
+    }
+    #loop-fill-track {
+        background: #1e293b;
+        border-radius: 4px;
+        height: 6px;
+        overflow: hidden;
+        margin-top: 4px;
+    }
+    #live-loop-toggle .btn.active {
+        background: #3b82f6 !important;
+        color: #fff !important;
+        border-color: #3b82f6 !important;
+    }
+    #btn-lightning.active {
+        background: #facc15 !important;
+        color: #0f172a !important;
+        border-color: #facc15 !important;
+    }
+    .radar-card {
+        border-radius: 16px;
+        border: 1px solid #e5e7eb;
+        background: #ffffff;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        overflow: hidden;
+    }
+    .radar-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 16px;
+        background: #f8fafc;
+        border-bottom: 1px solid #e5e7eb;
+        flex-wrap: wrap;
+    }
+    #radar-timestamp {
+        font-size: 0.88rem;
+        color: #4b5563;
+    }
+
     @media (max-width: 768px) {
         .hero-main {
             grid-template-columns: 1fr;
@@ -348,11 +459,36 @@
             width: 110px;
             height: 110px;
         }
+        #radar-map { height: 420px; }
+        #gravity-map { height: 420px; }
     }
 </style>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 {% endblock %}
 
 {% block content %}
+<ul class="nav weather-tabs" id="currentWeatherTabs">
+    <li class="nav-item">
+        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-conditions">
+            <i class="bi bi-thermometer-half me-1"></i>Current Conditions
+        </button>
+    </li>
+    <li class="nav-item">
+        <button class="nav-link" id="radarTabBtn" data-bs-toggle="tab" data-bs-target="#tab-radar">
+            <i class="bi bi-broadcast me-1"></i>National Radar
+        </button>
+    </li>
+    <li class="nav-item">
+        <button class="nav-link" id="gravityTabBtn" data-bs-toggle="tab" data-bs-target="#tab-gravity">
+            <i class="bi bi-water me-1"></i>Gravity Waves
+        </button>
+    </li>
+</ul>
+
+<div class="tab-content">
+
+<div class="tab-pane fade show active" id="tab-conditions">
+
 <div class="current-hero">
     <div class="d-flex justify-content-between align-items-start flex-wrap gap-3">
         <div>
@@ -435,7 +571,7 @@
             <div class="almanac-item"><span>Moon Phase</span><strong id="almanacMoonPhase">--</strong></div>
         </div>
     </div>
-</div>
+</div><!-- /.current-hero -->
 
 <div id="loadingState" class="loading-spinner">
     <div class="text-center">
@@ -532,9 +668,162 @@
         </div>
     </div>
 </div>
+
+</div><!-- /#tab-conditions -->
+
+<div class="tab-pane fade" id="tab-radar">
+    <div class="radar-card">
+        <div class="radar-toolbar">
+            <span id="radar-timestamp">Initializing...</span>
+            <div id="live-loop-toggle" class="ms-auto d-flex gap-1" style="display:none!important;">
+                <button id="btn-live" class="btn btn-sm active" onclick="setRadarMode('live')"
+                    style="background:#3b82f6;color:#fff;border-color:#3b82f6;">Live</button>
+                <button id="btn-loop" class="btn btn-sm" onclick="setRadarMode('loop')"
+                    style="background:#1e293b;color:#e2e8f0;border-color:#334155;">24h Loop</button>
+            </div>
+            <button id="btn-lightning" class="btn btn-sm"
+                onclick="toggleLightning()"
+                title="Show GOES-R GLM lightning (last 15 min)"
+                style="background:#1e293b;color:#e2e8f0;border-color:#334155;">⚡ Lightning</button>
+            <select id="radar-product-select" class="form-select form-select-sm" style="width:auto;background:#1e293b;color:#e2e8f0;border-color:#334155;" onchange="switchRadarProduct(this.value)">
+                <optgroup label="MRMS National">
+                    <option value="mrms-composite">Composite Reflectivity</option>
+                    <option value="mrms-precip">Precipitation Rate</option>
+                </optgroup>
+                <optgroup label="KLWX — WSR-88D (Sterling VA)">
+                    <option value="klwx-sr-bref">Super-Res Reflectivity</option>
+                    <option value="klwx-sr-bvel">Super-Res Velocity</option>
+                    <option value="klwx-bdhc">Hydrometeor Classification</option>
+                </optgroup>
+                <optgroup label="TIAD — TDWR (Dulles Airport)">
+                    <option value="tiad-bref1">Base Reflectivity</option>
+                    <option value="tiad-brefl">Long-Range Reflectivity</option>
+                    <option value="tiad-bvel">Base Velocity</option>
+                </optgroup>
+            </select>
+        </div>
+        <!-- Loop playback controls (hidden in live mode) -->
+        <div id="loop-controls" style="display:none;">
+            <div class="d-flex align-items-center gap-2 flex-wrap">
+                <button class="btn btn-sm btn-dark" onclick="loopFirst()" title="First frame">⏮</button>
+                <button class="btn btn-sm btn-primary" id="loop-btn-play" onclick="toggleLoopPlay()">▶</button>
+                <button class="btn btn-sm btn-dark" onclick="loopLast()" title="Last frame">⏭</button>
+                <input type="range" id="loop-scrubber" min="0" max="0" value="0" oninput="loopScrub(this.value)">
+                <span id="loop-frame-count" style="font-size:0.8rem;color:#94a3b8;white-space:nowrap;">-- / --</span>
+                <span id="loop-timestamp" style="font-size:0.8rem;color:#e2e8f0;white-space:nowrap;">--</span>
+                <select id="loop-speed" onchange="setLoopSpeed(this.value)">
+                    <option value="0.5">0.5×</option>
+                    <option value="1" selected>1×</option>
+                    <option value="2">2×</option>
+                    <option value="4">4×</option>
+                </select>
+                <button id="btn-export-gif" class="btn btn-sm"
+                    onclick="exportLoopGif()"
+                    title="Export current loop as animated GIF (cropped to visible map area)"
+                    style="background:#1e293b;color:#e2e8f0;border-color:#334155;margin-left:4px;">⬇ GIF</button>
+            </div>
+            <div style="margin-top:6px;">
+                <div id="loop-fill-track">
+                    <div id="loop-fill-bar" style="height:100%;background:#3b82f6;width:0%;transition:width 0.3s;"></div>
+                </div>
+                <div id="loop-fill-label" style="font-size:0.72rem;color:#64748b;margin-top:2px;">0 / 288 frames (0%)</div>
+            </div>
+        </div>
+        <div style="padding:6px 14px 8px;background:#1a1a2e;display:flex;align-items:center;flex-wrap:wrap;gap:2px;" id="radar-legend"></div>
+        <div id="radar-map"></div>
+    </div>
+</div><!-- /#tab-radar -->
+
+<div class="tab-pane fade" id="tab-gravity">
+    <div class="gravity-card">
+        <!-- Source subtabs -->
+        <div class="d-flex border-bottom px-3 pt-2" style="gap:0;">
+            <button id="gravity-src-metar" class="btn btn-sm px-3 py-1 gravity-src-btn active"
+                    style="border-radius:6px 6px 0 0;border:1px solid #dee2e6;border-bottom:none;background:#fff;font-size:0.82rem;">
+                5-min METAR <span class="badge bg-success ms-1" style="font-size:0.7rem;">Live</span>
+            </button>
+            <button id="gravity-src-1min" class="btn btn-sm px-3 py-1 gravity-src-btn"
+                    style="border-radius:6px 6px 0 0;border:1px solid transparent;background:transparent;font-size:0.82rem;color:#6b7280;">
+                1-min Historical <span class="badge bg-secondary ms-1" style="font-size:0.7rem;">28-42h delay</span>
+            </button>
+        </div>
+        <div class="gravity-toolbar">
+            <span id="gravity-status" class="gravity-status">Initializing...</span>
+            <div class="ms-auto d-flex align-items-center gap-2 flex-wrap">
+                <label class="small text-muted mb-0" for="gravity-method">Filter:</label>
+                <select id="gravity-method" class="form-select form-select-sm" style="width:auto;">
+                    <option value="bandpass" selected>Band-pass (10-180 min)</option>
+                    <option value="running_mean">Running mean subtraction</option>
+                </select>
+                <label class="small text-muted mb-0" for="gravity-history">Range:</label>
+                <select id="gravity-history" class="form-select form-select-sm" style="width:auto;">
+                    <option value="24" selected>24h</option>
+                    <option value="72">3 days</option>
+                    <option value="168">7 days</option>
+                    <option value="336">14 days</option>
+                    <option value="720">30 days</option>
+                    <option value="2160">90 days</option>
+                    <option value="max">Max available</option>
+                </select>
+                <label class="small text-muted mb-0" for="gravity-window">Background:</label>
+                <select id="gravity-window" class="form-select form-select-sm" style="width:auto;">
+                    <option value="60">1h running mean</option>
+                    <option value="120">2h running mean</option>
+                    <option value="180" selected>3h running mean</option>
+                    <option value="360">6h running mean</option>
+                </select>
+                <button class="btn btn-sm btn-outline-primary" id="gravity-reload-btn">Reload</button>
+                <button class="btn btn-sm btn-primary" id="gravity-play-btn">Pause</button>
+            </div>
+            <div class="w-100 d-flex align-items-center gap-2">
+                <input type="range" id="gravity-scrubber" min="0" max="0" value="0" style="width:100%;">
+                <span id="gravity-frame-count" class="small text-muted" style="min-width:88px;">0 / 0</span>
+            </div>
+        </div>
+        <div id="gravity-map"></div>
+        <div class="px-3 py-2 border-top d-flex align-items-center gap-3 flex-wrap" style="font-size:0.82rem;color:#4b5563;background:#f8fafc;">
+            <span><code>p' = LP(10m) − LP(180m)</code></span>
+            <div class="d-flex align-items-center gap-1">
+                <span style="font-size:0.78rem;color:#4b5563;">−3 mb</span>
+                <div style="width:210px;height:12px;border-radius:4px;background:linear-gradient(to right,rgb(30,64,255),rgb(105,128,255),rgb(180,191,255),rgb(255,255,255),rgb(255,187,187),rgb(255,118,118),rgb(255,50,50));border:1px solid #d1d5db;"></div>
+                <span style="font-size:0.78rem;color:#4b5563;">+3 mb</span>
+            </div>
+            <span style="color:#9ca3af;">grey = no data</span>
+        </div>
+    </div>
+</div><!-- /#tab-gravity -->
+
+</div><!-- /.tab-content -->
+
+<!-- Station pressure detail modal -->
+<div class="modal fade" id="stationPressureModal" tabindex="-1" aria-labelledby="stationPressureModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header py-2 px-3">
+                <h6 class="modal-title mb-0" id="stationPressureModalLabel">Station Pressure</h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body px-3 pt-3 pb-2">
+                <div id="stationPressureLoading" class="text-center text-muted py-4">
+                    <div class="spinner-border spinner-border-sm me-2" role="status"></div>Loading…
+                </div>
+                <div id="stationPressureError" class="alert alert-danger d-none"></div>
+                <div id="stationPressureCharts" style="display:none;">
+                    <div id="stationPressureRawNote" class="d-none text-muted small mb-2" style="font-style:italic;">
+                        Raw 1-min pressure observations unavailable (IEM sync failure for this station) — showing last-synced perturbation only.
+                    </div>
+                    <canvas id="stationPressureChart" style="max-height:260px;"></canvas>
+                    <canvas id="stationPerturbationChart" style="max-height:180px;margin-top:8px;"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 {% endblock %}
 
 {% block extra_js %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 function formatValue(value, decimals = 0, suffix = '') {
     if (value === null || value === undefined) return '--';
@@ -721,5 +1010,1244 @@ async function loadCurrentWeather() {
 
 loadCurrentWeather();
 setInterval(loadCurrentWeather, 5 * 60 * 1000);
+
+// ── National Radar (NEXRAD MRMS via NOAA AWS) ────────────────────────────────
+
+let radarMap         = null;
+let radarOverlay     = null;   // current L.imageOverlay
+let radarInitialized = false;
+let radarPollTimer   = null;
+let radarRefreshTimer = null;
+let radarLastValidTime = null;
+let currentProduct   = 'mrms-composite';
+let wmsLayer         = null;
+let wmsRefreshTimer  = null;
+
+const RADAR_BOUNDS = [[20.005, -130.005], [54.995, -60.005]];
+const RADAR_METADATA_URL  = '/api/radar/metadata';
+const RADAR_COMPOSITE_URL = '/api/radar/composite.png';
+
+async function initRadarMap() {
+    if (radarInitialized) return;
+    radarInitialized = true;
+
+    radarMap = L.map('radar-map', {
+        center: [38.5, -97],
+        zoom: 4,
+        minZoom: 3,
+        maxZoom: 10,
+        zoomControl: true,
+    });
+
+    // Dark basemap so radar colors pop
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; <a href="https://carto.com/">CARTO</a> | ' +
+                     'Radar: <a href="https://www.nssl.noaa.gov/projects/mrms/">NOAA MRMS</a>',
+        subdomains: 'abcd',
+        maxZoom: 19,
+    }).addTo(radarMap);
+
+    // Labels overlay (roads/cities on top of radar)
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png', {
+        subdomains: 'abcd',
+        pane: 'overlayPane',
+        zIndex: 500,
+    }).addTo(radarMap);
+
+    // Start polling for data readiness
+    setStatusMessage('Fetching NEXRAD MRMS data from NOAA AWS...', 'loading');
+    pollForRadarReady();
+}
+
+function setStatusMessage(msg, type) {
+    const el = document.getElementById('radar-timestamp');
+    if (!el) return;
+    if (type === 'loading') {
+        el.innerHTML = `<span class="text-muted"><span class="spinner-border spinner-border-sm me-1" role="status"></span>${msg}</span>`;
+    } else if (type === 'error') {
+        el.innerHTML = `<span class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>${msg}</span>`;
+    } else {
+        el.textContent = msg;
+    }
+}
+
+async function fetchRadarMetadata() {
+    const r = await fetch(RADAR_METADATA_URL);
+    if (!r.ok) throw new Error(`Metadata fetch failed: ${r.status}`);
+    return r.json();
+}
+
+async function refreshRadarImage(validTime) {
+    if (!radarMap) return;
+
+    // Cache-bust with the valid time so the browser fetches the new frame
+    const url = `${RADAR_COMPOSITE_URL}?t=${encodeURIComponent(validTime || Date.now())}`;
+
+    // Pre-load image before swapping to avoid flicker
+    await new Promise((resolve, reject) => {
+        const img = new window.Image();
+        img.onload  = resolve;
+        img.onerror = reject;
+        img.src     = url;
+    });
+
+    if (radarOverlay && radarMap.hasLayer(radarOverlay)) {
+        radarMap.removeLayer(radarOverlay);
+    }
+    radarOverlay = L.imageOverlay(url, RADAR_BOUNDS, {
+        opacity:     0.8,
+        interactive: false,
+        zIndex:      200,
+    });
+    // Only show when MRMS composite is the active product
+    if (currentProduct === 'mrms-composite') {
+        radarOverlay.addTo(radarMap);
+    }
+
+    if (validTime) {
+        const dt = new Date(validTime);
+        const label = dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' })
+                    + ' ' + dt.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' })
+                    + ' UTC · NOAA MRMS Composite Reflectivity';
+        setStatusMessage(label, 'ok');
+        radarLastValidTime = validTime;
+    }
+}
+
+async function pollForRadarReady() {
+    // Poll every 5 s until the backend has a PNG ready, then switch to
+    // periodic refresh every CACHE_TTL seconds.
+    const MAX_POLLS = 60;  // 5 min timeout
+    let polls = 0;
+
+    const poll = async () => {
+        try {
+            const meta = await fetchRadarMetadata();
+            if (meta.ready) {
+                clearTimeout(radarPollTimer);
+                await refreshRadarImage(meta.valid_time);
+                scheduleRadarRefresh(meta.cache_ttl || 120);
+            } else if (polls++ < MAX_POLLS) {
+                radarPollTimer = setTimeout(poll, 5000);
+            } else {
+                setStatusMessage('Radar data unavailable — NOAA server may be slow', 'error');
+            }
+        } catch (e) {
+            console.error('Radar poll error:', e);
+            if (polls++ < MAX_POLLS) {
+                radarPollTimer = setTimeout(poll, 10000);
+            }
+        }
+    };
+
+    await poll();
+}
+
+function scheduleRadarRefresh(ttlSeconds) {
+    clearTimeout(radarRefreshTimer);
+    radarRefreshTimer = setTimeout(async () => {
+        try {
+            if (currentProduct === 'mrms-composite') {
+                const meta = await fetchRadarMetadata();
+                if (meta.ready && meta.valid_time !== radarLastValidTime) {
+                    await refreshRadarImage(meta.valid_time);
+                }
+            }
+        } catch (e) {
+            console.error('Radar refresh error:', e);
+        }
+        scheduleRadarRefresh(ttlSeconds);
+    }, ttlSeconds * 1000);
+}
+
+// ── Colormap legend ───────────────────────────────────────────────────────────
+
+function buildRadarLegend() {
+    const stops = [
+        [5,  '#04e9e7', '5'],
+        [10, '#019ff4', '10'],
+        [15, '#0211d4', '15'],
+        [20, '#02fd02', '20'],
+        [25, '#01c501', '25'],
+        [30, '#008301', '30'],
+        [35, '#ffff00', '35'],
+        [40, '#e7c000', '40'],
+        [45, '#ff9000', '45'],
+        [50, '#ff0000', '50'],
+        [55, '#d40000', '55'],
+        [60, '#c00000', '60'],
+        [65, '#ff00ff', '65'],
+        [70, '#9955c9', '70'],
+        [75, '#ffffff', '75+'],
+    ];
+    const cells = stops.map(([, color, label]) =>
+        `<span style="display:inline-block;width:22px;height:14px;background:${color};"></span><span style="font-size:0.7rem;color:#ccc;margin-right:4px;">${label}</span>`
+    ).join('');
+    const el = document.getElementById('radar-legend');
+    if (el) {
+        el.innerHTML = `<span style="font-size:0.7rem;color:#aaa;margin-right:6px;">dBZ:</span>${cells}`;
+        if (lightningEnabled) el.innerHTML += _lightningLegendHTML();
+    }
+}
+
+// ── Radar product switcher ────────────────────────────────────────────────────
+
+const WMS_BASE = 'https://opengeo.ncep.noaa.gov/geoserver';
+
+// archiveKey matches the product subdirectory under /api/radar/frames/
+// loopBounds is [[south,west],[north,east]] for the imageOverlay when looping
+const RADAR_PRODUCTS = {
+    'mrms-composite': {
+        type: 'mrms',  label: 'NOAA MRMS Composite Reflectivity', legend: 'dbz',
+    },
+    'mrms-precip': {
+        type: 'precip', label: 'NOAA MRMS Precipitation Rate', legend: 'precip',
+        archiveKey: 'precip',
+        loopBounds: [[20.005, -130.005], [54.995, -60.005]],
+    },
+    'klwx-sr-bref': {
+        type: 'wms', label: 'KLWX Super-Res Reflectivity', legend: 'dbz',
+        wmsUrl: `${WMS_BASE}/klwx/ows`, layer: 'klwx_sr_bref',
+        fitBounds: [[33.977, -82.487], [43.976, -72.488]],
+        archiveKey: 'klwx_sr_bref',
+        loopBounds: [[33.977, -82.487], [43.976, -72.488]],
+    },
+    'klwx-sr-bvel': {
+        type: 'wms', label: 'KLWX Super-Res Velocity', legend: 'velocity',
+        wmsUrl: `${WMS_BASE}/klwx/ows`, layer: 'klwx_sr_bvel',
+        fitBounds: [[33.977, -82.487], [43.976, -72.488]],
+        archiveKey: 'klwx_sr_bvel',
+        loopBounds: [[33.977, -82.487], [43.976, -72.488]],
+    },
+    'klwx-bdhc': {
+        type: 'wms', label: 'KLWX Hydrometeor Classification', legend: 'hca',
+        wmsUrl: `${WMS_BASE}/klwx/ows`, layer: 'klwx_bdhc',
+        fitBounds: [[33.977, -82.487], [43.976, -72.488]],
+        archiveKey: 'klwx_bdhc',
+        loopBounds: [[33.977, -82.487], [43.976, -72.488]],
+    },
+    'tiad-bref1': {
+        type: 'wms', label: 'TIAD Base Reflectivity', legend: 'dbz',
+        wmsUrl: `${WMS_BASE}/tiad/ows`, layer: 'tiad_bref1',
+        fitBounds: [[38.084, -78.529], [40.084, -76.529]],
+        archiveKey: 'tiad_bref1',
+        loopBounds: [[38.084, -78.529], [40.084, -76.529]],
+    },
+    'tiad-brefl': {
+        type: 'wms', label: 'TIAD Long-Range Reflectivity', legend: 'dbz',
+        wmsUrl: `${WMS_BASE}/tiad/ows`, layer: 'tiad_brefl',
+        fitBounds: [[35.084, -81.529], [43.084, -73.529]],
+        archiveKey: 'tiad_brefl',
+        loopBounds: [[35.084, -81.529], [43.084, -73.529]],
+    },
+    'tiad-bvel': {
+        type: 'wms', label: 'TIAD Base Velocity', legend: 'velocity',
+        wmsUrl: `${WMS_BASE}/tiad/ows`, layer: 'tiad_bvel',
+        fitBounds: [[38.084, -78.529], [40.084, -76.529]],
+        archiveKey: 'tiad_bvel',
+        loopBounds: [[38.084, -78.529], [40.084, -76.529]],
+    },
+};
+
+let radarLoopMode = 'live';  // 'live' | 'loop' — current display mode for any product
+
+function switchRadarProduct(productId) {
+    const prev = RADAR_PRODUCTS[currentProduct];
+    const next = RADAR_PRODUCTS[productId];
+    if (!next || productId === currentProduct) return;
+
+    // Teardown previous
+    if (radarMode === 'loop') { _exitLoopMode(); }
+    if (prev.type === 'wms')   { _deactivateWmsLayer(); }
+    if (prev.type === 'mrms')  {
+        if (radarOverlay && radarMap && radarMap.hasLayer(radarOverlay))
+            radarMap.removeLayer(radarOverlay);
+    }
+
+    currentProduct = productId;
+    _updateLegend(next.legend);
+
+    // Show/hide Live|Loop toggle (all products with an archive support looping)
+    const hasArchive = !!next.archiveKey;
+    const toggle = document.getElementById('live-loop-toggle');
+    toggle.style.display = hasArchive ? 'flex' : 'none';
+
+    // Activate in the mode appropriate for this product
+    if (next.type === 'mrms') {
+        radarLoopMode = 'live';
+        _activateMrmsMode();
+    } else if (next.type === 'precip') {
+        // PrecipRate: always loop (no live WMS available)
+        radarLoopMode = 'loop';
+        _updateToggleButtons('loop');
+        _activateLoopMode();
+    } else {
+        // WMS product: respect radarLoopMode (default to live on first switch)
+        _updateToggleButtons(radarLoopMode);
+        if (radarLoopMode === 'loop') { _activateLoopMode(); }
+        else { _activateWmsLayer(productId); }
+        if (next.fitBounds) radarMap.fitBounds(next.fitBounds);
+    }
+}
+
+function setRadarMode(mode) {
+    if (mode === radarLoopMode) return;
+    const prod = RADAR_PRODUCTS[currentProduct];
+    if (!prod) return;
+
+    radarLoopMode = mode;
+    _updateToggleButtons(mode);
+
+    if (mode === 'loop') {
+        if (prod.type === 'wms') _deactivateWmsLayer();
+        if (prod.type === 'mrms') {
+            if (radarOverlay && radarMap && radarMap.hasLayer(radarOverlay))
+                radarMap.removeLayer(radarOverlay);
+        }
+        _activateLoopMode();
+    } else {
+        _exitLoopMode();
+        if (prod.type === 'wms') {
+            _activateWmsLayer(currentProduct);
+        } else if (prod.type === 'mrms') {
+            _activateMrmsMode();
+        }
+    }
+}
+
+function _updateToggleButtons(mode) {
+    const btnLive = document.getElementById('btn-live');
+    const btnLoop = document.getElementById('btn-loop');
+    if (!btnLive || !btnLoop) return;
+    if (mode === 'live') {
+        btnLive.classList.add('active');
+        btnLoop.classList.remove('active');
+    } else {
+        btnLoop.classList.add('active');
+        btnLive.classList.remove('active');
+    }
+}
+
+function _activateMrmsMode() {
+    radarMode = 'live';
+    document.getElementById('loop-controls').style.display = 'none';
+    if (radarOverlay && radarMap) radarOverlay.addTo(radarMap);
+    if (radarMap) radarMap.setView([38.5, -97], 4);
+    if (!radarRefreshTimer) scheduleRadarRefresh(120);
+    const vt = radarLastValidTime;
+    if (vt) {
+        const dt = new Date(vt);
+        setStatusMessage(dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' })
+            + ' ' + dt.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' })
+            + ' UTC · NOAA MRMS Composite Reflectivity', 'ok');
+    }
+}
+
+function _activateWmsLayer(productId) {
+    const prod = RADAR_PRODUCTS[productId];
+    radarMode = 'live';
+    document.getElementById('loop-controls').style.display = 'none';
+
+    wmsLayer = L.tileLayer.wms(prod.wmsUrl, {
+        layers:      prod.layer,
+        format:      'image/png',
+        transparent: true,
+        version:     '1.3.0',
+        opacity:     0.85,
+        zIndex:      200,
+    }).addTo(radarMap);
+
+    setStatusMessage(`${prod.label} · NWS GeoServer (live)`, 'ok');
+    _scheduleWmsRefresh(productId);
+}
+
+function _deactivateWmsLayer() {
+    clearTimeout(wmsRefreshTimer);
+    wmsRefreshTimer = null;
+    if (wmsLayer && radarMap) { radarMap.removeLayer(wmsLayer); wmsLayer = null; }
+}
+
+function _scheduleWmsRefresh(productId) {
+    clearTimeout(wmsRefreshTimer);
+    wmsRefreshTimer = setTimeout(() => {
+        if (currentProduct !== productId || radarLoopMode !== 'live') return;
+        if (wmsLayer) wmsLayer.redraw();
+        _scheduleWmsRefresh(productId);
+    }, 120 * 1000);
+}
+
+function _activateLoopMode() {
+    radarMode = 'loop';
+    document.getElementById('loop-controls').style.display = 'block';
+    if (lightningEnabled) _pauseLiveLightningForLoop();
+    _startLoopAfterActivation();
+}
+
+async function _startLoopAfterActivation() {
+    const prod = RADAR_PRODUCTS[currentProduct];
+    setStatusMessage(`Loading ${prod.label} archive...`, 'loading');
+    await loadFrameIndex();
+    if (loopFrames.length > 0) {
+        showLoopFrame(loopFrames.length - 1);
+        setLoopPlaying(true);
+        scheduleIndexRefresh();
+    } else {
+        setStatusMessage('No archived frames yet — archiver may not be running', 'error');
+    }
+}
+
+function _exitLoopMode() {
+    pauseLoop();
+    clearTimeout(loopIndexTimer);
+    if (loopOverlay && radarMap) { radarMap.removeLayer(loopOverlay); loopOverlay = null; }
+    document.getElementById('loop-controls').style.display = 'none';
+    radarMode = 'live';
+
+    // Resume real-time lightning if it was enabled
+    if (lightningEnabled) {
+        if (lightningLayer) { lightningLayer.clearLayers(); }
+        _fetchAndDrawLightning();
+        if (!lightningTimer) lightningTimer = setInterval(_fetchAndDrawLightning, 30 * 1000);
+    }
+}
+
+function _pauseLiveLightningForLoop() {
+    // Stop the live refresh timer when entering loop mode; lightning will be
+    // driven frame-by-frame instead via _updateLoopLightning().
+    clearInterval(lightningTimer);
+    lightningTimer = null;
+    if (lightningLayer) lightningLayer.clearLayers();
+}
+
+function _lightningLegendHTML() {
+    // Inline SVG circles to show actual shape + size used by Leaflet CircleMarkers
+    const entries = [
+        { color: '#ffffff', r: 3, label: '< 2 min' },
+        { color: '#facc15', r: 3, label: '2–5 min' },
+        { color: '#f97316', r: 3, label: '5–10 min' },
+        { color: '#ef4444', r: 3, label: '10+ min' },
+    ];
+    const cells = entries.map(({ color, r, label }) => {
+        const size = (r + 1) * 2;   // px of the svg viewbox
+        const cx   = size / 2;
+        return `<svg width="${size}" height="${size}" style="vertical-align:middle;margin-right:2px;">`
+             + `<circle cx="${cx}" cy="${cx}" r="${r}" fill="${color}" opacity="0.9"/>`
+             + `</svg>`
+             + `<span style="font-size:0.7rem;color:#ccc;margin-right:8px;">${label}</span>`;
+    }).join('');
+    return `<span style="font-size:0.7rem;color:#facc15;margin-left:12px;margin-right:4px;">⚡ Age:</span>${cells}`;
+}
+
+function _updateLegend(type) {
+    const el = document.getElementById('radar-legend');
+    if (!el) return;
+    if (type === 'dbz')    { buildRadarLegend(); return; }
+    if (type === 'precip') { buildPrecipLegend(); return; }
+    if (type === 'velocity') {
+        el.innerHTML = `<span style="font-size:0.7rem;color:#aaa;margin-right:6px;">Velocity:</span>`
+            + `<span style="display:inline-block;width:36px;height:14px;background:linear-gradient(to right,#00aa00,#00ff00);"></span>`
+            + `<span style="font-size:0.7rem;color:#ccc;margin-right:8px;"> Toward</span>`
+            + `<span style="display:inline-block;width:20px;height:14px;background:#555;"></span>`
+            + `<span style="font-size:0.7rem;color:#ccc;margin-right:8px;"> Zero</span>`
+            + `<span style="display:inline-block;width:36px;height:14px;background:linear-gradient(to right,#aa0000,#ff0000);"></span>`
+            + `<span style="font-size:0.7rem;color:#ccc;"> Away</span>`;
+        if (lightningEnabled) el.innerHTML += _lightningLegendHTML();
+        return;
+    }
+    if (type === 'hca') {
+        const cats = [
+            ['#00c8ff','BI/GC'],['#0000ff','DS'],['#00ff00','WS'],['#ff9600','CR'],
+            ['#ff0000','GR'],['#ff96ff','BD'],['#9600ff','RA'],['#969600','HR'],
+        ];
+        const cells = cats.map(([c, l]) =>
+            `<span style="display:inline-block;width:22px;height:14px;background:${c};"></span>`
+            + `<span style="font-size:0.7rem;color:#ccc;margin-right:4px;">${l}</span>`
+        ).join('');
+        el.innerHTML = `<span style="font-size:0.7rem;color:#aaa;margin-right:6px;">HCA:</span>${cells}`
+            + `<span style="font-size:0.65rem;color:#64748b;margin-left:6px;">BI=Biological GC=Clutter DS=DrySnow WS=WetSnow CR=Crystal GR=Graupel BD=BigDrop RA=Rain HR=HvyRain</span>`;
+        if (lightningEnabled) el.innerHTML += _lightningLegendHTML();
+    }
+}
+
+// ── 24h archive loop state ────────────────────────────────────────────────────
+
+const FRAMES_BASE_URL = '/api/radar/frames/';  // + productKey + '/' + filename or 'index'
+const MAX_FRAMES        = 288;   // 24h × 12 frames/h (every 5 min)
+const FRAME_MS_BASE     = 500;   // ms per frame at 1× speed
+
+let radarMode      = 'live';
+let loopFrames     = [];
+let loopIdx        = 0;
+let loopPlaying    = false;
+let loopTimer      = null;
+let loopSpeed      = 1.0;
+let loopOverlay    = null;
+let loopIndexTimer = null;
+
+// ── Gravity-wave pressure perturbation map ───────────────────────────────────
+let gravityMap = null;
+let gravityData = null;
+let gravityMarkers = [];
+let gravityFrameIdx = 0;
+let gravityTimer = null;
+let gravityPlaying = true;
+let gravitySource = 'metar'; // 'metar' | '1min'
+
+function gravityColor(v) {
+    if (v === null || v === undefined || !isFinite(v)) return '#9ca3af';
+    const x = Math.max(-3, Math.min(3, v));
+    if (x < 0) {
+        const t = (x + 3) / 3;
+        const r = Math.round(30 + t * 225);
+        const g = Math.round(64 + t * 191);
+        const b = 255;
+        return `rgb(${r},${g},${b})`;
+    }
+    const t = x / 3;
+    const r = 255;
+    const g = Math.round(255 - t * 205);
+    const b = Math.round(255 - t * 205);
+    return `rgb(${r},${g},${b})`;
+}
+
+function gravityRadius(v) {
+    if (v === null || v === undefined || !isFinite(v)) return 2.5;
+    return 2.5 + Math.min(4.5, Math.abs(v) * 1.2);
+}
+
+function setGravityStatus(msg) {
+    const el = document.getElementById('gravity-status');
+    if (el) el.textContent = msg;
+}
+
+function stopGravityLoop() {
+    if (gravityTimer) {
+        clearInterval(gravityTimer);
+        gravityTimer = null;
+    }
+}
+
+function startGravityLoop() {
+    stopGravityLoop();
+    gravityTimer = setInterval(() => {
+        if (!gravityData || !gravityData.frames || gravityData.frames.length === 0) return;
+        gravityFrameIdx = (gravityFrameIdx + 1) % gravityData.frames.length;
+        renderGravityFrame(gravityFrameIdx);
+    }, 350);
+}
+
+function initGravityMap() {
+    if (gravityMap) return;
+    gravityMap = L.map('gravity-map', {
+        center: [39.0, -98.5],
+        zoom: 4,
+        minZoom: 3,
+        maxZoom: 10,
+        zoomControl: true,
+    });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; OpenStreetMap, &copy; CartoDB',
+        maxZoom: 10,
+    }).addTo(gravityMap);
+}
+
+function clearGravityMarkers() {
+    if (!gravityMap) return;
+    for (const m of gravityMarkers) gravityMap.removeLayer(m);
+    gravityMarkers = [];
+}
+
+function renderGravityFrame(idx) {
+    if (!gravityData || !gravityData.frames || !gravityMarkers.length) return;
+    const frames = gravityData.frames;
+    const clamped = Math.max(0, Math.min(idx, frames.length - 1));
+    gravityFrameIdx = clamped;
+
+    for (const marker of gravityMarkers) {
+        const s = marker._gwStation;
+        const val = s.values[clamped];
+        marker.setStyle({
+            fillColor: gravityColor(val),
+            color: '#222',
+            weight: 0.7,
+            radius: gravityRadius(val),
+            fillOpacity: (val === null || val === undefined) ? 0.25 : 0.9,
+            opacity: 0.85,
+        });
+        const valText = (val === null || val === undefined) ? 'N/A' : `${val > 0 ? '+' : ''}${val.toFixed(2)} mb`;
+        const tipHtml = `<strong>${s.name}</strong> (${s.station_id})<br>` +
+            `Pressure perturbation: ${valText}<br>` +
+            `<small>${new Date(frames[clamped]).toUTCString()}</small>`;
+        if (marker.getTooltip()) {
+            marker.setTooltipContent(tipHtml);
+        } else {
+            marker.bindTooltip(tipHtml);
+        }
+    }
+
+    const scrubber = document.getElementById('gravity-scrubber');
+    if (scrubber) scrubber.value = String(clamped);
+    const count = document.getElementById('gravity-frame-count');
+    if (count) count.textContent = `${clamped + 1} / ${frames.length}`;
+
+    const ts = new Date(frames[clamped]);
+    const method = gravityData.window_minutes ? `${gravityData.window_minutes} min background` : '';
+    setGravityStatus(
+        `${ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' })} ` +
+        `${ts.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' })} UTC` +
+        (method ? ` | ${method}` : '')
+    );
+}
+
+async function loadGravityWaves() {
+    initGravityMap();
+    setGravityStatus(gravitySource === 'metar' ? 'Loading 5-min METAR pressure perturbations...' : 'Loading 1-min ASOS pressure perturbations...');
+    clearGravityMarkers();
+    stopGravityLoop();
+
+    const windowSel = document.getElementById('gravity-window');
+    const windowMinutes = windowSel ? parseInt(windowSel.value, 10) : 180;
+    const methodSel = document.getElementById('gravity-method');
+    const method = methodSel ? methodSel.value : 'bandpass';
+    const historySel = document.getElementById('gravity-history');
+    const hours = historySel ? historySel.value : '24';
+    if (windowSel) {
+        windowSel.disabled = method !== 'running_mean';
+    }
+
+    try {
+        const resp = await fetch(
+            `/api/asos/gravity-waves?hours=${hours}&window_minutes=${windowMinutes}&cadence_minutes=5&method=${encodeURIComponent(method)}&source=${gravitySource}`
+        );
+        const data = await resp.json();
+        if (!data.success) {
+            let msg = data.error || 'Failed to compute gravity-wave fields';
+            if (data.debug) {
+                const d = data.debug;
+                msg += ` | debug: obs=${d.obs_stations}, coords=${d.with_coords}, points=${d.with_points}, ` +
+                       `window=${d.with_window_points}, valid=${d.with_valid_frames}`;
+            }
+            throw new Error(msg);
+        }
+
+        gravityData = data;
+        const stations = data.stations || [];
+        for (const s of stations) {
+            if (s.lat == null || s.lon == null) continue;
+            const marker = L.circleMarker([s.lat, s.lon], {
+                radius: 3,
+                fillColor: '#9ca3af',
+                color: '#222',
+                weight: 0.7,
+                opacity: 0.85,
+                fillOpacity: 0.9,
+            }).addTo(gravityMap);
+            marker._gwStation = s;
+            _addStationClickHandler(marker);
+            gravityMarkers.push(marker);
+        }
+
+        const scrubber = document.getElementById('gravity-scrubber');
+        if (scrubber) {
+            const max = Math.max(0, (data.frames || []).length - 1);
+            scrubber.max = String(max);
+        }
+
+        gravityFrameIdx = Math.max(0, (data.frames || []).length - 1);
+        renderGravityFrame(gravityFrameIdx);
+
+        if (gravityMap) {
+            gravityMap.setView([39.0, -98.5], 4);
+            setTimeout(() => gravityMap && gravityMap.invalidateSize(), 50);
+        }
+
+        if (gravityPlaying) startGravityLoop();
+    } catch (e) {
+        console.error('Gravity-wave load error:', e);
+        setGravityStatus(`Error: ${e.message}`);
+    }
+}
+
+async function loadFrameIndex() {
+    const prod = RADAR_PRODUCTS[currentProduct];
+    if (!prod || !prod.archiveKey) return [];
+    try {
+        const r = await fetch(`${FRAMES_BASE_URL}${prod.archiveKey}/index`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const idx = await r.json();
+        const frames = idx.frames || [];
+        const prevCount = loopFrames.length;
+
+        loopFrames = frames;
+
+        const scrubber = document.getElementById('loop-scrubber');
+        if (scrubber) scrubber.max = Math.max(0, frames.length - 1);
+
+        const pct = frames.length > 0 ? Math.min(100, Math.round(frames.length / MAX_FRAMES * 100)) : 0;
+        const fillBar = document.getElementById('loop-fill-bar');
+        if (fillBar) fillBar.style.width = pct + '%';
+        const fillLabel = document.getElementById('loop-fill-label');
+        if (fillLabel) fillLabel.textContent = `${frames.length} / ${MAX_FRAMES} frames (${pct}%)`;
+
+        const newFrames = frames.length > prevCount ? frames.slice(prevCount) : (prevCount === 0 ? frames : []);
+        preloadFrames(newFrames, prod.archiveKey);
+
+        return frames;
+    } catch (e) {
+        console.error('Failed to load frame index:', e);
+        return [];
+    }
+}
+
+function preloadFrames(frames, archiveKey) {
+    // Fire-and-forget: prime the browser cache so animation is smooth
+    frames.forEach(f => {
+        const img = new window.Image();
+        img.src = `${FRAMES_BASE_URL}${archiveKey}/${f.f}`;
+    });
+}
+
+function showLoopFrame(idx) {
+    if (!radarMap || loopFrames.length === 0) return;
+    idx = Math.max(0, Math.min(idx, loopFrames.length - 1));
+    loopIdx = idx;
+
+    const prod  = RADAR_PRODUCTS[currentProduct];
+    const frame = loopFrames[idx];
+    const url   = `${FRAMES_BASE_URL}${prod.archiveKey}/${frame.f}`;
+    const bounds = prod.loopBounds || RADAR_BOUNDS;
+
+    if (!loopOverlay) {
+        loopOverlay = L.imageOverlay(url, bounds, {
+            opacity: 0.85,
+            interactive: false,
+            zIndex: 200,
+        }).addTo(radarMap);
+    } else {
+        loopOverlay.setUrl(url);
+        loopOverlay.setBounds(bounds);
+    }
+
+    const scrubber = document.getElementById('loop-scrubber');
+    if (scrubber) scrubber.value = idx;
+
+    const counter = document.getElementById('loop-frame-count');
+    if (counter) counter.textContent = `${idx + 1} / ${loopFrames.length}`;
+
+    const tsEl = document.getElementById('loop-timestamp');
+    if (tsEl && frame.t) {
+        const dt = new Date(frame.t);
+        tsEl.textContent = dt.toLocaleString([], {
+            month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', timeZone: 'UTC',
+            timeZoneName: 'short',
+        });
+    }
+
+    // Sync lightning to this frame's timestamp window
+    if (lightningEnabled) _updateLoopLightning(frame.t);
+
+    setStatusMessage(`${prod.label} · 24h Loop`, 'ok');
+}
+
+function setLoopPlaying(playing) {
+    loopPlaying = playing;
+    const btn = document.getElementById('loop-btn-play');
+    if (btn) btn.textContent = playing ? '⏸' : '▶';
+    if (playing) {
+        playLoop();
+    } else {
+        pauseLoop();
+    }
+}
+
+function toggleLoopPlay() { setLoopPlaying(!loopPlaying); }
+
+function playLoop() {
+    clearInterval(loopTimer);
+    const interval = Math.round(FRAME_MS_BASE / loopSpeed);
+    loopTimer = setInterval(() => {
+        if (loopFrames.length === 0) return;
+        showLoopFrame((loopIdx + 1) % loopFrames.length);
+    }, interval);
+}
+
+function pauseLoop() {
+    clearInterval(loopTimer);
+    loopTimer = null;
+}
+
+function loopFirst() { setLoopPlaying(false); showLoopFrame(0); }
+function loopLast()  { setLoopPlaying(false); showLoopFrame(loopFrames.length - 1); }
+
+function loopScrub(value) {
+    const was = loopPlaying;
+    if (was) pauseLoop();
+    showLoopFrame(parseInt(value, 10));
+    if (was) playLoop();
+}
+
+function setLoopSpeed(value) {
+    loopSpeed = parseFloat(value);
+    if (loopPlaying) { pauseLoop(); playLoop(); }
+}
+
+async function exportLoopGif() {
+    const prod = RADAR_PRODUCTS[currentProduct];
+    if (!prod || !prod.archiveKey || loopFrames.length === 0) return;
+
+    const btn = document.getElementById('btn-export-gif');
+    btn.disabled  = true;
+    btn.textContent = '⏳ Building…';
+
+    try {
+        // Use the current Leaflet viewport bounds for cropping
+        const mapBounds = radarMap.getBounds();
+        const bounds = {
+            south: mapBounds.getSouth(),
+            north: mapBounds.getNorth(),
+            west:  mapBounds.getWest(),
+            east:  mapBounds.getEast(),
+        };
+
+        const delayMs = Math.round(500 / loopSpeed);
+
+        const resp = await fetch('/api/radar/export-gif', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                product_key: prod.archiveKey,
+                frames:      loopFrames,
+                bounds:      bounds,
+                delay_ms:    delayMs,
+            }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            alert('GIF export failed: ' + (err.error || resp.statusText));
+            return;
+        }
+
+        // Trigger browser download
+        const blob = await resp.blob();
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href     = url;
+        // Try to use the Content-Disposition filename, otherwise fall back
+        const cd   = resp.headers.get('Content-Disposition') || '';
+        const match = cd.match(/filename="?([^"]+)"?/);
+        a.download = match ? match[1] : `radar_${prod.archiveKey}.gif`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    } catch(e) {
+        alert('GIF export error: ' + e.message);
+    } finally {
+        btn.disabled    = false;
+        btn.textContent = '⬇ GIF';
+    }
+}
+
+function scheduleIndexRefresh() {
+    clearTimeout(loopIndexTimer);
+    loopIndexTimer = setTimeout(async () => {
+        if (radarMode !== 'loop') return;
+        await loadFrameIndex();
+        scheduleIndexRefresh();
+    }, 120 * 1000);
+}
+
+function buildPrecipLegend() {
+    const stops = [
+        [0.25,  '#a0f0a0', '0.25'],
+        [1,     '#00c800', '1'],
+        [2.5,   '#009600', '2.5'],
+        [5,     '#f0f000', '5'],
+        [10,    '#ffa000', '10'],
+        [25,    '#ff0000', '25'],
+        [50,    '#c800c8', '50'],
+        [100,   '#ffffff', '100+'],
+    ];
+    const cells = stops.map(([, color, label]) =>
+        `<span style="display:inline-block;width:22px;height:14px;background:${color};"></span><span style="font-size:0.7rem;color:#ccc;margin-right:4px;">${label}</span>`
+    ).join('');
+    const el = document.getElementById('radar-legend');
+    if (el) {
+        el.innerHTML = `<span style="font-size:0.7rem;color:#aaa;margin-right:6px;">mm/hr:</span>${cells}`;
+        if (lightningEnabled) el.innerHTML += _lightningLegendHTML();
+    }
+}
+
+// ── GOES-R GLM Lightning overlay ─────────────────────────────────────────────
+
+let lightningEnabled  = false;
+let lightningLayer    = null;  // L.layerGroup
+let lightningTimer    = null;  // refresh interval handle (live mode only)
+
+// Cache of historical lightning fetches keyed by frame timestamp string.
+// Prevents re-fetching the same window on every loop tick.
+const _loopLightningCache = new Map();
+
+async function _updateLoopLightning(frameTime) {
+    if (!lightningEnabled || !radarMap) return;
+
+    let flashes = null;
+    if (_loopLightningCache.has(frameTime)) {
+        flashes = _loopLightningCache.get(frameTime);
+    } else {
+        try {
+            const r = await fetch(`/api/lightning/window?t=${encodeURIComponent(frameTime)}&window_min=10`);
+            if (!r.ok) return;
+            const data = await r.json();
+            flashes = data.flashes || [];
+            _loopLightningCache.set(frameTime, flashes);
+            // Keep cache bounded to ~200 entries
+            if (_loopLightningCache.size > 200) {
+                _loopLightningCache.delete(_loopLightningCache.keys().next().value);
+            }
+        } catch(e) {
+            console.error('Loop lightning fetch failed:', e);
+            return;
+        }
+    }
+
+    if (!lightningLayer) {
+        lightningLayer = L.layerGroup().addTo(radarMap);
+    } else {
+        lightningLayer.clearLayers();
+    }
+
+    const frameMs = new Date(frameTime).getTime();
+    flashes.forEach(f => {
+        // Age relative to the frame time so color coding makes sense historically
+        const ageMs = frameMs - new Date(f.t).getTime();
+        const s = _flashStyle(Math.max(0, ageMs));
+        L.circleMarker([f.lat, f.lon], {
+            radius:      s.radius,
+            color:       s.color,
+            fillColor:   s.color,
+            fillOpacity: s.opacity,
+            opacity:     s.opacity,
+            weight:      0,
+        }).addTo(lightningLayer);
+    });
+}
+
+// Age → color/opacity mapping (newest = white, oldest = red/dim)
+function _flashStyle(ageMs) {
+    const ageMin = ageMs / 60000;
+    if (ageMin <  2) return { color: '#ffffff', radius: 3, opacity: 0.95 };
+    if (ageMin <  5) return { color: '#facc15', radius: 3, opacity: 0.80 };
+    if (ageMin < 10) return { color: '#f97316', radius: 3, opacity: 0.55 };
+    return                  { color: '#ef4444', radius: 3, opacity: 0.30 };
+}
+
+async function _fetchAndDrawLightning() {
+    if (!lightningEnabled || !radarMap) return;
+    try {
+        const r = await fetch('/api/lightning');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+
+        if (!lightningLayer) {
+            lightningLayer = L.layerGroup().addTo(radarMap);
+        } else {
+            lightningLayer.clearLayers();
+        }
+
+        const now = Date.now();
+        (data.flashes || []).forEach(f => {
+            const ageMs = now - new Date(f.t).getTime();
+            const s = _flashStyle(ageMs);
+            L.circleMarker([f.lat, f.lon], {
+                radius:      s.radius,
+                color:       s.color,
+                fillColor:   s.color,
+                fillOpacity: s.opacity,
+                opacity:     s.opacity,
+                weight:      0,
+            }).addTo(lightningLayer);
+        });
+
+        const count = data.count || 0;
+        document.getElementById('btn-lightning').title =
+            `⚡ ${count} flash${count !== 1 ? 'es' : ''} in last ${data.window_min} min`;
+    } catch(e) {
+        console.error('Lightning fetch failed:', e);
+    }
+}
+
+function toggleLightning() {
+    lightningEnabled = !lightningEnabled;
+    const btn = document.getElementById('btn-lightning');
+    if (lightningEnabled) {
+        btn.classList.add('active');
+        if (radarMode === 'loop' && loopFrames.length > 0) {
+            // Sync to current loop frame, not real-time
+            _updateLoopLightning(loopFrames[loopIdx].t);
+        } else {
+            _fetchAndDrawLightning();
+            lightningTimer = setInterval(_fetchAndDrawLightning, 30 * 1000);
+        }
+    } else {
+        btn.classList.remove('active');
+        clearInterval(lightningTimer);
+        lightningTimer = null;
+        if (lightningLayer && radarMap) {
+            radarMap.removeLayer(lightningLayer);
+            lightningLayer = null;
+        }
+        btn.title = 'Show GOES-R GLM lightning (last 15 min)';
+    }
+    // Re-render the legend bar so the age key appears / disappears
+    const prod = RADAR_PRODUCTS[currentProduct];
+    if (prod) _updateLegend(prod.legend);
+}
+
+// Initialize when the radar tab is first shown
+document.getElementById('radarTabBtn').addEventListener('shown.bs.tab', () => {
+    initRadarMap();
+    _updateLegend('dbz');
+    setTimeout(() => radarMap && radarMap.invalidateSize(), 50);
+});
+
+document.getElementById('gravityTabBtn').addEventListener('shown.bs.tab', () => {
+    initGravityMap();
+    if (!gravityData) loadGravityWaves();
+    setTimeout(() => gravityMap && gravityMap.invalidateSize(), 50);
+});
+
+// Gravity source subtab switching
+document.querySelectorAll('.gravity-src-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const newSource = btn.id === 'gravity-src-metar' ? 'metar' : '1min';
+        if (newSource === gravitySource) return;
+        gravitySource = newSource;
+
+        // Update active styling
+        document.querySelectorAll('.gravity-src-btn').forEach(b => {
+            const active = b.id === btn.id;
+            b.classList.toggle('active', active);
+            b.style.background     = active ? '#fff' : 'transparent';
+            b.style.border         = active ? '1px solid #dee2e6' : '1px solid transparent';
+            b.style.borderBottom   = active ? 'none' : '';
+            b.style.color          = active ? '' : '#6b7280';
+        });
+
+        gravityData = null;
+        loadGravityWaves();
+    });
+});
+
+document.getElementById('gravity-reload-btn').addEventListener('click', loadGravityWaves);
+document.getElementById('gravity-window').addEventListener('change', loadGravityWaves);
+document.getElementById('gravity-method').addEventListener('change', loadGravityWaves);
+document.getElementById('gravity-history').addEventListener('change', loadGravityWaves);
+document.getElementById('gravity-scrubber').addEventListener('input', (e) => {
+    const idx = parseInt(e.target.value, 10) || 0;
+    renderGravityFrame(idx);
+});
+document.getElementById('gravity-play-btn').addEventListener('click', () => {
+    gravityPlaying = !gravityPlaying;
+    const btn = document.getElementById('gravity-play-btn');
+    btn.textContent = gravityPlaying ? 'Pause' : 'Play';
+    if (gravityPlaying) startGravityLoop();
+    else stopGravityLoop();
+});
+
+// ── Station pressure detail chart ────────────────────────────────────────────
+
+let stationPressureChart = null;
+let stationPerturbationChart = null;
+
+function _addStationClickHandler(marker) {
+    marker.on('click', () => {
+        const s = marker._gwStation;
+        stopGravityLoop();
+        openStationPressureChart(s.station_id, s.name, s.state, gravitySource);
+    });
+}
+
+async function openStationPressureChart(stationId, name, state, source) {
+    const modalEl = document.getElementById('stationPressureModal');
+    const modal   = bootstrap.Modal.getOrCreateInstance(modalEl);
+    document.getElementById('stationPressureModalLabel').textContent =
+        `${name} (${stationId})${state ? ' — ' + state : ''}`;
+    document.getElementById('stationPressureLoading').style.display = '';
+    document.getElementById('stationPressureError').classList.add('d-none');
+    document.getElementById('stationPressureCharts').style.display = 'none';
+
+    modalEl.addEventListener('hidden.bs.modal', () => {
+        if (gravityPlaying) startGravityLoop();
+    }, { once: true });
+
+    modal.show();
+
+    try {
+        const hours = document.getElementById('gravity-history')?.value || '24';
+        const src   = source || gravitySource || 'metar';
+        const resp  = await fetch(`/api/asos/station-pressure-detail?station_id=${stationId}&hours=${hours}&source=${src}`);
+        const data  = await resp.json();
+        if (!data.success) throw new Error(data.error || 'Request failed');
+
+        document.getElementById('stationPressureLoading').style.display = 'none';
+        renderStationPressureChart(data);
+    } catch (e) {
+        document.getElementById('stationPressureLoading').style.display = 'none';
+        const errEl = document.getElementById('stationPressureError');
+        errEl.textContent = e.message;
+        errEl.classList.remove('d-none');
+    }
+}
+
+const _chartAxisStyle = {
+    ticks: { color: '#374151', font: { size: 11 } },
+    grid:  { color: 'rgba(0,0,0,0.07)' },
+};
+const _chartTooltipLabel = (ctx) => {
+    const v = ctx.raw;
+    if (v === null || v === undefined) return null;
+    const val = typeof v === 'object' ? v.y : v;
+    if (!isFinite(val)) return null;
+    return `${ctx.dataset.label}: ${val.toFixed(3)} mb`;
+};
+
+function renderStationPressureChart(data) {
+    document.getElementById('stationPressureCharts').style.display = 'block';
+
+    if (stationPressureChart)     { stationPressureChart.destroy();     stationPressureChart     = null; }
+    if (stationPerturbationChart) { stationPerturbationChart.destroy(); stationPerturbationChart = null; }
+
+    const pertOnly = !!data.perturbation_only;
+    document.getElementById('stationPressureRawNote').classList.toggle('d-none', !pertOnly);
+    document.getElementById('stationPressureChart').style.display = pertOnly ? 'none' : '';
+
+    const labels = (data.frames || []).map(t => new Date(t));
+    const obsData = (data.obs || []).map(o => ({ x: new Date(o.t), y: o.v }));
+
+    const sharedXOptions = {
+        type: 'time',
+        time: { tooltipFormat: 'MMM d, HH:mm', displayFormats: { hour: 'HH:mm', day: 'MMM d' } },
+        ticks: { ..._chartAxisStyle.ticks, maxTicksLimit: 10 },
+        grid:  _chartAxisStyle.grid,
+    };
+
+    // ── Top chart: raw pressure + LP(10m) + LP(180m) baseline ───────────────
+    if (!pertOnly) stationPressureChart = new Chart(document.getElementById('stationPressureChart'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'Raw (interpolated)',
+                    data: data.raw,
+                    borderColor: 'rgba(156,163,175,0.6)',
+                    backgroundColor: 'transparent',
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    tension: 0,
+                    order: 3,
+                },
+                {
+                    label: 'Actual obs',
+                    data: obsData,
+                    type: 'scatter',
+                    borderColor: '#6b7280',
+                    backgroundColor: '#6b7280',
+                    pointRadius: 3,
+                    pointHoverRadius: 5,
+                    showLine: false,
+                    order: 2,
+                    parsing: false,
+                },
+                {
+                    label: 'LP(10 min)',
+                    data: data.lp_short,
+                    borderColor: '#2563eb',
+                    backgroundColor: 'transparent',
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0,
+                    order: 1,
+                },
+                {
+                    label: 'LP(180 min) baseline',
+                    data: data.lp_long,
+                    borderColor: '#dc2626',
+                    backgroundColor: 'transparent',
+                    borderWidth: 1.5,
+                    borderDash: [5, 3],
+                    pointRadius: 0,
+                    tension: 0,
+                    order: 0,
+                },
+            ],
+        },
+        options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { labels: { color: '#111827', boxWidth: 14, padding: 10, font: { size: 11 } } },
+                tooltip: { callbacks: { label: _chartTooltipLabel } },
+            },
+            scales: {
+                x: { ...sharedXOptions, ticks: { ...sharedXOptions.ticks, display: false } },
+                y: {
+                    position: 'left',
+                    title: { display: true, text: 'Pressure (mb)', color: '#374151', font: { size: 11 } },
+                    ..._chartAxisStyle,
+                },
+            },
+        },
+    });
+
+    // ── Bottom chart: perturbation p' ────────────────────────────────────────
+    stationPerturbationChart = new Chart(document.getElementById('stationPerturbationChart'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: "p' (LP10 − LP180)",
+                    data: data.perturbation,
+                    borderColor: '#7c3aed',
+                    backgroundColor: (ctx) => {
+                        const v = ctx.raw;
+                        if (v === null || v === undefined || !isFinite(v)) return 'transparent';
+                        return v >= 0 ? 'rgba(220,38,38,0.12)' : 'rgba(37,99,235,0.12)';
+                    },
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0,
+                    fill: 'origin',
+                },
+            ],
+        },
+        options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { labels: { color: '#111827', boxWidth: 14, padding: 10, font: { size: 11 } } },
+                tooltip: { callbacks: { label: _chartTooltipLabel } },
+            },
+            scales: {
+                x: sharedXOptions,
+                y: {
+                    position: 'left',
+                    title: { display: true, text: "p' perturbation (mb)", color: '#374151', font: { size: 11 } },
+                    min: -3,
+                    max:  3,
+                    ..._chartAxisStyle,
+                },
+            },
+        },
+    });
+}
 </script>
 {% endblock %}
