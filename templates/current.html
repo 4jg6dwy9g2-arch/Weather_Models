@@ -773,6 +773,7 @@
                     <option value="360">6h running mean</option>
                 </select>
                 <button class="btn btn-sm btn-outline-primary" id="gravity-reload-btn">Reload</button>
+                <button class="btn btn-sm btn-outline-secondary" id="gravity-analyze-btn" title="Detect gravity wave structures in current frame">Analyze</button>
                 <button class="btn btn-sm btn-primary" id="gravity-play-btn">Pause</button>
             </div>
             <div class="w-100 d-flex align-items-center gap-2">
@@ -789,6 +790,20 @@
                 <span style="font-size:0.78rem;color:#4b5563;">+3 mb</span>
             </div>
             <span style="color:#9ca3af;">grey = no data</span>
+        </div>
+        <!-- Wave analysis results panel (hidden until Analyze is clicked) -->
+        <div id="gravity-analysis-panel" class="d-none px-3 py-2 border-top" style="font-size:0.82rem;background:#f0f4ff;">
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+                <strong style="color:#3b4fc4;">Wave Analysis</strong>
+                <span id="gravity-analysis-status" class="text-muted">—</span>
+                <div id="gravity-propagation-info" class="d-none">
+                    <span class="me-2">Propagation:</span>
+                    <span id="gravity-prop-speed" class="fw-semibold"></span>
+                    <span id="gravity-prop-heading" class="text-muted ms-1"></span>
+                </div>
+                <button class="btn btn-sm btn-outline-secondary ms-auto py-0" id="gravity-clear-analysis-btn" style="font-size:0.78rem;">Clear</button>
+            </div>
+            <div id="gravity-structures-list" class="mt-1 d-flex gap-2 flex-wrap"></div>
         </div>
     </div>
 </div><!-- /#tab-gravity -->
@@ -1493,6 +1508,9 @@ let gravityTimer = null;
 let gravityPlaying = true;
 let gravitySource = 'metar'; // 'metar' | '1min'
 
+// Wave structure analysis overlay
+let gravityAnalysisLayer = null;  // Leaflet LayerGroup for contours + markers
+
 function gravityColor(v) {
     if (v === null || v === undefined || !isFinite(v)) return '#9ca3af';
     const x = Math.max(-3, Math.min(3, v));
@@ -2056,6 +2074,168 @@ document.getElementById('gravity-play-btn').addEventListener('click', () => {
     if (gravityPlaying) startGravityLoop();
     else stopGravityLoop();
 });
+
+// ── Gravity wave structure analysis ──────────────────────────────────────────
+
+// Contour level styling: negative=blue, positive=red, intensity by magnitude
+function _contourStyle(level) {
+    const abs = Math.abs(level);
+    const pos = level > 0;
+    let color, weight, opacity, dash;
+    if (abs >= 2.0)      { color = pos ? '#c0392b' : '#1a5276'; weight = 2.5; opacity = 0.85; dash = null; }
+    else if (abs >= 1.0) { color = pos ? '#e74c3c' : '#2980b9'; weight = 1.8; opacity = 0.75; dash = null; }
+    else                 { color = pos ? '#f1948a' : '#7fb3d3'; weight = 1.2; opacity = 0.60; dash = '4,4'; }
+    return { color, weight, opacity, dashArray: dash };
+}
+
+function clearGravityAnalysis() {
+    if (gravityAnalysisLayer) {
+        gravityAnalysisLayer.clearLayers();
+    }
+    document.getElementById('gravity-analysis-panel').classList.add('d-none');
+    document.getElementById('gravity-analyze-btn').classList.remove('btn-warning');
+    document.getElementById('gravity-analyze-btn').classList.add('btn-outline-secondary');
+}
+
+async function runGravityAnalysis() {
+    if (!gravityData || !gravityMap) return;
+    const btn = document.getElementById('gravity-analyze-btn');
+    btn.disabled = true;
+    btn.textContent = 'Analyzing…';
+
+    const panel = document.getElementById('gravity-analysis-panel');
+    panel.classList.remove('d-none');
+    document.getElementById('gravity-analysis-status').textContent = 'Running…';
+    document.getElementById('gravity-structures-list').innerHTML = '';
+    document.getElementById('gravity-propagation-info').classList.add('d-none');
+
+    try {
+        const resp = await fetch(
+            `/api/asos/gravity-wave-structures?source=${gravitySource}&frame=${gravityFrameIdx}`
+        );
+        const data = await resp.json();
+        if (!data.success) throw new Error(data.error || 'Analysis failed');
+
+        // Init layer group
+        if (!gravityAnalysisLayer) {
+            gravityAnalysisLayer = L.layerGroup().addTo(gravityMap);
+        } else {
+            gravityAnalysisLayer.clearLayers();
+        }
+
+        // Draw contours
+        const contours = data.contours || {};
+        for (const [lvlStr, paths] of Object.entries(contours)) {
+            const lvl = parseFloat(lvlStr);
+            const style = _contourStyle(lvl);
+            for (const path of paths) {
+                const poly = L.polyline(path, {
+                    color:     style.color,
+                    weight:    style.weight,
+                    opacity:   style.opacity,
+                    dashArray: style.dashArray,
+                    interactive: false,
+                });
+                poly.bindTooltip(`${lvl > 0 ? '+' : ''}${lvl.toFixed(1)} mb`, { sticky: true, className: 'small' });
+                gravityAnalysisLayer.addLayer(poly);
+            }
+        }
+
+        // Draw structure markers
+        const structures = data.structures || [];
+        const listEl = document.getElementById('gravity-structures-list');
+        structures.forEach((s, i) => {
+            const color = s.sign > 0 ? '#c0392b' : '#1a5276';
+            const label = s.sign > 0 ? `+${s.amplitude.toFixed(2)} mb` : `${s.amplitude.toFixed(2)} mb`;
+            const radiusDeg = Math.max(0.5, Math.sqrt(s.area_km2 / Math.PI) / 111);
+            const radiusPx  = Math.max(6, Math.min(30, radiusDeg * 40));
+
+            const marker = L.circleMarker([s.center_lat, s.center_lon], {
+                radius:      radiusPx,
+                color:       color,
+                fillColor:   color,
+                fillOpacity: 0.15,
+                weight:      2,
+                dashArray:   '5,3',
+            });
+            marker.bindTooltip(
+                `<strong>${s.sign > 0 ? 'High' : 'Low'} anomaly</strong><br>` +
+                `Peak: ${label}<br>` +
+                `Area: ${(s.area_km2 / 1000).toFixed(0)}k km²<br>` +
+                `Band axis: ${s.orientation_deg.toFixed(0)}°`,
+                { sticky: true }
+            );
+            gravityAnalysisLayer.addLayer(marker);
+
+            // Badge in panel
+            const badge = document.createElement('span');
+            badge.className = 'badge rounded-pill px-2 py-1';
+            badge.style.cssText = `background:${color}22;color:${color};border:1px solid ${color};font-size:0.75rem;`;
+            badge.textContent = `${s.sign > 0 ? '▲' : '▼'} ${label} · ${(s.area_km2/1000).toFixed(0)}k km²`;
+            listEl.appendChild(badge);
+        });
+
+        // Propagation arrow
+        const prop = data.propagation;
+        if (prop && prop.speed_kmh > 2) {
+            const cx = (data.structures && data.structures.length > 0)
+                ? data.structures.reduce((a, s) => a + s.center_lon, 0) / data.structures.length
+                : -95.0;
+            const cy = (data.structures && data.structures.length > 0)
+                ? data.structures.reduce((a, s) => a + s.center_lat, 0) / data.structures.length
+                : 38.0;
+
+            // Arrow length ~ speed / 20 degrees
+            const lenDeg = Math.min(8, prop.speed_kmh / 20);
+            const hdRad  = (prop.heading_deg - 90) * Math.PI / 180; // convert met→math angle
+            const dLon   = lenDeg * Math.cos(hdRad);
+            const dLat   = lenDeg * Math.sin(hdRad);
+
+            const arrow = L.polyline(
+                [[cy, cx], [cy + dLat, cx + dLon]],
+                { color: '#7c3aed', weight: 3, opacity: 0.9 }
+            );
+            // Arrowhead (small triangle)
+            const headSize = 0.4;
+            const backRad  = hdRad + Math.PI;
+            const perpRad  = hdRad + Math.PI / 2;
+            const tip  = [cy + dLat, cx + dLon];
+            const p1   = [tip[0] + headSize * Math.sin(backRad + 0.4),
+                          tip[1] + headSize * Math.cos(backRad + 0.4)];
+            const p2   = [tip[0] + headSize * Math.sin(backRad - 0.4),
+                          tip[1] + headSize * Math.cos(backRad - 0.4)];
+            const head = L.polygon([tip, p1, p2], {
+                color: '#7c3aed', fillColor: '#7c3aed', fillOpacity: 0.9, weight: 1
+            });
+            arrow.bindTooltip(`${prop.speed_kmh.toFixed(0)} km/h @ ${prop.heading_deg.toFixed(0)}°`, { sticky: true });
+            gravityAnalysisLayer.addLayer(arrow);
+            gravityAnalysisLayer.addLayer(head);
+
+            // Update panel
+            const propInfo = document.getElementById('gravity-propagation-info');
+            propInfo.classList.remove('d-none');
+            document.getElementById('gravity-prop-speed').textContent = `${prop.speed_kmh.toFixed(0)} km/h`;
+            document.getElementById('gravity-prop-heading').textContent = `@ ${prop.heading_deg.toFixed(0)}°`;
+        }
+
+        const nStructures = structures.length;
+        const thresh = data.threshold_mb != null ? ` · threshold ±${data.threshold_mb.toFixed(2)} mb` : '';
+        document.getElementById('gravity-analysis-status').textContent =
+            `${nStructures} structure${nStructures !== 1 ? 's' : ''} detected · ${data.n_stations} stations${thresh}`;
+
+        btn.classList.remove('btn-outline-secondary');
+        btn.classList.add('btn-warning');
+    } catch (e) {
+        console.error('Wave analysis error:', e);
+        document.getElementById('gravity-analysis-status').textContent = `Error: ${e.message}`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Analyze';
+    }
+}
+
+document.getElementById('gravity-analyze-btn').addEventListener('click', runGravityAnalysis);
+document.getElementById('gravity-clear-analysis-btn').addEventListener('click', clearGravityAnalysis);
 
 // ── Station pressure detail chart ────────────────────────────────────────────
 
