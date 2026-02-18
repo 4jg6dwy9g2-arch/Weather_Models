@@ -1519,21 +1519,39 @@ function calculateRollingAverage(data, window = 7) {
 async function loadTimeSeriesChart() {
     const variable = document.getElementById('tsVariable').value;
     const metric = document.getElementById('tsMetric').value;
-    const leadTime = document.getElementById('tsLeadTime').value;
+    const leadTime = parseInt(document.getElementById('tsLeadTime').value, 10);
     const timeFrame = document.getElementById('tsTimeFrame').value;
 
     try {
-        const response = await fetch(
-            `/api/asos/verification-time-series?variable=${variable}&lead_time=${leadTime}&days_back=${timeFrame}`
-        );
-        const data = await response.json();
+        const [tsResponse, allTimeResponse] = await Promise.all([
+            fetch(`/api/asos/verification-time-series?variable=${variable}&lead_time=${leadTime}&days_back=${timeFrame}`),
+            fetch('/api/asos/mean-verification?period=all')
+        ]);
+        const data = await tsResponse.json();
+        const allTimeData = await allTimeResponse.json();
 
         if (!data.success) {
             console.error('Error loading time series:', data.error);
             return;
         }
 
-        renderTimeSeriesChart(data, metric);
+        // Extract all-time averages for the selected variable/metric/lead_time
+        let allTimeAvgs = null;
+        if (allTimeData.success) {
+            const v = allTimeData.verification;
+            const ltIdx = v.lead_times ? v.lead_times.indexOf(leadTime) : -1;
+            if (ltIdx !== -1) {
+                const key = (pfx) => `${pfx}_${variable}_${metric}`;
+                allTimeAvgs = {
+                    gfs:  v[key('gfs')]?.[ltIdx]  ?? null,
+                    aifs: v[key('aifs')]?.[ltIdx] ?? null,
+                    ifs:  v[key('ifs')]?.[ltIdx]  ?? null,
+                    nws:  v[key('nws')]?.[ltIdx]  ?? null,
+                };
+            }
+        }
+
+        renderTimeSeriesChart(data, metric, allTimeAvgs);
 
     } catch (error) {
         console.error('Error loading time series chart:', error);
@@ -1541,7 +1559,7 @@ async function loadTimeSeriesChart() {
 }
 
 // Render time series chart
-function renderTimeSeriesChart(data, metric) {
+function renderTimeSeriesChart(data, metric, allTimeAvgs = null) {
     const ctx = document.getElementById('timeSeriesChart');
 
     // Update winner tally (only show for MAE metric)
@@ -1630,7 +1648,35 @@ function renderTimeSeriesChart(data, metric) {
                     tension: 0.3,
                     pointRadius: 1,
                     pointHoverRadius: 4
-                }] : [])
+                }] : []),
+                // All-time average reference lines
+                ...(allTimeAvgs ? (() => {
+                    const n = data.dates.length;
+                    const refLines = [];
+                    const refs = [
+                        { key: 'gfs',  label: 'GFS avg',  color: '#0d6efd' },
+                        { key: 'aifs', label: 'AIFS avg', color: '#0dcaf0' },
+                        { key: 'ifs',  label: 'IFS avg',  color: '#20c997' },
+                        { key: 'nws',  label: 'NWS avg',  color: '#111111' },
+                    ];
+                    for (const r of refs) {
+                        const val = allTimeAvgs[r.key];
+                        if (val === null || val === undefined) continue;
+                        refLines.push({
+                            label: r.label,
+                            data: Array(n).fill(val),
+                            borderColor: r.color,
+                            backgroundColor: 'transparent',
+                            borderWidth: 1.5,
+                            borderDash: [4, 4],
+                            pointRadius: 0,
+                            pointHoverRadius: 0,
+                            tension: 0,
+                            fill: false,
+                        });
+                    }
+                    return refLines;
+                })() : [])
             ]
         },
         options: {
@@ -1645,16 +1691,20 @@ function renderTimeSeriesChart(data, metric) {
                     position: 'top',
                     labels: {
                         usePointStyle: true,
-                        padding: 20
+                        padding: 20,
+                        filter: function(item) {
+                            return !item.text.endsWith(' avg');
+                        }
                     }
                 },
                 tooltip: {
                     callbacks: {
                         label: function(context) {
-                            let label = context.dataset.label || '';
-                            if (label) {
-                                label += ': ';
+                            if (context.dataset.label && context.dataset.label.endsWith(' avg')) {
+                                return null;
                             }
+                            let label = context.dataset.label || '';
+                            if (label) label += ': ';
                             if (context.parsed.y !== null) {
                                 label += context.parsed.y.toFixed(2) + ' ' + unit;
                             }
