@@ -144,6 +144,15 @@
                     <div id="asosStationCharts" class="card-body border-top d-none">
                         <h5 class="card-title mb-3">Verification for <span id="asosStationName"></span></h5>
                         <div id="asosStationMessage" class="alert alert-info d-none mb-3"></div>
+                        <div class="d-flex align-items-center flex-wrap gap-2 mb-3">
+                            <span class="small text-muted">Station Accuracy Model:</span>
+                            <div class="btn-group btn-group-sm" role="group" aria-label="Station model selector">
+                                <button type="button" class="btn btn-outline-primary asos-station-model-btn active" data-model="gfs">GFS</button>
+                                <button type="button" class="btn btn-outline-primary asos-station-model-btn" data-model="aifs">AIFS</button>
+                                <button type="button" class="btn btn-outline-primary asos-station-model-btn" data-model="ifs">IFS</button>
+                                <button type="button" class="btn btn-outline-primary asos-station-model-btn" data-model="nws">NWS</button>
+                            </div>
+                        </div>
                         <div class="row">
                             <div class="col-lg-6 mb-4">
                                 <div class="card h-100">
@@ -161,9 +170,26 @@
                                     </div>
                                 </div>
                             </div>
+                            <div class="col-12 mb-3">
+                                <div class="d-flex align-items-center flex-wrap gap-2">
+                                    <span class="small text-muted">Station Bias Lead Time:</span>
+                                    <div class="btn-group btn-group-sm" role="group" aria-label="Station bias lead time">
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn active" data-lead-time="6">6h</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="12">12h</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="24">24h</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="48">48h</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="72">72h</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="120">5d</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="168">7d</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="240">10d</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="288">12d</button>
+                                        <button type="button" class="btn btn-outline-secondary asos-station-lead-btn" data-lead-time="360">15d</button>
+                                    </div>
+                                </div>
+                            </div>
                             <div class="col-lg-6 mb-4">
                                 <div class="card h-100">
-                                    <div class="card-header"><i class="bi bi-thermometer-half"></i> Station Temperature (Obs + Bias)</div>
+                                    <div class="card-header"><i class="bi bi-thermometer-half"></i> Station Temperature (Obs + Bias) <span class="text-muted" id="stationTempLeadLabel">(6h)</span></div>
                                     <div class="card-body">
                                         <div class="chart-container chart-container-small">
                                             <canvas id="asosObsTempChart"></canvas>
@@ -176,7 +202,7 @@
                             </div>
                             <div class="col-lg-6 mb-4">
                                 <div class="card h-100">
-                                    <div class="card-header"><i class="bi bi-cloud-rain"></i> Station Precipitation (Obs + Bias)</div>
+                                    <div class="card-header"><i class="bi bi-cloud-rain"></i> Station Precipitation (Obs + Bias) <span class="text-muted" id="stationPrecipLeadLabel">(6h)</span></div>
                                     <div class="card-body">
                                         <div class="chart-container chart-container-small">
                                             <canvas id="asosObsPrecipChart"></canvas>
@@ -566,10 +592,37 @@ let currentAsosObsPrecipChart = null;
 let currentAsosObsPrecipBiasChart = null;
 let currentAsosStationId = null;
 let currentAsosStationName = null;
+let currentAsosStationLeadTime = '6';
+let currentAsosStationModel = 'gfs';
+
+function setStationLeadTimeControl(leadTime) {
+    currentAsosStationLeadTime = String(leadTime || '6');
+    document.querySelectorAll('.asos-station-lead-btn').forEach(btn => {
+        const isActive = btn.dataset.leadTime === currentAsosStationLeadTime;
+        btn.classList.toggle('active', isActive);
+        btn.classList.toggle('btn-secondary', isActive);
+        btn.classList.toggle('btn-outline-secondary', !isActive);
+    });
+    const label = `(${formatLeadTime(parseInt(currentAsosStationLeadTime, 10))})`;
+    const tempLeadLabel = document.getElementById('stationTempLeadLabel');
+    const precipLeadLabel = document.getElementById('stationPrecipLeadLabel');
+    if (tempLeadLabel) tempLeadLabel.textContent = label;
+    if (precipLeadLabel) precipLeadLabel.textContent = label;
+}
+
+function setStationModelControl(model) {
+    currentAsosStationModel = String(model || 'gfs').toLowerCase();
+    document.querySelectorAll('.asos-station-model-btn').forEach(btn => {
+        const isActive = btn.dataset.model === currentAsosStationModel;
+        btn.classList.toggle('active', isActive);
+        btn.classList.toggle('btn-primary', isActive);
+        btn.classList.toggle('btn-outline-primary', !isActive);
+    });
+}
 
 // Load detailed verification data for a single ASOS station
 async function loadAsosStationCharts(stationId, stationName) {
-    const model = document.getElementById('asosModel').value; // Get the selected model
+    const model = currentAsosStationModel || document.getElementById('asosModel').value; // Station-selected model
     const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
 
     currentAsosStationId = stationId;
@@ -579,6 +632,7 @@ async function loadAsosStationCharts(stationId, stationName) {
     document.getElementById('asosStationCharts').classList.remove('d-none');
     const periodLabel = period === 'monthly' ? ' (Last 30 days)' : '';
     document.getElementById('asosStationName').textContent = stationName + periodLabel;
+    setStationLeadTimeControl(currentAsosStationLeadTime || document.getElementById('asosLeadTime').value || '6');
 
     try {
         const response = await fetch(
@@ -606,8 +660,8 @@ async function loadAsosStationCharts(stationId, stationName) {
 
 // Load saved observations (temp/mslp) for a station
 async function loadAsosStationObservations(stationId, period) {
-    const model = document.getElementById('asosModel').value;
-    const leadTime = document.getElementById('asosLeadTime').value;
+    const model = currentAsosStationModel || document.getElementById('asosModel').value;
+    const leadTime = currentAsosStationLeadTime || document.getElementById('asosLeadTime').value;
     try {
         const response = await fetch(
             `/api/asos/station-obs-timeseries?station_id=${encodeURIComponent(stationId)}&model=${encodeURIComponent(model)}&lead_time=${leadTime}&period=${period}`
@@ -1613,6 +1667,7 @@ document.getElementById('asosVariable').addEventListener('change', loadAsosVerif
 document.getElementById('asosMetric').addEventListener('change', loadAsosVerification);
 document.getElementById('asosModel').addEventListener('change', function() {
     loadAsosVerification();
+    setStationModelControl(this.value);
     if (currentAsosStationId) {
         loadAsosStationCharts(currentAsosStationId, currentAsosStationName || '');
     }
@@ -1627,8 +1682,27 @@ document.getElementById('asosPeriodToggle').addEventListener('change', function(
 });
 document.getElementById('asosLeadTime').addEventListener('change', function() {
     if (currentAsosStationId) {
-        loadAsosStationCharts(currentAsosStationId, currentAsosStationName || '');
+        setStationLeadTimeControl(this.value);
+        const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
+        loadAsosStationObservations(currentAsosStationId, period);
     }
+});
+
+document.querySelectorAll('.asos-station-lead-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        setStationLeadTimeControl(this.dataset.leadTime);
+        if (!currentAsosStationId) return;
+        const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
+        loadAsosStationObservations(currentAsosStationId, period);
+    });
+});
+
+document.querySelectorAll('.asos-station-model-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        setStationModelControl(this.dataset.model);
+        if (!currentAsosStationId) return;
+        loadAsosStationCharts(currentAsosStationId, currentAsosStationName || '');
+    });
 });
 
 // Event listeners for time series controls
@@ -1639,6 +1713,8 @@ document.getElementById('tsTimeFrame').addEventListener('change', loadTimeSeries
 
 // Initial load
 document.addEventListener('DOMContentLoaded', function() {
+    setStationModelControl(document.getElementById('asosModel')?.value || 'gfs');
+    setStationLeadTimeControl(document.getElementById('asosLeadTime')?.value || '6');
     initAsosMap();
     setTimeout(loadAsosVerification, 50); // Small delay
     const period = document.getElementById('asosPeriodToggle')?.checked ? 'monthly' : 'all';

@@ -277,23 +277,6 @@
                     </div>
                 </div>
 
-                <!-- Rossby Wave Analysis -->
-                <div class="card mb-4">
-                    <div class="card-header">
-                        <i class="bi bi-graph-up"></i> ERA5 Rossby Wave Analysis (1940-Present)
-                    </div>
-                    <div class="card-body">
-                        <div id="era-wave-loading" class="text-center py-5" style="display: none;">
-                            <div class="spinner-border text-primary" role="status"></div>
-                            <p class="mt-2">Loading ERA5 data...</p>
-                        </div>
-                        <div id="era-wave-error" class="alert alert-warning" style="display: none;"></div>
-                        <div class="chart-container">
-                            <canvas id="eraWaveChart"></canvas>
-                        </div>
-                    </div>
-                </div>
-
                 <!-- Analog Forecast -->
                 <div class="card mb-4">
                     <div class="card-header">
@@ -1192,9 +1175,6 @@ function setYTD() {
     document.getElementById('end-date').value = end.toISOString().split('T')[0];
     loadData();
 }
-
-// ERA5 Reanalysis functions
-let eraWaveChart;
 
 // Calculate running mean with specified window size
 function calculateRunningMean(data, windowSize) {

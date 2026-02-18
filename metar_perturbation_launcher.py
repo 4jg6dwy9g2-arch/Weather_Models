@@ -53,7 +53,7 @@ with open(log_file, "w") as f:
 
         # Step 1: Fetch fresh 5-min METAR pressure data from IEM
         f.write("Syncing METAR pressure data from IEM...\n")
-        sync_result = asos_module.sync_asos_metar_pressure(lookback_hours=24)
+        sync_result = asos_module.sync_asos_metar_pressure(lookback_hours=28)
         f.write(f"Sync result: {sync_result}\n")
 
         # Step 2: Rebuild perturbation cache from the dedicated pressure file

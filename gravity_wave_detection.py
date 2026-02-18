@@ -12,6 +12,7 @@ Pipeline:
 import numpy as np
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter, label
+from scipy.spatial import cKDTree
 
 import matplotlib
 matplotlib.use('Agg')
@@ -38,14 +39,45 @@ def make_grid():
 
 
 def interpolate_stations(station_lats, station_lons, station_vals,
-                         grid_lats, grid_lons):
+                         grid_lats, grid_lons,
+                         max_dist_km=250, min_neighbors=3,
+                         max_nearest_km=150):
     """
     Linear Delaunay triangulation from irregular stations to the regular grid.
-    Points outside the station convex hull are NaN.
+
+    Two masking passes:
+      1. min_neighbors within max_dist_km — requires a cluster of stations,
+         not just a single coastal airport.
+      2. max_nearest_km — masks any cell whose *nearest* station is farther
+         than this distance.  This is the key guard against Canada / ocean
+         bleed-through: even a dense coastal cluster cannot paint ocean cells
+         that are genuinely far from all stations.
     """
-    pts = np.column_stack([station_lons, station_lats])
+    pts  = np.column_stack([station_lons, station_lats])
     vals = np.asarray(station_vals, dtype=np.float64)
-    return griddata(pts, vals, (grid_lons, grid_lats), method='linear')
+    grid = griddata(pts, vals, (grid_lons, grid_lats), method='linear')
+
+    # KD-tree in approximate km (flat-Earth, good enough for masking)
+    tree = cKDTree(np.column_stack([
+        np.asarray(station_lons) * KM_PER_DEG_LON,
+        np.asarray(station_lats) * KM_PER_DEG_LAT,
+    ]))
+    grid_pts_km = np.column_stack([
+        grid_lons.ravel() * KM_PER_DEG_LON,
+        grid_lats.ravel() * KM_PER_DEG_LAT,
+    ])
+
+    # Pass 1: need at least min_neighbors within max_dist_km
+    counts = tree.query_ball_point(grid_pts_km, r=max_dist_km, return_length=True)
+    too_sparse = counts.reshape(grid_lats.shape) < min_neighbors
+    grid[too_sparse] = np.nan
+
+    # Pass 2: nearest single station must be within max_nearest_km
+    nearest_dist, _ = tree.query(grid_pts_km, k=1)
+    too_far = nearest_dist.reshape(grid_lats.shape) > max_nearest_km
+    grid[too_far] = np.nan
+
+    return grid
 
 
 def smooth_field(grid, sigma_deg=1.5):
@@ -59,7 +91,7 @@ def smooth_field(grid, sigma_deg=1.5):
     s_data  = gaussian_filter(filled,  sigma=sigma_cells)
     s_weight = gaussian_filter(weight, sigma=sigma_cells)
     with np.errstate(invalid='ignore'):
-        result = np.where(s_weight > 0.05, s_data / s_weight, np.nan)
+        result = np.where(s_weight > 0.3, s_data / s_weight, np.nan)
     return result
 
 
@@ -72,7 +104,9 @@ def adaptive_threshold(smooth_grid, sigma=1.5):
 
 
 def detect_structures(smooth_grid, grid_lats, grid_lons,
-                      threshold=None, min_area_km2=15_000):
+                      threshold=None, min_area_km2=15_000,
+                      station_lats=None, station_lons=None,
+                      min_center_stations=2, center_radius_km=150):
     """
     Find connected positive/negative anomaly regions.
 
@@ -80,9 +114,21 @@ def detect_structures(smooth_grid, grid_lats, grid_lons,
         center_lat, center_lon, amplitude, sign (+1/-1),
         orientation_deg (0-180, major-axis azimuth from North),
         extent_lat_deg, extent_lon_deg, area_km2
+
+    If station_lats/station_lons are provided, any structure whose center
+    has fewer than min_center_stations within center_radius_km is discarded
+    (this removes interpolation artefacts over ocean/data-sparse areas).
     """
     if threshold is None:
         threshold = adaptive_threshold(smooth_grid)
+
+    # Build KD-tree for station-center proximity check
+    center_tree = None
+    if station_lats is not None and station_lons is not None and len(station_lats) > 0:
+        center_tree = cKDTree(np.column_stack([
+            np.asarray(station_lons) * KM_PER_DEG_LON,
+            np.asarray(station_lats) * KM_PER_DEG_LAT,
+        ]))
 
     cell_area_km2 = (GRID_RES * KM_PER_DEG_LAT) * (GRID_RES * KM_PER_DEG_LON)
     min_cells = max(4, int(min_area_km2 / cell_area_km2))
@@ -118,6 +164,15 @@ def detect_structures(smooth_grid, grid_lats, grid_lons,
             major = eigvecs[:, eigvals.argmax()]       # [dlat, dlon]
             # Convert to compass bearing of the band axis (0-180)
             orientation_deg = float(np.degrees(np.arctan2(major[1], major[0])) % 180)
+
+            # Discard structures over ocean / data-sparse areas
+            if center_tree is not None:
+                center_pt_km = [center_lon * KM_PER_DEG_LON,
+                                center_lat * KM_PER_DEG_LAT]
+                n_nearby = len(center_tree.query_ball_point(
+                    center_pt_km, r=center_radius_km))
+                if n_nearby < min_center_stations:
+                    continue
 
             structures.append({
                 'center_lat':     center_lat,
