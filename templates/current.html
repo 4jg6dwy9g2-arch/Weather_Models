@@ -685,6 +685,10 @@
                 onclick="toggleLightning()"
                 title="Show GOES-R GLM lightning (last 15 min)"
                 style="background:#1e293b;color:#e2e8f0;border-color:#334155;">⚡ Lightning</button>
+            <button id="btn-radar-gw" class="btn btn-sm"
+                onclick="toggleRadarGravityWaves()"
+                title="Overlay gravity wave pressure perturbation contours (≥1 mb)"
+                style="background:#1e293b;color:#e2e8f0;border-color:#334155;">〜 Gravity Waves</button>
             <select id="radar-product-select" class="form-select form-select-sm" style="width:auto;background:#1e293b;color:#e2e8f0;border-color:#334155;" onchange="switchRadarProduct(this.value)">
                 <optgroup label="MRMS National">
                     <option value="mrms-composite">Composite Reflectivity</option>
@@ -774,6 +778,7 @@
                 </select>
                 <button class="btn btn-sm btn-outline-primary" id="gravity-reload-btn">Reload</button>
                 <button class="btn btn-sm btn-outline-secondary" id="gravity-analyze-btn" title="Detect gravity wave structures in current frame">Analyze</button>
+                <button class="btn btn-sm btn-outline-info" id="gravity-gif-btn" title="Export frames as animated GIF">GIF</button>
                 <button class="btn btn-sm btn-primary" id="gravity-play-btn">Pause</button>
             </div>
             <div class="w-100 d-flex align-items-center gap-2">
@@ -809,6 +814,41 @@
 </div><!-- /#tab-gravity -->
 
 </div><!-- /.tab-content -->
+
+<!-- GIF export modal -->
+<div class="modal fade" id="gravityGifModal" tabindex="-1" aria-labelledby="gravityGifModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content bg-dark text-light border-secondary">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title" id="gravityGifModalLabel">Export Animated GIF</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label small text-muted">Start time</label>
+                    <select id="gif-start-frame" class="form-select form-select-sm bg-dark text-light border-secondary"></select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label small text-muted">End time</label>
+                    <select id="gif-end-frame" class="form-select form-select-sm bg-dark text-light border-secondary"></select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label small text-muted">Frame rate: <span id="gif-fps-label">8</span> fps</label>
+                    <input type="range" id="gif-fps" class="form-range" min="1" max="8" value="8">
+                </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="gif-include-analysis" checked>
+                    <label class="form-check-label small" for="gif-include-analysis">Include contour analysis overlay</label>
+                </div>
+                <div id="gif-status" class="small text-muted mt-2"></div>
+            </div>
+            <div class="modal-footer border-secondary">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-info btn-sm" id="gif-generate-btn">Generate &amp; Download</button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <!-- Station pressure detail modal -->
 <div class="modal fade" id="stationPressureModal" tabindex="-1" aria-labelledby="stationPressureModalLabel" aria-hidden="true">
@@ -1037,6 +1077,11 @@ let radarLastValidTime = null;
 let currentProduct   = 'mrms-composite';
 let wmsLayer         = null;
 let wmsRefreshTimer  = null;
+let radarGwLayer          = null;   // Leaflet layerGroup holding station markers
+let radarGwVisible        = false;
+let radarGwData           = null;   // full /api/asos/gravity-waves response
+let radarGwMarkers        = [];     // L.circleMarker array, parallel to radarGwData.stations
+let radarGwCurrentFrameIdx = -1;   // last rendered GW frame index
 
 const RADAR_BOUNDS = [[20.005, -130.005], [54.995, -60.005]];
 const RADAR_METADATA_URL  = '/api/radar/metadata';
@@ -1072,6 +1117,113 @@ async function initRadarMap() {
     // Start polling for data readiness
     setStatusMessage('Fetching NEXRAD MRMS data from NOAA AWS...', 'loading');
     pollForRadarReady();
+}
+
+function _findClosestGwFrameIdx(isoTimeStr) {
+    if (!radarGwData || !radarGwData.frames) return -1;
+    const frames = radarGwData.frames;
+    const target = new Date(isoTimeStr).getTime();
+    let best = 0, bestDelta = Infinity;
+    for (let i = 0; i < frames.length; i++) {
+        const delta = Math.abs(new Date(frames[i]).getTime() - target);
+        if (delta < bestDelta) { bestDelta = delta; best = i; }
+    }
+    return bestDelta <= 15 * 60 * 1000 ? best : -1;
+}
+
+function _updateGwMarkersForFrame(gwIdx) {
+    if (gwIdx === radarGwCurrentFrameIdx) return;
+    radarGwCurrentFrameIdx = gwIdx;
+    for (const marker of radarGwMarkers) {
+        const s = marker._gwStation;
+        const val = s.values[gwIdx];
+        marker.setStyle({
+            fillColor: gravityColor(val),
+            color: '#111',
+            weight: 0.5,
+            radius: gravityRadius(val),
+            fillOpacity: (val == null) ? 0.15 : 0.85,
+            opacity: 0.8,
+        });
+    }
+}
+
+function _syncGwMarkersToRadarFrame(radarTimeStr) {
+    if (!radarGwData) return;
+    const gwIdx = _findClosestGwFrameIdx(radarTimeStr);
+    if (gwIdx === -1) {
+        // No GW data near this radar time — fade markers
+        if (gwIdx !== radarGwCurrentFrameIdx) {
+            radarGwCurrentFrameIdx = gwIdx;
+            for (const m of radarGwMarkers) m.setStyle({ fillOpacity: 0.1, opacity: 0.3 });
+        }
+        return;
+    }
+    _updateGwMarkersForFrame(gwIdx);
+}
+
+async function toggleRadarGravityWaves() {
+    const btn = document.getElementById('btn-radar-gw');
+    if (radarGwVisible) {
+        if (radarGwLayer) { radarGwLayer.clearLayers(); radarGwLayer = null; }
+        radarGwMarkers = [];
+        radarGwData = null;
+        radarGwVisible = false;
+        radarGwCurrentFrameIdx = -1;
+        btn.style.background = '#1e293b';
+        btn.style.color = '#e2e8f0';
+        btn.style.borderColor = '#334155';
+        return;
+    }
+    btn.textContent = '〜 Loading…';
+    try {
+        const res = await fetch('/api/asos/gravity-waves?source=metar');
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'API error');
+        radarGwData = data;
+
+        radarGwLayer = L.layerGroup().addTo(radarMap);
+        radarGwMarkers = [];
+        for (const s of (data.stations || [])) {
+            if (s.lat == null || s.lon == null) continue;
+            const marker = L.circleMarker([s.lat, s.lon], {
+                radius: 2.5,
+                fillColor: '#9ca3af',
+                color: '#111',
+                weight: 0.5,
+                opacity: 0.8,
+                fillOpacity: 0.85,
+                interactive: true,
+            });
+            marker._gwStation = s;
+            marker.bindTooltip('', { sticky: true, className: 'small' });
+            marker.on('mouseover', function() {
+                const idx = radarGwCurrentFrameIdx >= 0 ? radarGwCurrentFrameIdx : (data.frames.length - 1);
+                const val = s.values[idx];
+                const valText = val == null ? 'N/A' : `${val > 0 ? '+' : ''}${val.toFixed(2)} mb`;
+                this.setTooltipContent(`<strong>${s.name}</strong> (${s.station_id})<br>Perturbation: ${valText}`);
+            });
+            radarGwLayer.addLayer(marker);
+            radarGwMarkers.push(marker);
+        }
+
+        // Sync to current radar frame or show latest
+        const currentRadarFrame = loopFrames[loopIdx];
+        if (currentRadarFrame && currentRadarFrame.t) {
+            _syncGwMarkersToRadarFrame(currentRadarFrame.t);
+        } else {
+            _updateGwMarkersForFrame(data.frames.length - 1);
+        }
+
+        radarGwVisible = true;
+        btn.textContent = '〜 Gravity Waves';
+        btn.style.background = '#7c3aed';
+        btn.style.color = '#fff';
+        btn.style.borderColor = '#7c3aed';
+    } catch (e) {
+        btn.textContent = '〜 Gravity Waves';
+        console.error('Gravity wave overlay failed:', e);
+    }
 }
 
 function setStatusMessage(msg, type) {
@@ -1510,18 +1662,19 @@ let gravitySource = 'metar'; // 'metar' | '1min'
 
 // Wave structure analysis overlay
 let gravityAnalysisLayer = null;  // Leaflet LayerGroup for contours + markers
+let gravityAnalysisCache = null;  // Array of per-frame analysis results (pre-fetched)
 
 function gravityColor(v) {
     if (v === null || v === undefined || !isFinite(v)) return '#9ca3af';
-    const x = Math.max(-3, Math.min(3, v));
+    const x = Math.max(-1, Math.min(1, v));
     if (x < 0) {
-        const t = (x + 3) / 3;
+        const t = x + 1;
         const r = Math.round(30 + t * 225);
         const g = Math.round(64 + t * 191);
         const b = 255;
         return `rgb(${r},${g},${b})`;
     }
-    const t = x / 3;
+    const t = x;
     const r = 255;
     const g = Math.round(255 - t * 205);
     const b = Math.round(255 - t * 205);
@@ -1615,6 +1768,11 @@ function renderGravityFrame(idx) {
         `${ts.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' })} UTC` +
         (method ? ` | ${method}` : '')
     );
+
+    // Update analysis overlay if pre-fetched cache is available
+    if (gravityAnalysisCache && gravityAnalysisCache[clamped]) {
+        _drawAnalysisFrame(gravityAnalysisCache[clamped]);
+    }
 }
 
 async function loadGravityWaves() {
@@ -1622,6 +1780,8 @@ async function loadGravityWaves() {
     setGravityStatus(gravitySource === 'metar' ? 'Loading 5-min METAR pressure perturbations...' : 'Loading 1-min ASOS pressure perturbations...');
     clearGravityMarkers();
     stopGravityLoop();
+    // Clear cached analysis — frame count may change on reload
+    clearGravityAnalysis();
 
     const windowSel = document.getElementById('gravity-window');
     const windowMinutes = windowSel ? parseInt(windowSel.value, 10) : 180;
@@ -1764,6 +1924,11 @@ function showLoopFrame(idx) {
 
     // Sync lightning to this frame's timestamp window
     if (lightningEnabled) _updateLoopLightning(frame.t);
+
+    // Sync gravity wave station markers to this frame's time
+    if (radarGwVisible && radarGwData && frame.t) {
+        _syncGwMarkersToRadarFrame(frame.t);
+    }
 
     setStatusMessage(`${prod.label} · 24h Loop`, 'ok');
 }
@@ -2078,13 +2243,14 @@ document.getElementById('gravity-play-btn').addEventListener('click', () => {
 // ── Gravity wave structure analysis ──────────────────────────────────────────
 
 // Contour level styling: negative=blue, positive=red, intensity by magnitude
-function _contourStyle(level) {
+function _contourStyle(level, threshold) {
     const abs = Math.abs(level);
     const pos = level > 0;
+    const t = threshold || 1.0;
     let color, weight, opacity, dash;
-    if (abs >= 2.0)      { color = pos ? '#c0392b' : '#1a5276'; weight = 2.5; opacity = 0.85; dash = null; }
-    else if (abs >= 1.0) { color = pos ? '#e74c3c' : '#2980b9'; weight = 1.8; opacity = 0.75; dash = null; }
-    else                 { color = pos ? '#f1948a' : '#7fb3d3'; weight = 1.2; opacity = 0.60; dash = '4,4'; }
+    if (abs >= t * 1.5)      { color = pos ? '#c0392b' : '#1a5276'; weight = 2.5; opacity = 0.85; dash = null; }
+    else if (abs >= t * 1.0) { color = pos ? '#e74c3c' : '#2980b9'; weight = 1.8; opacity = 0.75; dash = null; }
+    else                     { color = pos ? '#f1948a' : '#7fb3d3'; weight = 1.8; opacity = 0.80; dash = '4,4'; }
     return { color, weight, opacity, dashArray: dash };
 }
 
@@ -2092,136 +2258,116 @@ function clearGravityAnalysis() {
     if (gravityAnalysisLayer) {
         gravityAnalysisLayer.clearLayers();
     }
+    gravityAnalysisCache = null;
     document.getElementById('gravity-analysis-panel').classList.add('d-none');
     document.getElementById('gravity-analyze-btn').classList.remove('btn-warning');
     document.getElementById('gravity-analyze-btn').classList.add('btn-outline-secondary');
 }
 
+// Draw one frame's analysis results onto the map (called from renderGravityFrame)
+function _drawAnalysisFrame(data) {
+    if (!gravityAnalysisLayer) {
+        gravityAnalysisLayer = L.layerGroup().addTo(gravityMap);
+    } else {
+        gravityAnalysisLayer.clearLayers();
+    }
+
+    // Draw contours — only levels at or above the adaptive threshold
+    const contours = data.contours || {};
+    const minMb = data.threshold_mb || 0;
+    for (const [lvlStr, paths] of Object.entries(contours)) {
+        const lvl = parseFloat(lvlStr);
+        if (Math.abs(lvl) < minMb) continue;
+        const style = _contourStyle(lvl, minMb);
+        for (const path of paths) {
+            const poly = L.polyline(path, {
+                color:     style.color,
+                weight:    style.weight,
+                opacity:   style.opacity,
+                dashArray: style.dashArray,
+                interactive: false,
+            });
+            poly.bindTooltip(`${lvl > 0 ? '+' : ''}${lvl.toFixed(2)} mb`, { sticky: true, className: 'small' });
+            gravityAnalysisLayer.addLayer(poly);
+        }
+    }
+
+    const structures = data.structures || [];
+    document.getElementById('gravity-structures-list').innerHTML = '';
+
+    // Propagation arrow
+    const prop = data.propagation;
+    document.getElementById('gravity-propagation-info').classList.add('d-none');
+    if (prop && prop.speed_kmh > 2) {
+        const cx = structures.length > 0
+            ? structures.reduce((a, s) => a + s.center_lon, 0) / structures.length : -95.0;
+        const cy = structures.length > 0
+            ? structures.reduce((a, s) => a + s.center_lat, 0) / structures.length : 38.0;
+
+        const lenDeg = Math.min(8, prop.speed_kmh / 20);
+        const hdRad  = (prop.heading_deg - 90) * Math.PI / 180;
+        const dLon   = lenDeg * Math.cos(hdRad);
+        const dLat   = lenDeg * Math.sin(hdRad);
+
+        const arrow = L.polyline(
+            [[cy, cx], [cy + dLat, cx + dLon]],
+            { color: '#7c3aed', weight: 3, opacity: 0.9 }
+        );
+        const headSize = 0.4;
+        const backRad  = hdRad + Math.PI;
+        const tip = [cy + dLat, cx + dLon];
+        const p1  = [tip[0] + headSize * Math.sin(backRad + 0.4),
+                     tip[1] + headSize * Math.cos(backRad + 0.4)];
+        const p2  = [tip[0] + headSize * Math.sin(backRad - 0.4),
+                     tip[1] + headSize * Math.cos(backRad - 0.4)];
+        const head = L.polygon([tip, p1, p2], {
+            color: '#7c3aed', fillColor: '#7c3aed', fillOpacity: 0.9, weight: 1
+        });
+        arrow.bindTooltip(`${prop.speed_kmh.toFixed(0)} km/h @ ${prop.heading_deg.toFixed(0)}°`, { sticky: true });
+        gravityAnalysisLayer.addLayer(arrow);
+        gravityAnalysisLayer.addLayer(head);
+
+        const propInfo = document.getElementById('gravity-propagation-info');
+        propInfo.classList.remove('d-none');
+        document.getElementById('gravity-prop-speed').textContent = `${prop.speed_kmh.toFixed(0)} km/h`;
+        document.getElementById('gravity-prop-heading').textContent = `@ ${prop.heading_deg.toFixed(0)}°`;
+    }
+
+    const nStructures = structures.length;
+    const thresh = data.threshold_mb != null ? ` · threshold ±${data.threshold_mb.toFixed(2)} mb` : '';
+    document.getElementById('gravity-analysis-status').textContent =
+        `${nStructures} structure${nStructures !== 1 ? 's' : ''} detected · ${data.n_stations} stations${thresh}`;
+}
+
 async function runGravityAnalysis() {
     if (!gravityData || !gravityMap) return;
+    const nFrames = (gravityData.frames || []).length;
+    if (nFrames === 0) return;
+
     const btn = document.getElementById('gravity-analyze-btn');
     btn.disabled = true;
-    btn.textContent = 'Analyzing…';
+    btn.textContent = `Analyzing…`;
 
     const panel = document.getElementById('gravity-analysis-panel');
     panel.classList.remove('d-none');
-    document.getElementById('gravity-analysis-status').textContent = 'Running…';
+    document.getElementById('gravity-analysis-status').textContent = `Fetching ${nFrames} frames…`;
     document.getElementById('gravity-structures-list').innerHTML = '';
     document.getElementById('gravity-propagation-info').classList.add('d-none');
 
     try {
-        const resp = await fetch(
-            `/api/asos/gravity-wave-structures?source=${gravitySource}&frame=${gravityFrameIdx}`
+        // Fetch all frames in parallel
+        const requests = Array.from({ length: nFrames }, (_, i) =>
+            fetch(`/api/asos/gravity-wave-structures?source=${gravitySource}&frame=${i}`)
+                .then(r => r.json())
         );
-        const data = await resp.json();
-        if (!data.success) throw new Error(data.error || 'Analysis failed');
+        const results = await Promise.all(requests);
 
-        // Init layer group
-        if (!gravityAnalysisLayer) {
-            gravityAnalysisLayer = L.layerGroup().addTo(gravityMap);
-        } else {
-            gravityAnalysisLayer.clearLayers();
-        }
+        // Validate and store in cache
+        gravityAnalysisCache = results.map(d => (d && d.success) ? d : null);
 
-        // Draw contours
-        const contours = data.contours || {};
-        for (const [lvlStr, paths] of Object.entries(contours)) {
-            const lvl = parseFloat(lvlStr);
-            const style = _contourStyle(lvl);
-            for (const path of paths) {
-                const poly = L.polyline(path, {
-                    color:     style.color,
-                    weight:    style.weight,
-                    opacity:   style.opacity,
-                    dashArray: style.dashArray,
-                    interactive: false,
-                });
-                poly.bindTooltip(`${lvl > 0 ? '+' : ''}${lvl.toFixed(1)} mb`, { sticky: true, className: 'small' });
-                gravityAnalysisLayer.addLayer(poly);
-            }
-        }
-
-        // Draw structure markers
-        const structures = data.structures || [];
-        const listEl = document.getElementById('gravity-structures-list');
-        structures.forEach((s, i) => {
-            const color = s.sign > 0 ? '#c0392b' : '#1a5276';
-            const label = s.sign > 0 ? `+${s.amplitude.toFixed(2)} mb` : `${s.amplitude.toFixed(2)} mb`;
-            const radiusDeg = Math.max(0.5, Math.sqrt(s.area_km2 / Math.PI) / 111);
-            const radiusPx  = Math.max(6, Math.min(30, radiusDeg * 40));
-
-            const marker = L.circleMarker([s.center_lat, s.center_lon], {
-                radius:      radiusPx,
-                color:       color,
-                fillColor:   color,
-                fillOpacity: 0.15,
-                weight:      2,
-                dashArray:   '5,3',
-            });
-            marker.bindTooltip(
-                `<strong>${s.sign > 0 ? 'High' : 'Low'} anomaly</strong><br>` +
-                `Peak: ${label}<br>` +
-                `Area: ${(s.area_km2 / 1000).toFixed(0)}k km²<br>` +
-                `Band axis: ${s.orientation_deg.toFixed(0)}°`,
-                { sticky: true }
-            );
-            gravityAnalysisLayer.addLayer(marker);
-
-            // Badge in panel
-            const badge = document.createElement('span');
-            badge.className = 'badge rounded-pill px-2 py-1';
-            badge.style.cssText = `background:${color}22;color:${color};border:1px solid ${color};font-size:0.75rem;`;
-            badge.textContent = `${s.sign > 0 ? '▲' : '▼'} ${label} · ${(s.area_km2/1000).toFixed(0)}k km²`;
-            listEl.appendChild(badge);
-        });
-
-        // Propagation arrow
-        const prop = data.propagation;
-        if (prop && prop.speed_kmh > 2) {
-            const cx = (data.structures && data.structures.length > 0)
-                ? data.structures.reduce((a, s) => a + s.center_lon, 0) / data.structures.length
-                : -95.0;
-            const cy = (data.structures && data.structures.length > 0)
-                ? data.structures.reduce((a, s) => a + s.center_lat, 0) / data.structures.length
-                : 38.0;
-
-            // Arrow length ~ speed / 20 degrees
-            const lenDeg = Math.min(8, prop.speed_kmh / 20);
-            const hdRad  = (prop.heading_deg - 90) * Math.PI / 180; // convert met→math angle
-            const dLon   = lenDeg * Math.cos(hdRad);
-            const dLat   = lenDeg * Math.sin(hdRad);
-
-            const arrow = L.polyline(
-                [[cy, cx], [cy + dLat, cx + dLon]],
-                { color: '#7c3aed', weight: 3, opacity: 0.9 }
-            );
-            // Arrowhead (small triangle)
-            const headSize = 0.4;
-            const backRad  = hdRad + Math.PI;
-            const perpRad  = hdRad + Math.PI / 2;
-            const tip  = [cy + dLat, cx + dLon];
-            const p1   = [tip[0] + headSize * Math.sin(backRad + 0.4),
-                          tip[1] + headSize * Math.cos(backRad + 0.4)];
-            const p2   = [tip[0] + headSize * Math.sin(backRad - 0.4),
-                          tip[1] + headSize * Math.cos(backRad - 0.4)];
-            const head = L.polygon([tip, p1, p2], {
-                color: '#7c3aed', fillColor: '#7c3aed', fillOpacity: 0.9, weight: 1
-            });
-            arrow.bindTooltip(`${prop.speed_kmh.toFixed(0)} km/h @ ${prop.heading_deg.toFixed(0)}°`, { sticky: true });
-            gravityAnalysisLayer.addLayer(arrow);
-            gravityAnalysisLayer.addLayer(head);
-
-            // Update panel
-            const propInfo = document.getElementById('gravity-propagation-info');
-            propInfo.classList.remove('d-none');
-            document.getElementById('gravity-prop-speed').textContent = `${prop.speed_kmh.toFixed(0)} km/h`;
-            document.getElementById('gravity-prop-heading').textContent = `@ ${prop.heading_deg.toFixed(0)}°`;
-        }
-
-        const nStructures = structures.length;
-        const thresh = data.threshold_mb != null ? ` · threshold ±${data.threshold_mb.toFixed(2)} mb` : '';
-        document.getElementById('gravity-analysis-status').textContent =
-            `${nStructures} structure${nStructures !== 1 ? 's' : ''} detected · ${data.n_stations} stations${thresh}`;
+        // Draw the current frame
+        const frameData = gravityAnalysisCache[gravityFrameIdx];
+        if (frameData) _drawAnalysisFrame(frameData);
 
         btn.classList.remove('btn-outline-secondary');
         btn.classList.add('btn-warning');
@@ -2236,6 +2382,91 @@ async function runGravityAnalysis() {
 
 document.getElementById('gravity-analyze-btn').addEventListener('click', runGravityAnalysis);
 document.getElementById('gravity-clear-analysis-btn').addEventListener('click', clearGravityAnalysis);
+
+// ── GIF export ────────────────────────────────────────────────────────────────
+document.getElementById('gravity-gif-btn').addEventListener('click', () => {
+    if (!gravityData || !gravityData.frames || !gravityData.frames.length) {
+        alert('Load perturbation data first.'); return;
+    }
+    const frames = gravityData.frames;
+    const startSel = document.getElementById('gif-start-frame');
+    const endSel   = document.getElementById('gif-end-frame');
+    startSel.innerHTML = '';
+    endSel.innerHTML   = '';
+    frames.forEach((iso, i) => {
+        const ts  = new Date(iso);
+        const lbl = ts.toLocaleString([], {
+            month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', timeZone: 'UTC', hour12: false
+        }) + ' UTC';
+        startSel.appendChild(new Option(lbl, i));
+        endSel.appendChild(new Option(lbl, i));
+    });
+    // Default: last 6 hours
+    const lastTime  = new Date(frames[frames.length - 1]);
+    const sixHrsAgo = new Date(lastTime.getTime() - 6 * 3600 * 1000);
+    let defaultStart = 0;
+    for (let i = frames.length - 1; i >= 0; i--) {
+        if (new Date(frames[i]) <= sixHrsAgo) { defaultStart = i; break; }
+    }
+    startSel.value = String(defaultStart);
+    endSel.value   = String(frames.length - 1);
+    document.getElementById('gif-status').textContent = '';
+    new bootstrap.Modal(document.getElementById('gravityGifModal')).show();
+});
+
+document.getElementById('gif-fps').addEventListener('input', e => {
+    document.getElementById('gif-fps-label').textContent = e.target.value;
+});
+
+document.getElementById('gif-generate-btn').addEventListener('click', async () => {
+    const startIdx = parseInt(document.getElementById('gif-start-frame').value, 10);
+    const endIdx   = parseInt(document.getElementById('gif-end-frame').value, 10);
+    const fps      = parseInt(document.getElementById('gif-fps').value, 10);
+    const includeAnalysis = document.getElementById('gif-include-analysis').checked;
+
+    if (startIdx > endIdx) {
+        document.getElementById('gif-status').textContent = 'Start must be before end.'; return;
+    }
+
+    const frameIndices = Array.from({ length: endIdx - startIdx + 1 }, (_, i) => startIdx + i);
+    const btn = document.getElementById('gif-generate-btn');
+    btn.disabled = true;
+    btn.textContent = 'Generating…';
+    document.getElementById('gif-status').textContent =
+        `Rendering ${frameIndices.length} frame(s), this may take a moment…`;
+
+    try {
+        const resp = await fetch('/api/asos/export-gif', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                source: gravitySource,
+                frames: frameIndices,
+                fps,
+                include_analysis: includeAnalysis,
+            }),
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ error: resp.statusText }));
+            throw new Error(err.error || resp.statusText);
+        }
+        const blob = await resp.blob();
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href     = url;
+        a.download = 'pressure_perturbation.gif';
+        a.click();
+        URL.revokeObjectURL(url);
+        document.getElementById('gif-status').textContent = 'Download started!';
+        bootstrap.Modal.getInstance(document.getElementById('gravityGifModal'))?.hide();
+    } catch (e) {
+        document.getElementById('gif-status').textContent = `Error: ${e.message}`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Generate & Download';
+    }
+});
 
 // ── Station pressure detail chart ────────────────────────────────────────────
 

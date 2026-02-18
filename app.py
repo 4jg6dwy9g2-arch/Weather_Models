@@ -56,7 +56,6 @@ VERIF_LEAD_CACHE_PATH = DATA_DIR / "verification_lead_time_cache.json"
 COCORAHs_CACHE_PATH = DATA_DIR / "cocorahs_daily_cache.json"
 BIAS_HISTORY_CACHE_PATH = DATA_DIR / "bias_history_cache.json"
 import asos
-import rossby_waves
 import gravity_wave_detection as _gwd
 import nws_batch
 
@@ -1354,57 +1353,18 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
 
         times.append((init_time + timedelta(hours=hour)).isoformat())
 
-    # Calculate wave number forecast at 24-hour intervals for 15 days
-    z500_waves = None  # Current wave number (F000)
-    z500_field = None  # Store F000 z500 field for analog matching
-    z500_waves_forecast = {
-        "times": [],
-        "wave_numbers": [],
-        "amplitudes": [],
-        "variance_explained": []
-    }
-
-    # Calculate at 24-hour intervals up to 360 hours (15 days)
-    wave_forecast_hours = list(range(0, 361, 24))
-    global_region = Region("Global", (-180, 180, 20, 70))
-
-    for fhr in wave_forecast_hours:
-        try:
-            logger.info(f"Calculating Rossby wave number for GFS F{fhr:03d}")
-            z500_data = gfs_model.fetch_data(Z500_GFS, init_time, fhr, global_region)
-            wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
-
-            # Store forecast time series
-            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
-            z500_waves_forecast["times"].append(valid_time)
-            z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
-            # Get amplitude and variance of dominant wave
-            amplitudes = wave_metrics.get('top_3_amplitudes', [])
-            variance = wave_metrics.get('top_3_variance', [])
-            z500_waves_forecast["amplitudes"].append(amplitudes[0] if amplitudes else None)
-            z500_waves_forecast["variance_explained"].append(variance[0] if variance else None)
-
-            # Store F000 as current wave number and save full field
-            if fhr == 0:
-                z500_waves = wave_metrics
-                # Save the full z500 field for analog matching (F000 only)
-                z500_field = {
-                    'values': z500_data.values.tolist(),
-                    'latitude': z500_data.latitude.values.tolist(),
-                    'longitude': z500_data.longitude.values.tolist()
-                }
-                amp_str = f"{amplitudes[0]:.1f}m" if amplitudes else "N/A"
-                var_str = f"{variance[0]:.1f}%" if variance else "N/A"
-                logger.info(f"GFS wave number: {wave_metrics.get('wave_number')} (amplitude: {amp_str}, variance: {var_str})")
-
-        except Exception as e:
-            logger.warning(f"Wave analysis failed for GFS F{fhr:03d}: {e}")
-            # Add None values to maintain array alignment
-            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
-            z500_waves_forecast["times"].append(valid_time)
-            z500_waves_forecast["wave_numbers"].append(None)
-            z500_waves_forecast["amplitudes"].append(None)
-            z500_waves_forecast["variance_explained"].append(None)
+    # Fetch z500 at F000 for analog pattern matching
+    z500_field = None
+    try:
+        global_region = Region("Global", (-180, 180, 20, 70))
+        z500_data = gfs_model.fetch_data(Z500_GFS, init_time, 0, global_region)
+        z500_field = {
+            'values': z500_data.values.tolist(),
+            'latitude': z500_data.latitude.values.tolist(),
+            'longitude': z500_data.longitude.values.tolist()
+        }
+    except Exception as e:
+        logger.warning(f"Failed to fetch z500 for analog matching: {e}")
 
     return {
         "temps": temps,
@@ -1412,8 +1372,6 @@ def fetch_gfs_data(region, forecast_hours, init_hour: Optional[int] = None):
         "mslps": mslps,
         "times": times,
         "init_time": init_time.isoformat(),
-        "z500_waves": z500_waves,
-        "z500_waves_forecast": z500_waves_forecast,
         "z500_field": z500_field
     }
 
@@ -1489,60 +1447,12 @@ def fetch_aifs_data(region, forecast_hours, init_hour: Optional[int] = None):
             else:
                 precips.append(None)
 
-    # Calculate wave number forecast at 24-hour intervals for 15 days
-    z500_waves = None  # Current wave number (F000)
-    z500_waves_forecast = {
-        "times": [],
-        "wave_numbers": [],
-        "amplitudes": [],
-        "variance_explained": []
-    }
-
-    # Calculate at 24-hour intervals up to 360 hours (15 days)
-    wave_forecast_hours = list(range(0, 361, 24))
-    global_region = Region("Global", (-180, 180, 20, 70))
-    z500_var = AIFS_VARIABLES["z500"]
-
-    for fhr in wave_forecast_hours:
-        try:
-            logger.info(f"Calculating Rossby wave number for AIFS F{fhr:03d}")
-            z500_data = aifs_model.fetch_data(z500_var, init_time, fhr, global_region)
-            wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
-
-            # Store forecast time series
-            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
-            z500_waves_forecast["times"].append(valid_time)
-            z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
-            # Get amplitude and variance of dominant wave
-            amplitudes = wave_metrics.get('top_3_amplitudes', [])
-            variance = wave_metrics.get('top_3_variance', [])
-            z500_waves_forecast["amplitudes"].append(amplitudes[0] if amplitudes else None)
-            z500_waves_forecast["variance_explained"].append(variance[0] if variance else None)
-
-            # Store F000 as current wave number
-            if fhr == 0:
-                z500_waves = wave_metrics
-                amp_str = f"{amplitudes[0]:.1f}m" if amplitudes else "N/A"
-                var_str = f"{variance[0]:.1f}%" if variance else "N/A"
-                logger.info(f"AIFS wave number: {wave_metrics.get('wave_number')} (amplitude: {amp_str}, variance: {var_str})")
-
-        except Exception as e:
-            logger.warning(f"Wave analysis failed for AIFS F{fhr:03d}: {e}")
-            # Add None values to maintain array alignment
-            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
-            z500_waves_forecast["times"].append(valid_time)
-            z500_waves_forecast["wave_numbers"].append(None)
-            z500_waves_forecast["amplitudes"].append(None)
-            z500_waves_forecast["variance_explained"].append(None)
-
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
         "init_time": init_time.isoformat(),
-        "z500_waves": z500_waves,
-        "z500_waves_forecast": z500_waves_forecast
     }
 
 
@@ -1629,61 +1539,12 @@ def fetch_ifs_data(region, forecast_hours, init_hour: Optional[int] = None):
         mslps.append(None)
         times.append(None)
 
-    # Calculate wave number forecast at 24-hour intervals (IFS only goes to 240 hours)
-    z500_waves = None  # Current wave number (F000)
-    z500_waves_forecast = {
-        "times": [],
-        "wave_numbers": [],
-        "amplitudes": [],
-        "variance_explained": []
-    }
-
-    # Calculate at 24-hour intervals (range depends on init time)
-    wave_max_hour = 240 if init_time.hour in [0, 12] else 144
-    wave_forecast_hours = list(range(0, wave_max_hour + 1, 24))
-    global_region = Region("Global", (-180, 180, 20, 70))
-    z500_var = IFS_VARIABLES["z500"]
-
-    for fhr in wave_forecast_hours:
-        try:
-            logger.info(f"Calculating Rossby wave number for IFS F{fhr:03d}")
-            z500_data = ifs_model.fetch_data(z500_var, init_time, fhr, global_region)
-            wave_metrics = rossby_waves.calculate_wave_number(z500_data, latitude=55.0)
-
-            # Store forecast time series
-            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
-            z500_waves_forecast["times"].append(valid_time)
-            z500_waves_forecast["wave_numbers"].append(wave_metrics.get('wave_number'))
-            # Get amplitude and variance of dominant wave
-            amplitudes = wave_metrics.get('top_3_amplitudes', [])
-            variance = wave_metrics.get('top_3_variance', [])
-            z500_waves_forecast["amplitudes"].append(amplitudes[0] if amplitudes else None)
-            z500_waves_forecast["variance_explained"].append(variance[0] if variance else None)
-
-            # Store F000 as current wave number
-            if fhr == 0:
-                z500_waves = wave_metrics
-                amp_str = f"{amplitudes[0]:.1f}m" if amplitudes else "N/A"
-                var_str = f"{variance[0]:.1f}%" if variance else "N/A"
-                logger.info(f"IFS wave number: {wave_metrics.get('wave_number')} (amplitude: {amp_str}, variance: {var_str})")
-
-        except Exception as e:
-            logger.warning(f"Wave analysis failed for IFS F{fhr:03d}: {e}")
-            # Add None values to maintain array alignment
-            valid_time = (init_time + timedelta(hours=fhr)).isoformat()
-            z500_waves_forecast["times"].append(valid_time)
-            z500_waves_forecast["wave_numbers"].append(None)
-            z500_waves_forecast["amplitudes"].append(None)
-            z500_waves_forecast["variance_explained"].append(None)
-
     return {
         "temps": temps,
         "precips": precips,
         "mslps": mslps,
         "times": times,
         "init_time": init_time.isoformat(),
-        "z500_waves": z500_waves,
-        "z500_waves_forecast": z500_waves_forecast
     }
 
 
@@ -3990,433 +3851,6 @@ def api_precip_daily_history():
         "aifs_bias": aifs_bias,
         "ifs_bias": ifs_bias
     })
-
-@app.route('/api/wave-analysis')
-def api_wave_analysis():
-    """
-    Get Rossby wave numbers for latest forecast run.
-
-    Query params:
-        - location: Location name (default: "Fairfax, VA")
-
-    Returns:
-        {
-            "success": true,
-            "location": "Fairfax, VA",
-            "init_time": "2026-02-02T00:00:00",
-            "gfs_waves": {...},
-            "aifs_waves": {...},
-            "ifs_waves": {...}
-        }
-    """
-    location_name = request.args.get('location', 'Fairfax, VA')
-
-    try:
-        db = load_forecasts_db()
-        if location_name not in db:
-            return jsonify({"success": False, "error": "Location not found"})
-
-        latest_run = db[location_name].get("latest_run")
-        if not latest_run:
-            return jsonify({"success": False, "error": "No forecast data"})
-
-        run_data = db[location_name]["runs"][latest_run]
-
-        return jsonify({
-            "success": True,
-            "location": location_name,
-            "init_time": latest_run,
-            "gfs_waves": run_data.get("gfs", {}).get("z500_waves"),
-            "aifs_waves": run_data.get("aifs", {}).get("z500_waves"),
-            "ifs_waves": run_data.get("ifs", {}).get("z500_waves")
-        })
-    except Exception as e:
-        logger.error(f"Error fetching wave analysis: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
-@app.route('/api/wave-time-series')
-def api_wave_time_series():
-    """
-    Get historical time series of wave numbers from 00Z runs only.
-
-    Note: Only 00Z model runs are included in the historical time series
-    to maintain consistency in daily wave number tracking.
-
-    Query params:
-        - location: Location name (default: "Fairfax, VA")
-        - days_back: Number of days to look back (default: 30)
-
-    Returns:
-        {
-            "success": true,
-            "location": "Fairfax, VA",
-            "dates": ["2026-01-15T00:00:00", ...],
-            "gfs": [5.5, 6.0, 4.5, ...],
-            "aifs": [5.0, 5.5, 4.0, ...],
-            "ifs": [5.5, 6.0, 4.5, ...]
-        }
-    """
-    location_name = request.args.get('location', 'Fairfax, VA')
-    days_back = int(request.args.get('days_back', 30))
-
-    try:
-        db = load_forecasts_db()
-        if location_name not in db:
-            return jsonify({"success": False, "error": "Location not found"})
-
-        runs = db[location_name].get("runs", {})
-        now = datetime.now(timezone.utc)
-        cutoff_date = now - timedelta(days=days_back)
-
-        # Collect wave numbers from all runs
-        dates = []
-        gfs_waves = []
-        aifs_waves = []
-        ifs_waves = []
-
-        for run_id, run_data in sorted(runs.items()):
-            try:
-                run_time = datetime.fromisoformat(run_id)
-                if run_time.tzinfo is None:
-                    run_time = run_time.replace(tzinfo=timezone.utc)
-
-                if run_time < cutoff_date:
-                    continue
-
-                # Only include 00Z runs in historical data
-                if run_time.hour != 0:
-                    continue
-
-                # Extract wave numbers (handle None case with 'or {}')
-                gfs_wave = (run_data.get("gfs", {}).get("z500_waves") or {}).get("wave_number")
-                aifs_wave = (run_data.get("aifs", {}).get("z500_waves") or {}).get("wave_number")
-                ifs_wave = (run_data.get("ifs", {}).get("z500_waves") or {}).get("wave_number")
-
-                # Only include if at least one model has data
-                if gfs_wave or aifs_wave or ifs_wave:
-                    dates.append(run_id)
-                    gfs_waves.append(gfs_wave)
-                    aifs_waves.append(aifs_wave)
-                    ifs_waves.append(ifs_wave)
-
-            except (ValueError, TypeError):
-                continue
-
-        return jsonify({
-            "success": True,
-            "location": location_name,
-            "dates": dates,
-            "gfs": gfs_waves,
-            "aifs": aifs_waves,
-            "ifs": ifs_waves
-        })
-
-    except Exception as e:
-        logger.error(f"Error fetching wave time series: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
-@app.route('/api/wave-forecast')
-def api_wave_forecast():
-    """
-    Get wave number forecast for the latest run (15-day forecast of wave numbers).
-
-    Query params:
-        - location: Location name (default: "Fairfax, VA")
-
-    Returns:
-        {
-            "success": true,
-            "location": "Fairfax, VA",
-            "init_time": "2026-02-02T00:00:00",
-            "gfs_forecast": {
-                "times": [...],
-                "wave_numbers": [...]
-            },
-            "aifs_forecast": {...},
-            "ifs_forecast": {...}
-        }
-    """
-    location_name = request.args.get('location', 'Fairfax, VA')
-
-    try:
-        db = load_forecasts_db()
-        if location_name not in db:
-            return jsonify({"success": False, "error": "Location not found"})
-
-        latest_run = db[location_name].get("latest_run")
-        if not latest_run:
-            return jsonify({"success": False, "error": "No forecast data"})
-
-        run_data = db[location_name]["runs"][latest_run]
-
-        return jsonify({
-            "success": True,
-            "location": location_name,
-            "init_time": latest_run,
-            "gfs_forecast": run_data.get("gfs", {}).get("z500_waves_forecast"),
-            "aifs_forecast": run_data.get("aifs", {}).get("z500_waves_forecast"),
-            "ifs_forecast": run_data.get("ifs", {}).get("z500_waves_forecast")
-        })
-    except Exception as e:
-        logger.error(f"Error fetching wave forecast: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
-@app.route('/api/wave-skill-correlation')
-def api_wave_skill_correlation():
-    """
-    Analyze correlation between Rossby wave patterns and forecast errors.
-
-    This endpoint calculates the relationship between wave characteristics
-    (wave number, amplitude) and temperature forecast errors at different
-    lead times using ASOS network mean verification.
-
-    Query params:
-        - location: Location name (default: "Fairfax, VA")
-        - days_back: Number of days to analyze (default: 90)
-
-    Returns:
-        {
-            "success": true,
-            "current_wave_number": 5,
-            "predictability_status": "MEDIUM",
-            "confidence": "High",
-            "expected_error_72h": 2.8,
-            "expected_error_120h": 4.2,
-            "wave_error_correlation": {
-                "points_72h": [{x: 3, y: 2.1}, ...],
-                "points_120h": [{x: 3, y: 3.5}, ...]
-            },
-            "amplitude_error_correlation": {
-                "points_72h": [{x: 245, y: 2.1}, ...],
-                "points_120h": [{x: 245, y: 3.5}, ...]
-            }
-        }
-    """
-    location_name = request.args.get('location', 'Fairfax, VA')
-    days_back = int(request.args.get('days_back', 90))
-
-    try:
-        # Import ASOS module
-        import asos
-
-        # Load Fairfax forecast database (for wave data)
-        fairfax_db = load_forecasts_db()
-        if location_name not in fairfax_db:
-            return jsonify({"success": False, "error": "Location not found"})
-
-        # Load ASOS forecast database (for verification data)
-        asos_db = asos.load_asos_forecasts_db()
-        if not asos_db or "runs" not in asos_db:
-            return jsonify({"success": False, "error": "ASOS verification data not available"})
-
-        # Get cutoff date (timezone-aware)
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
-
-        # Collect wave-error pairs
-        wave_error_data_72h = []
-        wave_error_data_120h = []
-        amplitude_error_data_72h = []
-        amplitude_error_data_120h = []
-
-        # Loop through ASOS runs to get verification data
-        for run_time_str, asos_run in asos_db["runs"].items():
-            try:
-                run_time = datetime.fromisoformat(run_time_str)
-                if run_time.tzinfo is None:
-                    run_time = run_time.replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-
-            # Skip runs outside the time window
-            if run_time < cutoff_date:
-                continue
-
-            # Get wave data from Fairfax database for this same init time
-            fairfax_runs = fairfax_db[location_name].get("runs", {})
-            if run_time_str not in fairfax_runs:
-                continue
-
-            fairfax_run = fairfax_runs[run_time_str]
-            gfs_waves = fairfax_run.get("gfs", {}).get("z500_waves")
-            if not gfs_waves or gfs_waves.get("wave_number") is None:
-                continue
-
-            wave_number = gfs_waves.get("wave_number")
-            amplitude = gfs_waves.get("top_3_amplitudes", [None])[0]
-
-            # Calculate ASOS mean MAE for this run at 72h and 120h
-            forecast_hours = asos_run.get("forecast_hours", [])
-
-            # Calculate 72h error
-            if 72 in forecast_hours:
-                mae_72h = asos._calculate_asos_mean_mae(asos_db, run_time_str, 'gfs', 'temp', 72)
-                if mae_72h is not None and mae_72h > 0:
-                    wave_error_data_72h.append({"x": wave_number, "y": mae_72h})
-                    if amplitude is not None:
-                        amplitude_error_data_72h.append({"x": amplitude, "y": mae_72h})
-
-            # Calculate 120h error
-            if 120 in forecast_hours:
-                mae_120h = asos._calculate_asos_mean_mae(asos_db, run_time_str, 'gfs', 'temp', 120)
-                if mae_120h is not None and mae_120h > 0:
-                    wave_error_data_120h.append({"x": wave_number, "y": mae_120h})
-                    if amplitude is not None:
-                        amplitude_error_data_120h.append({"x": amplitude, "y": mae_120h})
-
-        # Calculate expected errors based on current wave pattern
-        latest_run = fairfax_db[location_name].get("latest_run")
-        current_wave_number = None
-        expected_error_72h = None
-        expected_error_120h = None
-        predictability_status = "UNKNOWN"
-        confidence = "Low"
-
-        if latest_run and latest_run in fairfax_db[location_name]["runs"]:
-            current_run = fairfax_db[location_name]["runs"][latest_run]
-            current_waves = current_run.get("gfs", {}).get("z500_waves", {})
-            current_wave_number = current_waves.get("wave_number")
-
-            if current_wave_number is not None and wave_error_data_72h:
-                # Calculate average error for this wave number (±1 wave number tolerance)
-                errors_72h_for_wave = [
-                    d["y"] for d in wave_error_data_72h
-                    if abs(d["x"] - current_wave_number) <= 1
-                ]
-                errors_120h_for_wave = [
-                    d["y"] for d in wave_error_data_120h
-                    if abs(d["x"] - current_wave_number) <= 1
-                ]
-
-                if errors_72h_for_wave:
-                    expected_error_72h = sum(errors_72h_for_wave) / len(errors_72h_for_wave)
-                    confidence = "High" if len(errors_72h_for_wave) >= 10 else "Medium" if len(errors_72h_for_wave) >= 5 else "Low"
-
-                if errors_120h_for_wave:
-                    expected_error_120h = sum(errors_120h_for_wave) / len(errors_120h_for_wave)
-
-                # Determine predictability status based on wave number
-                if current_wave_number <= 4:
-                    predictability_status = "HIGH"
-                elif current_wave_number <= 6:
-                    predictability_status = "MEDIUM"
-                else:
-                    predictability_status = "LOW"
-
-        return jsonify({
-            "success": True,
-            "location": location_name,
-            "days_analyzed": days_back,
-            "sample_size": len(wave_error_data_72h),
-            "current_wave_number": current_wave_number,
-            "predictability_status": predictability_status,
-            "confidence": confidence,
-            "expected_error_72h": round(expected_error_72h, 1) if expected_error_72h else None,
-            "expected_error_120h": round(expected_error_120h, 1) if expected_error_120h else None,
-            "wave_error_correlation": {
-                "points_72h": wave_error_data_72h,
-                "points_120h": wave_error_data_120h
-            },
-            "amplitude_error_correlation": {
-                "points_72h": amplitude_error_data_72h,
-                "points_120h": amplitude_error_data_120h
-            }
-        })
-
-    except Exception as e:
-        logger.error(f"Error calculating wave-skill correlation: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
-@app.route('/api/era5/wave-analysis')
-def api_era5_wave_analysis():
-    """
-    Analyze Rossby waves from ERA5 reanalysis data.
-
-    Query params:
-        - start_date: Start date (YYYY-MM-DD), default: 30 days ago
-        - end_date: End date (YYYY-MM-DD), default: today
-
-    Returns wave numbers calculated from ERA5 500mb heights over time.
-    """
-    try:
-        import xarray as xr
-        from datetime import datetime, timedelta
-
-        # Get date range
-        end_date = request.args.get('end_date')
-        start_date = request.args.get('start_date')
-
-        if not end_date:
-            end_date = datetime.now()
-        else:
-            end_date = datetime.fromisoformat(end_date)
-
-        if not start_date:
-            start_date = end_date - timedelta(days=30)
-        else:
-            start_date = datetime.fromisoformat(start_date)
-
-        # Load ERA5 data
-        era5_files = list(Path("/Volumes/T7/Weather_Models/era5/global_500mb").glob("era5_z500_NH_*.nc"))
-
-        if not era5_files:
-            return jsonify({"success": False, "error": "No ERA5 data found. Please download data first."})
-
-        # Load the most recent file or combine multiple files
-        datasets = []
-        for f in era5_files:
-            try:
-                ds = xr.open_dataset(f)
-                datasets.append(ds)
-            except Exception as e:
-                logger.warning(f"Failed to load {f}: {e}")
-
-        if not datasets:
-            return jsonify({"success": False, "error": "Failed to load ERA5 datasets"})
-
-        # Combine datasets
-        ds = xr.concat(datasets, dim='time')
-        ds = ds.sortby('time')
-
-        # Filter to requested date range
-        ds = ds.sel(time=slice(start_date, end_date))
-
-        # Calculate wave numbers for each day
-        wave_data = []
-
-        for t in ds.time.values:
-            try:
-                # Get 500mb heights for this time (keep as DataArray with coordinates)
-                z500 = ds['z'].sel(time=t, pressure_level=500)
-
-                # Use rossby_waves module to calculate wave number (pass DataArray directly)
-                wave_result = rossby_waves.calculate_wave_number(z500, latitude=55.0)
-
-                wave_data.append({
-                    "time": str(t),
-                    "wave_number": wave_result.get("wave_number", 0),
-                    "dominant_waves": wave_result.get("dominant_wave_numbers", []),
-                    "variance_explained": wave_result.get("top_3_variance", {})
-                })
-            except Exception as e:
-                logger.warning(f"Failed to calculate wave for {t}: {e}")
-                continue
-
-        return jsonify({
-            "success": True,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "wave_data": wave_data
-        })
-
-    except Exception as e:
-        logger.error(f"Error in ERA5 wave analysis: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
 @app.route('/api/era5/500mb-map')
 def api_era5_500mb_map():
     """
@@ -4479,8 +3913,7 @@ def api_era5_500mb_map():
         # Convert to dam (decameters) for traditional display
         z500_dam = z500 / 9.80665
 
-        # Calculate wave number
-        wave_result = rossby_waves.calculate_wave_number(z500, latitude=55.0)
+        wave_result = {}
 
         # Generate map image
         import warnings
@@ -4635,9 +4068,7 @@ def _find_analogs_core(top_n: int = 10, method: str = 'composite') -> dict:
         current_lats_gfs = z500_da.latitude.values
         current_lons_gfs = z500_da.longitude.values
 
-        # Compute wave number live
-        wave_result = rossby_waves.calculate_wave_number(z500_da, latitude=55.0)
-        current_wave_num = wave_result.get('wave_number')
+        current_wave_num = None
 
     except Exception as e:
         logger.warning(f"Live GFS z500 fetch failed ({e}); falling back to stored DB")
@@ -4911,8 +4342,7 @@ def _find_analogs_core(top_n: int = 10, method: str = 'composite') -> dict:
                 time=t,
                 **{pressure_coord: 500, lat_coord_name: era5_lats_overlap, lon_coord_name: era5_lons_overlap}
             )
-            wave_result = rossby_waves.calculate_wave_number(hist_z_da, latitude=55.0)
-            record['wave_number'] = wave_result.get('wave_number')
+            record['wave_number'] = None
 
             analogs.append(record)
 
@@ -5075,9 +4505,8 @@ def api_era5_analog_compare_map():
         else:
             gfs_anom = gfs_heights - np.nanmean(gfs_heights, axis=1, keepdims=True)
 
-        # Wave numbers
-        era5_wave = rossby_waves.calculate_wave_number(era5_z500, latitude=55.0)
-        gfs_wave  = rossby_waves.calculate_wave_number(gfs_z500_da, latitude=55.0)
+        era5_wave = {}
+        gfs_wave  = {}
 
         # ---- Build figure ----
         proj = ccrs.NorthPolarStereo(central_longitude=-100)
@@ -6860,9 +6289,10 @@ def asos_verification_page():
     )
 
 
+
 @app.route('/rossby')
 def rossby_page():
-    """Rossby Wave Analysis page - shows wave patterns and predictability."""
+    """Rossby wave analysis and SOM clustering page."""
     return render_template('rossby.html')
 
 
@@ -7082,7 +6512,7 @@ def api_historical():
 
 def extract_model_at_stations(model_data_array, stations):
     """
-    Extract model values at station locations via bilinear interpolation.
+    Extract model values at station locations via vectorized bilinear interpolation.
 
     Args:
         model_data_array: xarray DataArray with lat/lon coordinates
@@ -7093,54 +6523,64 @@ def extract_model_at_stations(model_data_array, stations):
     """
     import xarray as xr
 
-    values = []
     lat_name = 'latitude' if 'latitude' in model_data_array.coords else 'lat'
     lon_name = 'longitude' if 'longitude' in model_data_array.coords else 'lon'
 
-    # Get coordinate values
-    lats = model_data_array[lat_name].values
-    lons = model_data_array[lon_name].values
+    grid_lats = model_data_array[lat_name].values
+    grid_lons = model_data_array[lon_name].values
+    lon_is_0_360 = grid_lons.min() >= 0 and grid_lons.max() > 180
 
-    # Check longitude convention
-    lon_is_0_360 = lons.min() >= 0 and lons.max() > 180
+    station_lats = np.array([s['lat'] for s in stations], dtype=float)
+    station_lons = np.array([s['lon'] for s in stations], dtype=float)
 
-    for station in stations:
-        try:
-            slat = station['lat']
-            slon = station['lon']
+    if lon_is_0_360:
+        station_lons = np.where(station_lons < 0, station_lons + 360, station_lons)
 
-            # Convert longitude if needed
-            if lon_is_0_360 and slon < 0:
-                slon = slon + 360
+    # Mark out-of-bounds stations so we can restore None after vectorized interp
+    in_bounds = (
+        (station_lats >= grid_lats.min()) & (station_lats <= grid_lats.max()) &
+        (station_lons >= grid_lons.min()) & (station_lons <= grid_lons.max())
+    )
 
-            # Check bounds
-            if slat < lats.min() or slat > lats.max():
+    try:
+        result = model_data_array.interp(
+            {
+                lat_name: xr.DataArray(station_lats, dims='points'),
+                lon_name: xr.DataArray(station_lons, dims='points'),
+            },
+            method='linear',
+        )
+        # Squeeze any extra dims (e.g. valid_time) so result is 1-D over points
+        vals = np.asarray(result.values).squeeze()
+        if vals.ndim == 0:
+            vals = vals.reshape(1)
+        if vals.ndim > 1:
+            # Unexpected extra dims — flatten to (n_extra, n_stations) and take last row
+            vals = vals.reshape(-1, len(stations))[-1]
+    except Exception as e:
+        logger.warning(f"Vectorized interpolation failed, falling back to scalar: {e}")
+        # Fall back to the old scalar loop
+        values = []
+        for i, station in enumerate(stations):
+            if not in_bounds[i]:
                 values.append(None)
                 continue
-            if slon < lons.min() or slon > lons.max():
+            try:
+                val = model_data_array.interp(
+                    {lat_name: float(station_lats[i]), lon_name: float(station_lons[i])},
+                    method='linear',
+                ).values
+                if hasattr(val, 'item'):
+                    val = val.item()
+                values.append(None if np.isnan(val) else float(val))
+            except Exception:
                 values.append(None)
-                continue
+        return values
 
-            # Interpolate
-            val = model_data_array.interp(
-                {lat_name: slat, lon_name: slon},
-                method='linear'
-            ).values
-
-            # Handle scalar or array result
-            if hasattr(val, 'item'):
-                val = val.item()
-
-            if np.isnan(val):
-                values.append(None)
-            else:
-                values.append(float(val))
-
-        except Exception as e:
-            logger.warning(f"Interpolation failed for station {station.get('station_id', '?')}: {e}")
-            values.append(None)
-
-    return values
+    return [
+        None if (not in_bounds[i] or np.isnan(v)) else float(v)
+        for i, v in enumerate(vals)
+    ]
 
 
 def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_hour: Optional[int] = None):
@@ -7334,6 +6774,52 @@ def _parse_iso_utc(ts_str: str) -> datetime:
     else:
         dt = dt.astimezone(timezone.utc)
     return dt
+
+
+def _clean_pressure_points(
+    points: list[tuple[datetime, float]],
+    *,
+    min_mb: float = 875.0,
+    max_mb: float = 1085.0,
+    max_jump_mb: float = 4.0,
+    max_rate_mb_per_min: float = 0.35,
+    max_dt_minutes_for_jump_check: float = 20.0,
+) -> list[tuple[datetime, float]]:
+    """
+    Remove implausible surface pressure observations.
+
+    Rules:
+    - Drop values outside [min_mb, max_mb].
+    - Drop step changes that are too large for their time gap:
+      |dp| > max(max_jump_mb, max_rate_mb_per_min * dt_minutes), for dt <= max_dt_minutes_for_jump_check.
+    """
+    if not points:
+        return []
+
+    cleaned: list[tuple[datetime, float]] = []
+    for dt, p in sorted(points, key=lambda x: x[0]):
+        try:
+            val = float(p)
+        except Exception:
+            continue
+        if not np.isfinite(val):
+            continue
+        if val < min_mb or val > max_mb:
+            continue
+
+        if cleaned:
+            prev_dt, prev_val = cleaned[-1]
+            dt_min = (dt - prev_dt).total_seconds() / 60.0
+            if dt_min <= 0:
+                continue
+            if dt_min <= max_dt_minutes_for_jump_check:
+                jump_limit = max(max_jump_mb, max_rate_mb_per_min * dt_min)
+                if abs(val - prev_val) > jump_limit:
+                    continue
+
+        cleaned.append((dt, val))
+
+    return cleaned
 
 
 def _moving_average_nan(arr: np.ndarray, n: int) -> np.ndarray:
@@ -7590,6 +7076,9 @@ def rebuild_asos_pressure_perturbation_cache(
         stations_with_points += 1
         stations_with_consistent_cadence += 1
         points.sort(key=lambda x: x[0])
+        points = _clean_pressure_points(points)
+        if len(points) < 6:
+            continue
         station_raw[sid] = {
             "station_id": sid,
             "name": meta.get("name", sid),
@@ -7943,6 +7432,9 @@ def rebuild_asos_metar_perturbation_cache(
         if len(points) < 6:
             continue
         points.sort(key=lambda x: x[0])
+        points = _clean_pressure_points(points)
+        if len(points) < 6:
+            continue
         station_raw[sid] = {
             "station_id": sid,
             "name":  sid_data.get("name", sid),
@@ -8187,6 +7679,9 @@ def api_asos_gravity_waves():
             dbg_stations_with_points += 1
             dbg_stations_with_consistent_cadence += 1
             points.sort(key=lambda x: x[0])
+            points = _clean_pressure_points(points)
+            if len(points) < 6:
+                continue
             station_raw[sid] = {
                 "meta": {
                     "station_id": sid,
@@ -8375,7 +7870,8 @@ def api_gravity_wave_structures():
 
         threshold  = _gwd.adaptive_threshold(smooth, sigma=1.5)
         structures = _gwd.detect_structures(smooth, grid_lats_2d, grid_lons_2d,
-                                            threshold=threshold, min_area_km2=15_000)
+                                            threshold=threshold, min_area_km2=15_000,
+                                            station_lats=lats, station_lons=lons)
         contours   = _gwd.get_contour_paths(smooth, grid_lats_2d, grid_lons_2d)
 
         # Propagation: compare with previous frame
@@ -8404,6 +7900,206 @@ def api_gravity_wave_structures():
     except Exception as e:
         logger.error(f'gravity-wave-structures error: {e}', exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/asos/gravity-wave-frame-times')
+def api_gravity_wave_frame_times():
+    """Return the list of gravity wave frame timestamps for radar sync."""
+    source = request.args.get('source', 'metar').strip().lower()
+    try:
+        cached = load_asos_metar_perturbation_cache() if source == 'metar' else load_asos_pressure_perturbation_cache()
+        if not cached or not cached.get('frames'):
+            return jsonify({'success': False, 'error': 'No data available'}), 404
+        return jsonify({
+            'success': True,
+            'frames': cached['frames'],
+            'cadence_minutes': cached.get('cadence_minutes', 5),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/asos/export-gif', methods=['POST'])
+def api_asos_export_gif():
+    """Render selected perturbation frames as an animated GIF."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import warnings
+    from io import BytesIO
+    from PIL import Image
+
+    try:
+        body         = request.get_json(force=True) or {}
+        source       = body.get('source', 'metar').strip().lower()
+        frame_indices = body.get('frames', [])
+        fps          = max(1, min(10, int(body.get('fps', 2))))
+        include_analysis = bool(body.get('include_analysis', False))
+
+        if not frame_indices:
+            return jsonify({'error': 'No frames specified'}), 400
+
+        # Load perturbation data
+        if source == 'metar':
+            cached = load_asos_metar_perturbation_cache()
+        else:
+            cached = load_asos_pressure_perturbation_cache()
+
+        if not cached or not cached.get('stations') or not cached.get('frames'):
+            return jsonify({'error': 'No perturbation data available'}), 404
+
+        stations = cached['stations']
+        frames   = cached['frames']
+        n_frames = len(frames)
+
+        # Clamp indices
+        frame_indices = [max(0, min(i, n_frames - 1)) for i in frame_indices]
+
+        # Try cartopy for a nice basemap
+        try:
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
+            HAS_CARTOPY = True
+        except ImportError:
+            HAS_CARTOPY = False
+
+        # Compute adaptive color scale from all selected frames (consistent across GIF)
+        all_vals = []
+        for fi in frame_indices:
+            for s in stations:
+                vlist = s.get('values', [])
+                v = vlist[fi] if fi < len(vlist) else None
+                if v is not None and np.isfinite(v):
+                    all_vals.append(v)
+        if all_vals:
+            p95 = float(np.percentile(np.abs(all_vals), 95))
+            clim = max(1.0, p95)    # at least ±1.0 mb so quiet days still show structure
+        else:
+            clim = 1.0
+
+        cmap = plt.cm.RdBu_r
+        norm = mcolors.Normalize(vmin=-clim, vmax=clim)
+
+        def perturb_size(v):
+            if v is None or not np.isfinite(v):
+                return 4
+            return 4 + min(20, abs(v) / clim * 10)
+
+        pil_frames = []
+
+        for fi in frame_indices:
+            lats, lons, vals = [], [], []
+            for s in stations:
+                vals_list = s.get('values', [])
+                v = vals_list[fi] if fi < len(vals_list) else None
+                if v is None:
+                    continue
+                lat, lon = s.get('lat'), s.get('lon')
+                if lat is None or lon is None:
+                    continue
+                lats.append(lat); lons.append(lon); vals.append(v)
+
+            if HAS_CARTOPY:
+                proj = ccrs.LambertConformal(central_longitude=-96, central_latitude=37)
+                fig, ax = plt.subplots(figsize=(10, 6.5),
+                                       subplot_kw={'projection': proj})
+                ax.set_extent([-125, -65, 22, 52], crs=ccrs.PlateCarree())
+                ax.add_feature(cfeature.LAND,   facecolor='#1a1a2e', zorder=0)
+                ax.add_feature(cfeature.OCEAN,  facecolor='#0d1117', zorder=0)
+                ax.add_feature(cfeature.STATES, edgecolor='#444466', linewidth=0.5, zorder=1)
+                ax.add_feature(cfeature.BORDERS, edgecolor='#555577', linewidth=0.7, zorder=1)
+                transform = ccrs.PlateCarree()
+            else:
+                fig, ax = plt.subplots(figsize=(10, 6.5))
+                ax.set_xlim(-125, -65); ax.set_ylim(22, 52)
+                ax.set_facecolor('#1a1a2e')
+                fig.patch.set_facecolor('#0d1117')
+                transform = None
+
+            fig.patch.set_facecolor('#0d1117')
+
+            # Scatter stations
+            if lats:
+                sizes   = [perturb_size(v) for v in vals]
+                sc_vals = [v if v is not None else 0.0 for v in vals]
+                if HAS_CARTOPY:
+                    sc = ax.scatter(lons, lats, c=sc_vals, cmap=cmap, norm=norm,
+                                    s=sizes, alpha=0.85, linewidths=0,
+                                    transform=transform, zorder=3)
+                else:
+                    sc = ax.scatter(lons, lats, c=sc_vals, cmap=cmap, norm=norm,
+                                    s=sizes, alpha=0.85, linewidths=0, zorder=3)
+
+                # Colorbar
+                cbar = fig.colorbar(sc, ax=ax, orientation='vertical',
+                                    fraction=0.025, pad=0.02, shrink=0.75)
+                cbar.set_label(f'Pressure perturbation (mb)  [±{clim:.2f}]', color='white', fontsize=9)
+                cbar.ax.yaxis.set_tick_params(color='white')
+                plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white', fontsize=8)
+
+            # Contours (if analysis requested)
+            if include_analysis and len(lats) >= 50:
+                try:
+                    grid_lats_1d, grid_lons_1d, grid_lats_2d, grid_lons_2d = _gwd.make_grid()
+                    grid   = _gwd.interpolate_stations(lats, lons, vals,
+                                                       grid_lats_2d, grid_lons_2d)
+                    smooth = _gwd.smooth_field(grid, sigma_deg=1.0)
+                    thresh = _gwd.adaptive_threshold(smooth, sigma=1.5)
+                    levels = [l for l in _gwd.adaptive_contour_levels(smooth)
+                              if abs(l) >= thresh]
+                    if levels:
+                        if HAS_CARTOPY:
+                            ax.contour(grid_lons_2d, grid_lats_2d, smooth,
+                                       levels=levels,
+                                       colors=['#4a90d9' if l < 0 else '#e74c3c' for l in levels],
+                                       linewidths=1.0, transform=transform, zorder=4)
+                        else:
+                            ax.contour(grid_lons_2d, grid_lats_2d, smooth,
+                                       levels=levels,
+                                       colors=['#4a90d9' if l < 0 else '#e74c3c' for l in levels],
+                                       linewidths=1.0, zorder=4)
+                except Exception:
+                    pass
+
+            # Timestamp title
+            ts_str = 'N/A'
+            if fi < len(frames):
+                try:
+                    ts = datetime.fromisoformat(frames[fi].replace('Z', '+00:00'))
+                    ts_str = ts.strftime('%Y-%m-%d %H:%MZ')
+                except Exception:
+                    ts_str = frames[fi]
+
+            ax.set_title(f'Surface Pressure Perturbation  –  {ts_str}',
+                         color='white', fontsize=11, pad=8)
+
+            plt.tight_layout(pad=0.5)
+
+            buf = BytesIO()
+            fig.savefig(buf, format='PNG', dpi=110, facecolor=fig.get_facecolor())
+            plt.close(fig)
+            buf.seek(0)
+            pil_frames.append(Image.open(buf).copy())
+
+        if not pil_frames:
+            return jsonify({'error': 'No frames rendered'}), 500
+
+        duration_ms = int(1000 / fps)
+        gif_buf = BytesIO()
+        pil_frames[0].save(
+            gif_buf, format='GIF', save_all=True,
+            append_images=pil_frames[1:],
+            duration=duration_ms, loop=0, optimize=False,
+        )
+        gif_buf.seek(0)
+        return send_file(gif_buf, mimetype='image/gif',
+                         as_attachment=True,
+                         download_name='pressure_perturbation.gif')
+
+    except Exception as e:
+        logger.error(f'export-gif error: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/asos/station-pressure-detail')
@@ -8445,6 +8141,9 @@ def api_asos_station_pressure_detail():
             }
 
             points.sort(key=lambda x: x[0])
+            points = _clean_pressure_points(points)
+            if len(points) < 6:
+                return jsonify({"success": False, "error": f"Insufficient valid METAR pressure data for {station_id}"}), 404
             latest_time = points[-1][0]
 
             cadence_sec = cadence_minutes * 60
@@ -8567,9 +8266,10 @@ def api_asos_station_pressure_detail():
             return jsonify({"success": False, "error": f"No 1-min pressure data for {station_id}"}), 404
 
         points.sort(key=lambda x: x[0])
+        points = _clean_pressure_points(points)
 
         if len(points) < 6:
-            return jsonify({"success": False, "error": "Insufficient pressure observations"}), 404
+            return jsonify({"success": False, "error": "Insufficient valid pressure observations"}), 404
 
         latest_time = points[-1][0]
 
@@ -9628,8 +9328,7 @@ def api_asos_mean_verification():
         window_start = None
         window_end = None
         if period == 'monthly':
-            db = asos.load_asos_forecasts_db()
-            cache_timestamp = db.get("cumulative_stats", {}).get("monthly_generated_at")
+            cache_timestamp = asos.load_monthly_stats_cache().get("monthly_generated_at")
             if cache_timestamp:
                 try:
                     end_dt = datetime.fromisoformat(cache_timestamp)
@@ -10284,9 +9983,23 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 logger.warning(f"Trend data storage failed: {e}")
                 asos_results['trends'] = {'status': 'error', 'error': str(e)}
 
-            broadcast_sync_log("Rebuilding monthly ASOS cache (last 30 days)...", 'info')
-            asos.rebuild_monthly_station_cache(days_back=30)
-            broadcast_sync_log("Monthly ASOS cache updated", 'success')
+            _monthly_cache = asos.load_monthly_stats_cache()
+            _monthly_generated_at = _monthly_cache.get("monthly_generated_at")
+            _monthly_age_hours = None
+            if _monthly_generated_at:
+                try:
+                    _gen_dt = datetime.fromisoformat(_monthly_generated_at)
+                    if _gen_dt.tzinfo is None:
+                        _gen_dt = _gen_dt.replace(tzinfo=timezone.utc)
+                    _monthly_age_hours = (datetime.now(timezone.utc) - _gen_dt).total_seconds() / 3600
+                except Exception:
+                    pass
+            if _monthly_age_hours is None or _monthly_age_hours > 20:
+                broadcast_sync_log("Rebuilding monthly ASOS cache (last 30 days)...", 'info')
+                asos.rebuild_monthly_station_cache(days_back=30)
+                broadcast_sync_log("Monthly ASOS cache updated", 'success')
+            else:
+                broadcast_sync_log(f"Monthly ASOS cache is {_monthly_age_hours:.1f}h old, skipping rebuild", 'info')
 
             results['asos'] = {
                 'status': 'success',

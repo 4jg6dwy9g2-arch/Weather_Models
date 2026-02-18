@@ -3724,7 +3724,7 @@ def load_asos_metar_pressure_cache() -> dict | None:
         return None
 
 
-def sync_asos_metar_pressure(lookback_hours: int = 24) -> dict:
+def sync_asos_metar_pressure(lookback_hours: int = 28) -> dict:
     """
     Fetch recent 5-min METAR altimeter data from IEM for all ASOS stations
     and store in the dedicated asos_metar_pressure.json file.
