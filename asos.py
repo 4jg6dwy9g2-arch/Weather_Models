@@ -28,6 +28,7 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 import json
+import bisect
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ IEM_ASOS_1MIN_GEOJSON_URL = "https://mesonet.agron.iastate.edu/geojson/network/A
 
 # 5-minute METAR pressure archive (dedicated, independent of verification data)
 ASOS_METAR_PRESSURE_FILE = DATA_DIR / "asos_metar_pressure.json"
+ASOS_MONTHLY_STATS_FILE = DATA_DIR / "asos_monthly_stats.json"
 
 # Retention period for stored forecasts
 FORECASTS_RETENTION_DAYS = 21
@@ -130,6 +132,9 @@ _asos_1min_stations_cache: list | None = None  # list of 3-char station IDs
 
 _asos_metar_pressure_cache: dict | None = None
 _asos_metar_pressure_mtime: float | None = None
+
+_monthly_stats_cache: dict | None = None
+_monthly_stats_mtime: float | None = None
 
 # US states with ASOS networks
 US_STATES = [
@@ -503,7 +508,8 @@ def load_asos_forecasts_db() -> dict:
                 "by_lead_time": {},
                 "time_series": {},
                 "by_station_monthly": {},
-                "monthly_generated_at": None
+                "monthly_generated_at": None,
+                "accumulated_run_keys": {}
             }
         }
     try:
@@ -525,6 +531,8 @@ def load_asos_forecasts_db() -> dict:
             data["cumulative_stats"]["by_station_monthly"] = {}
         if "monthly_generated_at" not in data["cumulative_stats"]:
             data["cumulative_stats"]["monthly_generated_at"] = None
+        if "accumulated_run_keys" not in data["cumulative_stats"]:
+            data["cumulative_stats"]["accumulated_run_keys"] = {}
         _asos_forecasts_db_cache = data
         _asos_forecasts_db_mtime = current_mtime
         return _asos_forecasts_db_cache
@@ -538,7 +546,8 @@ def load_asos_forecasts_db() -> dict:
             "by_lead_time": {},
             "time_series": {},
             "by_station_monthly": {},
-            "monthly_generated_at": None
+            "monthly_generated_at": None,
+            "accumulated_run_keys": {}
         }
     }
 
@@ -548,6 +557,30 @@ def save_asos_forecasts_db(data: dict):
     with open(ASOS_FORECASTS_FILE, 'w') as f:
         json.dump(data, f, indent=2)
     logger.info(f"Saved ASOS forecasts to {ASOS_FORECASTS_FILE}")
+
+
+def load_monthly_stats_cache() -> dict:
+    """Load the monthly per-station stats from the small sidecar file."""
+    global _monthly_stats_cache, _monthly_stats_mtime
+    if not ASOS_MONTHLY_STATS_FILE.exists():
+        return {}
+    current_mtime = ASOS_MONTHLY_STATS_FILE.stat().st_mtime
+    if _monthly_stats_cache is not None and _monthly_stats_mtime == current_mtime:
+        return _monthly_stats_cache
+    with open(ASOS_MONTHLY_STATS_FILE) as f:
+        _monthly_stats_cache = json.load(f)
+    _monthly_stats_mtime = current_mtime
+    return _monthly_stats_cache
+
+
+def save_monthly_stats_cache(data: dict) -> None:
+    """Save the monthly per-station stats to the small sidecar file."""
+    global _monthly_stats_cache, _monthly_stats_mtime
+    with open(ASOS_MONTHLY_STATS_FILE, 'w') as f:
+        json.dump(data, f)
+    _monthly_stats_mtime = ASOS_MONTHLY_STATS_FILE.stat().st_mtime
+    _monthly_stats_cache = data
+    logger.info(f"Saved monthly stats to {ASOS_MONTHLY_STATS_FILE}")
 
 
 def accumulate_stats_from_run(
@@ -760,16 +793,24 @@ def cleanup_old_runs(data: dict) -> dict:
             continue # Ignore invalid run_ids
 
     # Accumulate statistics from old runs before deleting them
+    # Skip runs already eagerly accumulated by precompute_verification_cache()
+    accumulated_run_keys = data.get("cumulative_stats", {}).get("accumulated_run_keys", {})
+    accumulated_count = 0
     for run_id in old_runs:
-        run_data = data["runs"][run_id]
-        accumulate_stats_from_run(data, run_id, run_data)
+        if run_id in accumulated_run_keys:
+            # Already accumulated — just clean up the tracking key
+            del accumulated_run_keys[run_id]
+        else:
+            run_data = data["runs"][run_id]
+            accumulate_stats_from_run(data, run_id, run_data)
+            accumulated_count += 1
 
     # Now delete the old runs
     for run_id in old_runs:
         del data["runs"][run_id]
 
     if old_runs:
-        logger.info(f"Accumulated stats from {len(old_runs)} old runs before cleanup")
+        logger.info(f"Accumulated stats from {accumulated_count} old runs before cleanup ({len(old_runs) - accumulated_count} already eagerly accumulated)")
 
     # Also cleanup old observations
     obs_data = data.get("observations", {})
@@ -1994,73 +2035,192 @@ def precompute_verification_cache() -> dict:
 
     logger.info(f"Built observation cache for {len(obs_cache)} stations")
 
+    # Build sorted timestamp index for O(log n) binary-search lookups
+    logger.info("Building sorted observation index for binary search...")
+    obs_sorted_ts = {}   # {station_id: [float unix timestamp]}
+    obs_sorted_keys = {} # {station_id: [time_str]}
+    for station_id, station_obs in obs_cache.items():
+        pairs = []
+        for t in station_obs:
+            try:
+                pairs.append((datetime.fromisoformat(t).timestamp(), t))
+            except ValueError:
+                pass
+        pairs.sort()
+        obs_sorted_ts[station_id] = [p[0] for p in pairs]
+        obs_sorted_keys[station_id] = [p[1] for p in pairs]
+    logger.info(f"Built sorted index for {len(obs_sorted_ts)} stations")
+
+    # Phase 2: Eagerly accumulate mature runs (>16 days old) into cumulative_stats so
+    # they can be skipped in the fresh-computation loop on this and all future syncs.
+    MATURE_RUN_HOURS = 16 * 24
+    accumulated_run_keys = db.get("cumulative_stats", {}).get("accumulated_run_keys", {})
+    to_accumulate = []
+    for k in runs:
+        if k in accumulated_run_keys:
+            continue
+        try:
+            run_init = datetime.fromisoformat(k)
+            if run_init.tzinfo is None:
+                run_init = run_init.replace(tzinfo=timezone.utc)
+            if (now - run_init).total_seconds() / 3600 >= MATURE_RUN_HOURS:
+                to_accumulate.append(k)
+        except ValueError:
+            pass
+    if to_accumulate:
+        logger.info(f"Eagerly accumulating {len(to_accumulate)} mature runs into cumulative stats...")
+        for run_key in to_accumulate:
+            accumulate_stats_from_run(db, run_key, runs[run_key])
+            db["cumulative_stats"]["accumulated_run_keys"][run_key] = now.isoformat()
+        save_asos_forecasts_db(db)
+        accumulated_run_keys = db["cumulative_stats"]["accumulated_run_keys"]
+        # Refresh cumulative stat references so the loading step below sees new data
+        cumulative_by_station = db["cumulative_stats"]["by_station"]
+        cumulative_by_lead_time = db["cumulative_stats"]["by_lead_time"]
+        logger.info(f"Eager accumulation complete ({len(accumulated_run_keys)} total accumulated runs)")
+
     # Cache for 6hr precip calculations to avoid recomputing
     precip_6hr_cache = {}  # {(station_id, time_str): value}
 
-    # Helper function for fast observation lookup
-    def get_cached_observation(station_id: str, target_time: datetime, max_delta_minutes: int = 30):
+    def fast_calculate_6hr_precip(station_id: str, end_time: datetime) -> Optional[float]:
         """
-        Fast observation lookup using pre-built cache.
-
-        Returns composite observation with each variable from its nearest available time.
-        This handles ASOS stations that report MSLP every 5 min but temp/precip only hourly.
+        Binary-search version of calculate_6hr_precip_total() for use inside
+        precompute_verification_cache().  Uses obs_sorted_ts/keys instead of
+        iterating all observations.  Logic is otherwise identical to the module-
+        level function: overflow filter → stuck-gauge detection → hourly max.
         """
-        station_cache = obs_cache.get(station_id, {})
-        if not station_cache:
+        if station_id in PRECIP_EXCLUDE_STATIONS:
+            return None
+        sorted_ts = obs_sorted_ts.get(station_id)
+        sorted_keys = obs_sorted_keys.get(station_id)
+        station_cache = obs_cache.get(station_id)
+        if not sorted_ts or station_cache is None:
             return None
 
-        target_time_str = target_time.isoformat()
-        max_delta = timedelta(minutes=max_delta_minutes)
+        end_ts = end_time.timestamp()
+        start_ts = end_ts - 6 * 3600.0
+        # Exclusive-start, inclusive-end window: start_ts < ts <= end_ts
+        lo = bisect.bisect_right(sorted_ts, start_ts)
+        hi = bisect.bisect_right(sorted_ts, end_ts)
 
-        # Find nearest observation for each variable separately
-        best = {
-            'temp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
-            'mslp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
-            'precip': {'value': None, 'delta': max_delta + timedelta(seconds=1)}
-        }
+        if lo >= hi:
+            return None
 
-        # Search through observations to find nearest for each variable
-        for obs_time_str, obs_data in station_cache.items():
-            try:
-                obs_time = datetime.fromisoformat(obs_time_str)
-                delta = abs(obs_time - target_time)
-
-                if delta > max_delta:
-                    continue
-
-                # Check each variable and update if this is closer
-                if obs_data.get('temp') is not None and delta < best['temp']['delta']:
-                    best['temp']['value'] = obs_data['temp']
-                    best['temp']['delta'] = delta
-
-                if obs_data.get('mslp') is not None and delta < best['mslp']['delta']:
-                    best['mslp']['value'] = obs_data['mslp']
-                    best['mslp']['delta'] = delta
-
-                if obs_data.get('precip') is not None and delta < best['precip']['delta']:
-                    best['precip']['value'] = obs_data['precip']
-                    best['precip']['delta'] = delta
-
-            except ValueError:
+        window_obs = []
+        for idx in range(lo, hi):
+            obs_data = station_cache.get(sorted_keys[idx])
+            if obs_data is None:
                 continue
+            precip = obs_data.get('precip')
+            if precip is None:
+                continue
+            obs_time = datetime.fromtimestamp(sorted_ts[idx], tz=timezone.utc)
+            window_obs.append((obs_time, precip))
 
-        # Build composite observation
-        if all(best[v]['value'] is None for v in ['temp', 'mslp', 'precip']):
+        if not window_obs:
+            return None
+
+        # Pre-filter tipping-bucket overflow artifacts (2.56", 5.12", …)
+        window_obs = [(t, p) for t, p in window_obs if not _is_overflow_value(p)]
+        if not window_obs:
+            return None
+
+        # Detect stuck-gauge: non-zero value repeated consecutively
+        stuck_times: set = set()
+        if len(window_obs) >= 2:
+            for i in range(len(window_obs) - 1):
+                v0, v1 = window_obs[i][1], window_obs[i + 1][1]
+                if v0 > 0 and v0 == v1:
+                    j = i
+                    while j < len(window_obs) and window_obs[j][1] == v0:
+                        stuck_times.add(window_obs[j][0])
+                        j += 1
+
+        # Group by clock hour, take max p01i (= full METAR total at :53)
+        hourly_max: dict = {}
+        for obs_time, precip in window_obs:
+            if obs_time in stuck_times:
+                continue
+            hour_key = obs_time.replace(minute=0, second=0, microsecond=0)
+            if hour_key not in hourly_max or precip > hourly_max[hour_key]:
+                hourly_max[hour_key] = precip
+
+        if not hourly_max:
+            return None
+
+        total = sum(hourly_max.values())
+        if station_id in PRECIP_MM_STATIONS:
+            total /= 25.4
+        return total
+
+    def get_cached_observation(station_id: str, target_time: datetime, max_delta_minutes: int = 30):
+        """
+        Fast observation lookup using sorted index + binary search (O(log n)).
+
+        Returns composite observation with each variable from its nearest available
+        time.  Handles ASOS stations that report MSLP every 5 min but temp/precip
+        only at :56 (hourly METARs).
+        """
+        sorted_ts = obs_sorted_ts.get(station_id)
+        sorted_keys = obs_sorted_keys.get(station_id)
+        station_cache = obs_cache.get(station_id)
+        if not sorted_ts or station_cache is None:
+            return None
+
+        target_ts = target_time.timestamp()
+        window_s = max_delta_minutes * 60.0
+
+        # Narrow to the ±window candidates with two binary searches
+        lo = bisect.bisect_left(sorted_ts, target_ts - window_s)
+        hi = bisect.bisect_right(sorted_ts, target_ts + window_s)
+
+        if lo >= hi:
+            return None
+
+        best_temp_val = None
+        best_temp_delta = window_s + 1.0
+        best_mslp_val = None
+        best_mslp_delta = window_s + 1.0
+        best_precip_val = None
+        best_precip_delta = window_s + 1.0
+
+        for idx in range(lo, hi):
+            obs_data = station_cache.get(sorted_keys[idx])
+            if obs_data is None:
+                continue
+            delta = abs(sorted_ts[idx] - target_ts)
+
+            v = obs_data.get('temp')
+            if v is not None and delta < best_temp_delta:
+                best_temp_val = v
+                best_temp_delta = delta
+
+            v = obs_data.get('mslp')
+            if v is not None and delta < best_mslp_delta:
+                best_mslp_val = v
+                best_mslp_delta = delta
+
+            v = obs_data.get('precip')
+            if v is not None and delta < best_precip_delta:
+                best_precip_val = v
+                best_precip_delta = delta
+
+        if best_temp_val is None and best_mslp_val is None and best_precip_val is None:
             return None
 
         composite_obs = {
-            'temp': best['temp']['value'],
-            'mslp': best['mslp']['value'],
-            'precip': best['precip']['value']
+            'temp': best_temp_val,
+            'mslp': best_mslp_val,
+            'precip': best_precip_val
         }
 
         # Calculate 6hr precip on demand for synoptic times only
         if target_time.hour % 6 == 0:
-            cache_key = (station_id, target_time_str)
+            cache_key = (station_id, target_time.isoformat())
             if cache_key in precip_6hr_cache:
                 composite_obs['precip_6hr'] = precip_6hr_cache[cache_key]
             else:
-                precip_6hr = calculate_6hr_precip_total(db, station_id, target_time)
+                precip_6hr = fast_calculate_6hr_precip(station_id, target_time)
                 precip_6hr_cache[cache_key] = precip_6hr
                 composite_obs['precip_6hr'] = precip_6hr
         else:
@@ -2146,10 +2306,14 @@ def precompute_verification_cache() -> dict:
                     aggregated_stats[model][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
                     aggregated_stats[model][var][lt_str]['count'] += stats.get('count', 0)
 
-    logger.info(f"Computing fresh stats from {len(runs)} current runs...")
+    fresh_run_count = sum(1 for k in runs if k not in accumulated_run_keys)
+    logger.info(f"Computing fresh stats from {fresh_run_count} current runs (skipping {len(accumulated_run_keys)} accumulated)...")
 
-    # Add fresh calculations from current runs
+    # Add fresh calculations from current runs (skip mature runs already in cumulative_stats)
     for run_key, run_data in runs.items():
+        if run_key in accumulated_run_keys:
+            continue  # already folded into cumulative_stats
+
         try:
             init_time = datetime.fromisoformat(run_key)
             if init_time.tzinfo is None:
@@ -2211,7 +2375,7 @@ def precompute_verification_cache() -> dict:
 
     # Precompute time series data (all historical data) using cached observations
     logger.info("Computing verification time series with cached observations...")
-    time_series_data = precompute_verification_time_series(db, lead_times, obs_cache=obs_cache, get_cached_obs_fn=get_cached_observation)
+    time_series_data = precompute_verification_time_series(db, lead_times, obs_cache=obs_cache, get_cached_obs_fn=get_cached_observation, skip_run_keys=accumulated_run_keys)
 
     # Convert to final cache format - by_station
     for station_id in stations:
@@ -2295,7 +2459,7 @@ def load_verification_cache() -> Optional[dict]:
         return None
 
 
-def precompute_verification_time_series(db: dict, lead_times: list, days_back: int = None, obs_cache: dict = None, get_cached_obs_fn=None) -> dict:
+def precompute_verification_time_series(db: dict, lead_times: list, days_back: int = None, obs_cache: dict = None, get_cached_obs_fn=None, skip_run_keys: dict = None) -> dict:
     """
     Precompute verification time series data for all models, variables, and lead times.
 
@@ -2308,6 +2472,7 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
         days_back: How many days back to compute from current runs (None = all available)
         obs_cache: Prebuilt observation cache (optional, for performance)
         get_cached_obs_fn: Function to get cached observations (optional, for performance)
+        skip_run_keys: Set/dict of run keys already folded into cumulative_stats (Phase 2)
 
     Returns:
         Dict with time series data: {model: {variable: {lead_time: {dates, mae, bias, counts}}}}
@@ -2356,8 +2521,11 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
                     # Copy the historical date->errors mapping
                     time_series[model][var][lt] = dict(date_errors)
 
-    # Collect errors by date from current runs
+    # Collect errors by date from current runs (skip mature runs already in cumulative)
     for run_key, run_data in runs.items():
+        if skip_run_keys and run_key in skip_run_keys:
+            continue  # already represented in cumulative_time_series
+
         try:
             init_time = datetime.fromisoformat(run_key)
             if init_time.tzinfo is None:
@@ -2468,8 +2636,8 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = 30)
     """
     Get detailed verification for a single station using the monthly cache.
     """
+    monthly = load_monthly_stats_cache().get("by_station_monthly", {})
     db = load_asos_forecasts_db()
-    monthly = db.get("cumulative_stats", {}).get("by_station_monthly", {})
 
     station = db.get("stations", {}).get(station_id)
     if not station:
@@ -2592,9 +2760,8 @@ def get_verification_data_from_monthly_cache(
     """
     Get verification data from the rolling monthly cache.
     """
+    monthly = load_monthly_stats_cache().get("by_station_monthly", {})
     db = load_asos_forecasts_db()
-    cache = db.get("cumulative_stats", {})
-    monthly = cache.get("by_station_monthly", {})
 
     lt_str = str(lead_time_hours)
     results = {}
@@ -2635,9 +2802,122 @@ def rebuild_monthly_station_cache(days_back: int = 30) -> None:
     db = load_asos_forecasts_db()
     stations = db.get("stations", {})
     runs = db.get("runs", {})
+    observations_data = db.get("observations", {})
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days_back)
+
+    # Build sorted observation index for O(log n) lookups (same approach as
+    # precompute_verification_cache — avoids O(n) scan per station per time).
+    obs_cache = {}
+    obs_sorted_ts = {}
+    obs_sorted_keys = {}
+    for station_id, station_obs in observations_data.items():
+        obs_cache[station_id] = station_obs
+        pairs = []
+        for t in station_obs:
+            try:
+                pairs.append((datetime.fromisoformat(t).timestamp(), t))
+            except ValueError:
+                pass
+        pairs.sort()
+        obs_sorted_ts[station_id] = [p[0] for p in pairs]
+        obs_sorted_keys[station_id] = [p[1] for p in pairs]
+
+    precip_6hr_cache = {}  # {(station_id, time_str): value}
+
+    def _fast_6hr_precip(station_id: str, end_time: datetime) -> Optional[float]:
+        if station_id in PRECIP_EXCLUDE_STATIONS:
+            return None
+        sorted_ts = obs_sorted_ts.get(station_id)
+        sorted_keys_list = obs_sorted_keys.get(station_id)
+        station_cache = obs_cache.get(station_id)
+        if not sorted_ts or station_cache is None:
+            return None
+        end_ts = end_time.timestamp()
+        start_ts = end_ts - 6 * 3600.0
+        lo = bisect.bisect_right(sorted_ts, start_ts)
+        hi = bisect.bisect_right(sorted_ts, end_ts)
+        if lo >= hi:
+            return None
+        window_obs = []
+        for idx in range(lo, hi):
+            obs_data = station_cache.get(sorted_keys_list[idx])
+            if obs_data is None:
+                continue
+            precip = obs_data.get('precip')
+            if precip is None:
+                continue
+            window_obs.append((datetime.fromtimestamp(sorted_ts[idx], tz=timezone.utc), precip))
+        if not window_obs:
+            return None
+        window_obs = [(t, p) for t, p in window_obs if not _is_overflow_value(p)]
+        if not window_obs:
+            return None
+        stuck_times: set = set()
+        if len(window_obs) >= 2:
+            for i in range(len(window_obs) - 1):
+                v0, v1 = window_obs[i][1], window_obs[i + 1][1]
+                if v0 > 0 and v0 == v1:
+                    j = i
+                    while j < len(window_obs) and window_obs[j][1] == v0:
+                        stuck_times.add(window_obs[j][0])
+                        j += 1
+        hourly_max: dict = {}
+        for obs_time, precip in window_obs:
+            if obs_time in stuck_times:
+                continue
+            hour_key = obs_time.replace(minute=0, second=0, microsecond=0)
+            if hour_key not in hourly_max or precip > hourly_max[hour_key]:
+                hourly_max[hour_key] = precip
+        if not hourly_max:
+            return None
+        total = sum(hourly_max.values())
+        if station_id in PRECIP_MM_STATIONS:
+            total /= 25.4
+        return total
+
+    def fast_get_obs(station_id: str, target_time: datetime) -> Optional[dict]:
+        """Binary-search observation lookup returning composite obs dict."""
+        sorted_ts = obs_sorted_ts.get(station_id)
+        sorted_keys_list = obs_sorted_keys.get(station_id)
+        station_cache = obs_cache.get(station_id)
+        if not sorted_ts or station_cache is None:
+            return None
+        target_ts = target_time.timestamp()
+        window_s = 30 * 60.0
+        lo = bisect.bisect_left(sorted_ts, target_ts - window_s)
+        hi = bisect.bisect_right(sorted_ts, target_ts + window_s)
+        if lo >= hi:
+            return None
+        best_temp_val = None; best_temp_delta = window_s + 1.0
+        best_mslp_val = None; best_mslp_delta = window_s + 1.0
+        best_precip_val = None; best_precip_delta = window_s + 1.0
+        for idx in range(lo, hi):
+            obs_data = station_cache.get(sorted_keys_list[idx])
+            if obs_data is None:
+                continue
+            delta = abs(sorted_ts[idx] - target_ts)
+            v = obs_data.get('temp')
+            if v is not None and delta < best_temp_delta:
+                best_temp_val = v; best_temp_delta = delta
+            v = obs_data.get('mslp')
+            if v is not None and delta < best_mslp_delta:
+                best_mslp_val = v; best_mslp_delta = delta
+            v = obs_data.get('precip')
+            if v is not None and delta < best_precip_delta:
+                best_precip_val = v; best_precip_delta = delta
+        if best_temp_val is None and best_mslp_val is None and best_precip_val is None:
+            return None
+        result = {'temp': best_temp_val, 'mslp': best_mslp_val, 'precip': best_precip_val}
+        if target_time.hour % 6 == 0:
+            cache_key = (station_id, target_time.isoformat())
+            if cache_key not in precip_6hr_cache:
+                precip_6hr_cache[cache_key] = _fast_6hr_precip(station_id, target_time)
+            result['precip_6hr'] = precip_6hr_cache[cache_key]
+        else:
+            result['precip_6hr'] = None
+        return result
 
     monthly = {}
 
@@ -2659,55 +2939,60 @@ def rebuild_monthly_station_cache(days_back: int = 30) -> None:
         if not forecast_hours:
             continue
 
-        for model in ['gfs', 'aifs', 'ifs', 'nws']:
-            model_data = run_data.get(model)
-            if not model_data:
+        # Pre-build index map once per run to avoid list.index() in inner loop
+        fh_to_idx = {lt: i for i, lt in enumerate(forecast_hours)}
+
+        for lead_time_hours in forecast_hours:
+            valid_time = init_time + timedelta(hours=lead_time_hours)
+            if valid_time >= now or valid_time < cutoff:
                 continue
 
-            for lead_time_hours in forecast_hours:
-                valid_time = init_time + timedelta(hours=lead_time_hours)
-                if valid_time >= now or valid_time < cutoff:
-                    continue
+            lt_str = str(lead_time_hours)
+            fcst_idx = fh_to_idx[lead_time_hours]
 
-                lt_str = str(lead_time_hours)
+            # Cache obs per station for this valid_time so each station is looked up
+            # once regardless of how many models have data for it (was 4x redundant).
+            obs_for_time: dict = {}
+
+            for model in ['gfs', 'aifs', 'ifs', 'nws']:
+                model_data = run_data.get(model)
+                if not model_data:
+                    continue
 
                 for station_id, fcst_data in model_data.items():
                     if station_id not in stations:
                         continue
 
+                    # Look up obs once per (station, valid_time) — shared across all models and vars
+                    if station_id not in obs_for_time:
+                        obs_for_time[station_id] = fast_get_obs(station_id, valid_time)
+                    obs = obs_for_time[station_id]
+                    if obs is None:
+                        continue
+
                     for var, (fcst_key, obs_key) in var_map.items():
                         fcst_values = fcst_data.get(fcst_key, [])
-                        if lead_time_hours not in forecast_hours:
-                            continue
-                        try:
-                            fcst_idx = forecast_hours.index(lead_time_hours)
-                        except ValueError:
-                            continue
-
                         if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
                             continue
-                        fcst_val = fcst_values[fcst_idx]
-
-                        obs = get_stored_observation(db, station_id, valid_time)
-                        if obs is None or obs.get(obs_key) is None:
+                        obs_val = obs.get(obs_key)
+                        if obs_val is None:
                             continue
-                        obs_val = obs[obs_key]
 
+                        fcst_val = fcst_values[fcst_idx]
                         error = fcst_val - obs_val
 
                         monthly.setdefault(station_id, {}).setdefault(model, {}).setdefault(var, {}).setdefault(
                             lt_str, {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
                         )
-
                         stats = monthly[station_id][model][var][lt_str]
                         stats['sum_abs_errors'] += abs(error)
                         stats['sum_errors'] += error
                         stats['count'] += 1
 
-    db.setdefault("cumulative_stats", {})
-    db["cumulative_stats"]["by_station_monthly"] = monthly
-    db["cumulative_stats"]["monthly_generated_at"] = now.isoformat()
-    save_asos_forecasts_db(db)
+    save_monthly_stats_cache({
+        "by_station_monthly": monthly,
+        "monthly_generated_at": now.isoformat(),
+    })
 
 
 def get_mean_verification_from_cache(model: str) -> dict:
@@ -2763,8 +3048,7 @@ def get_mean_verification_from_monthly_cache(model: str) -> dict:
     Args:
         model: Model name ('gfs', 'aifs', 'ifs', 'nws')
     """
-    db = load_asos_forecasts_db()
-    monthly = db.get("cumulative_stats", {}).get("by_station_monthly", {})
+    monthly = load_monthly_stats_cache().get("by_station_monthly", {})
 
     # Collect all lead times available for this model
     lead_times = set()
