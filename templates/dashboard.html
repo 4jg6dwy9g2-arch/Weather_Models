@@ -552,7 +552,15 @@ async function loadVerificationTable() {
         const response = await fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=${period}`);
         const data = await response.json();
         if (data.success && data.verification.lead_times.length > 0) {
-            renderVerificationTable(data.verification);
+            let vAll = null;
+            if (period === 'monthly') {
+                try {
+                    const allResp = await fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=all`);
+                    const allData = await allResp.json();
+                    if (allData.success) vAll = allData.verification;
+                } catch (e) { /* no baseline available */ }
+            }
+            renderVerificationTable(data.verification, vAll);
             document.getElementById('verificationSection').style.display = '';
         } else {
             const tbody = document.getElementById('verificationTableBody');
@@ -622,7 +630,22 @@ function formatLeadTime(hours) {
 }
 
 // Render verification table with accumulated data across all runs
-function renderVerificationTable(v) {
+function _pctMae(cur, base) {
+    if (cur == null || base == null || base === 0) return '';
+    const pct = Math.round((cur - base) / base * 100);
+    if (pct === 0) return '';
+    const color = pct < 0 ? 'green' : 'red';
+    return ` <span style="color:${color};font-size:0.7em">(${pct > 0 ? '+' : ''}${pct}%)</span>`;
+}
+function _pctBias(cur, base) {
+    if (cur == null || base == null || base === 0) return '';
+    const pct = Math.round((Math.abs(cur) - Math.abs(base)) / Math.abs(base) * 100);
+    if (pct === 0) return '';
+    const color = pct < 0 ? 'green' : 'red';
+    return ` <span style="color:${color};font-size:0.7em">(${pct > 0 ? '+' : ''}${pct}%)</span>`;
+}
+
+function renderVerificationTable(v, vAll = null) {
     const tbody = document.getElementById('verificationTableBody');
     tbody.innerHTML = '';
 
@@ -653,6 +676,11 @@ function renderVerificationTable(v) {
 
         const samples = v.temp_sample_counts[i];
 
+        // All-time baseline values (only present when period=monthly)
+        const a = vAll;
+        const aIfs = a?.ifs_temp_mae || [];
+        const aIfsMslp = a?.ifs_mslp_mae || [];
+
         // Determine winner - find lowest MAE among all models
         let winner = '--';
         let winnerClass = 'badge bg-secondary';
@@ -679,21 +707,21 @@ function renderVerificationTable(v) {
         row.innerHTML = `
             <td><strong>${formatLeadTime(lt)}</strong></td>
             <td>${days.toFixed(1)}</td>
-            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${ifsTempMaeVal !== null && ifsTempMaeVal !== undefined ? ifsTempMaeVal.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${ifsTempBias !== null && ifsTempBias !== undefined ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${nwsTempMae !== null && nwsTempMae !== undefined ? nwsTempMae.toFixed(1) + '°F' : '--'}</td>
-            <td class="text-center">${nwsTempBias !== null && nwsTempBias !== undefined ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) + '°F' : '--'}</td>
+            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) + '°F' + _pctMae(gfsTempMae, a?.gfs_temp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) + '°F' + _pctBias(gfsTempBias, a?.gfs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) + '°F' + _pctMae(aifsTempMae, a?.aifs_temp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + '°F' + _pctBias(aifsTempBias, a?.aifs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${ifsTempMaeVal != null ? ifsTempMaeVal.toFixed(1) + '°F' + _pctMae(ifsTempMaeVal, aIfs[i]) : '--'}</td>
+            <td class="text-center">${ifsTempBias != null ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + '°F' + _pctBias(ifsTempBias, a?.ifs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${nwsTempMae != null ? nwsTempMae.toFixed(1) + '°F' + _pctMae(nwsTempMae, a?.nws_temp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${nwsTempBias != null ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) + '°F' + _pctBias(nwsTempBias, a?.nws_temp_bias?.[i]) : '--'}</td>
             <td><span class="${winnerClass}">${winner}</span></td>
-            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${ifsMslpMaeVal !== null && ifsMslpMaeVal !== undefined ? ifsMslpMaeVal.toFixed(1) + ' mb' : '--'}</td>
-            <td class="text-center">${ifsMslpBias !== null && ifsMslpBias !== undefined ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
+            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' + _pctMae(gfsMslpMae, a?.gfs_mslp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + ' mb' + _pctBias(gfsMslpBias, a?.gfs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + ' mb' + _pctMae(aifsMslpMae, a?.aifs_mslp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) + ' mb' + _pctBias(aifsMslpBias, a?.aifs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${ifsMslpMaeVal != null ? ifsMslpMaeVal.toFixed(1) + ' mb' + _pctMae(ifsMslpMaeVal, aIfsMslp[i]) : '--'}</td>
+            <td class="text-center">${ifsMslpBias != null ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) + ' mb' + _pctBias(ifsMslpBias, a?.ifs_mslp_bias?.[i]) : '--'}</td>
             <td>${samples}</td>
         `;
         tbody.appendChild(row);

@@ -1185,7 +1185,16 @@ async function loadMeanAsosVerification(period = 'all') {
             throw new Error(data.error || 'No mean verification data available.');
         }
 
-        renderAsosVerificationTable(data.verification);
+        let vAll = null;
+        if (period === 'monthly') {
+            try {
+                const allResp = await fetch('/api/asos/mean-verification?period=all');
+                const allData = await allResp.json();
+                if (allData.success) vAll = allData.verification;
+            } catch (e) { /* no baseline available */ }
+        }
+
+        renderAsosVerificationTable(data.verification, vAll);
 
         // Update cache timestamp
         if (data.cache_timestamp) {
@@ -1224,8 +1233,23 @@ async function loadMeanAsosVerification(period = 'all') {
     }
 }
 
+function _pctMae(cur, base) {
+    if (cur == null || base == null || base === 0) return '';
+    const pct = Math.round((cur - base) / base * 100);
+    if (pct === 0) return '';
+    const color = pct < 0 ? 'green' : 'red';
+    return ` <span style="color:${color};font-size:0.7em">(${pct > 0 ? '+' : ''}${pct}%)</span>`;
+}
+function _pctBias(cur, base) {
+    if (cur == null || base == null || base === 0) return '';
+    const pct = Math.round((Math.abs(cur) - Math.abs(base)) / Math.abs(base) * 100);
+    if (pct === 0) return '';
+    const color = pct < 0 ? 'green' : 'red';
+    return ` <span style="color:${color};font-size:0.7em">(${pct > 0 ? '+' : ''}${pct}%)</span>`;
+}
+
 // Render ASOS verification table
-function renderAsosVerificationTable(v) {
+function renderAsosVerificationTable(v, vAll = null) {
     const tbody = document.getElementById('asosVerificationTableBody');
     tbody.innerHTML = '';
 
@@ -1308,33 +1332,34 @@ function renderAsosVerificationTable(v) {
             }
         }
 
+        const a = vAll;
         const row = document.createElement('tr');
         row.innerHTML = `
             <td><strong>${formatLeadTime(lt)}</strong></td>
             <td>${days}</td>
-            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) : '--'}</td>
-            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) : '--'}</td>
-            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${ifsTempMae !== null && ifsTempMae !== undefined ? ifsTempMae.toFixed(1) : '--'}</td>
-            <td class="text-center">${ifsTempBias !== null && ifsTempBias !== undefined ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${nwsTempMae !== null && nwsTempMae !== undefined ? nwsTempMae.toFixed(1) : '--'}</td>
-            <td class="text-center">${nwsTempBias !== null && nwsTempBias !== undefined ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) : '--'}</td>
+            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) + _pctMae(gfsTempMae, a?.gfs_temp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) + _pctBias(gfsTempBias, a?.gfs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) + _pctMae(aifsTempMae, a?.aifs_temp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + _pctBias(aifsTempBias, a?.aifs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${ifsTempMae != null ? ifsTempMae.toFixed(1) + _pctMae(ifsTempMae, a?.ifs_temp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${ifsTempBias != null ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + _pctBias(ifsTempBias, a?.ifs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${nwsTempMae != null ? nwsTempMae.toFixed(1) + _pctMae(nwsTempMae, a?.nws_temp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${nwsTempBias != null ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) + _pctBias(nwsTempBias, a?.nws_temp_bias?.[i]) : '--'}</td>
             <td><span class="${tempWinnerClass}">${tempWinner}</span></td>
-            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) : '--'}</td>
-            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) : '--'}</td>
-            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${ifsMslpMae !== null && ifsMslpMae !== undefined ? ifsMslpMae.toFixed(1) : '--'}</td>
-            <td class="text-center">${ifsMslpBias !== null && ifsMslpBias !== undefined ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${gfsPrecipMae !== null && gfsPrecipMae !== undefined ? gfsPrecipMae.toFixed(2) : '--'}</td>
-            <td class="text-center">${gfsPrecipBias !== null && gfsPrecipBias !== undefined ? (gfsPrecipBias > 0 ? '+' : '') + gfsPrecipBias.toFixed(2) : '--'}</td>
-            <td class="text-center">${aifsPrecipMae !== null && aifsPrecipMae !== undefined ? aifsPrecipMae.toFixed(2) : '--'}</td>
-            <td class="text-center">${aifsPrecipBias !== null && aifsPrecipBias !== undefined ? (aifsPrecipBias > 0 ? '+' : '') + aifsPrecipBias.toFixed(2) : '--'}</td>
-            <td class="text-center">${ifsPrecipMae !== null && ifsPrecipMae !== undefined ? ifsPrecipMae.toFixed(2) : '--'}</td>
-            <td class="text-center">${ifsPrecipBias !== null && ifsPrecipBias !== undefined ? (ifsPrecipBias > 0 ? '+' : '') + ifsPrecipBias.toFixed(2) : '--'}</td>
-            <td class="text-center">${nwsPrecipMae !== null && nwsPrecipMae !== undefined ? nwsPrecipMae.toFixed(2) : '--'}</td>
-            <td class="text-center">${nwsPrecipBias !== null && nwsPrecipBias !== undefined ? (nwsPrecipBias > 0 ? '+' : '') + nwsPrecipBias.toFixed(2) : '--'}</td>
+            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + _pctMae(gfsMslpMae, a?.gfs_mslp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + _pctBias(gfsMslpBias, a?.gfs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + _pctMae(aifsMslpMae, a?.aifs_mslp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) + _pctBias(aifsMslpBias, a?.aifs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${ifsMslpMae != null ? ifsMslpMae.toFixed(1) + _pctMae(ifsMslpMae, a?.ifs_mslp_mae?.[i]) : '--'}</td>
+            <td class="text-center">${ifsMslpBias != null ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) + _pctBias(ifsMslpBias, a?.ifs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${gfsPrecipMae != null ? gfsPrecipMae.toFixed(2) + _pctMae(gfsPrecipMae, a?.gfs_precip_mae?.[i]) : '--'}</td>
+            <td class="text-center">${gfsPrecipBias != null ? (gfsPrecipBias > 0 ? '+' : '') + gfsPrecipBias.toFixed(2) + _pctBias(gfsPrecipBias, a?.gfs_precip_bias?.[i]) : '--'}</td>
+            <td class="text-center">${aifsPrecipMae != null ? aifsPrecipMae.toFixed(2) + _pctMae(aifsPrecipMae, a?.aifs_precip_mae?.[i]) : '--'}</td>
+            <td class="text-center">${aifsPrecipBias != null ? (aifsPrecipBias > 0 ? '+' : '') + aifsPrecipBias.toFixed(2) + _pctBias(aifsPrecipBias, a?.aifs_precip_bias?.[i]) : '--'}</td>
+            <td class="text-center">${ifsPrecipMae != null ? ifsPrecipMae.toFixed(2) + _pctMae(ifsPrecipMae, a?.ifs_precip_mae?.[i]) : '--'}</td>
+            <td class="text-center">${ifsPrecipBias != null ? (ifsPrecipBias > 0 ? '+' : '') + ifsPrecipBias.toFixed(2) + _pctBias(ifsPrecipBias, a?.ifs_precip_bias?.[i]) : '--'}</td>
+            <td class="text-center">${nwsPrecipMae != null ? nwsPrecipMae.toFixed(2) + _pctMae(nwsPrecipMae, a?.nws_precip_mae?.[i]) : '--'}</td>
+            <td class="text-center">${nwsPrecipBias != null ? (nwsPrecipBias > 0 ? '+' : '') + nwsPrecipBias.toFixed(2) + _pctBias(nwsPrecipBias, a?.nws_precip_bias?.[i]) : '--'}</td>
             <td><span class="${precipWinnerClass}">${precipWinner}</span></td>
         `;
         tbody.appendChild(row);
