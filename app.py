@@ -1949,7 +1949,10 @@ def calculate_lead_time_verification(location_name: str, days_back: Optional[int
             _add(lead_time_hours, "nws_temp", temp_val - obs_temp)
 
     # Calculate statistics for each lead time
-    lead_times = sorted(errors_by_lead_time.keys())
+    # Filter to canonical lead times matching the ASOS Network table:
+    # 6h, 12h, 18h, 24h, then every 24h out to 360h
+    _canonical_lts = set(list(range(6, 25, 6)) + list(range(48, 361, 24)))
+    lead_times = sorted(lt for lt in errors_by_lead_time.keys() if lt in _canonical_lts)
 
     result = {
         "lead_times": lead_times,

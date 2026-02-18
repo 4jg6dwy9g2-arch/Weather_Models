@@ -1848,14 +1848,16 @@ async function loadFairfaxTimeSeriesChart() {
     const location = 'Fairfax, VA';
     const variable = document.getElementById('fairfaxTsVariable').value;
     const metric = document.getElementById('fairfaxTsMetric').value;
-    const leadTime = document.getElementById('fairfaxTsLeadTime').value;
+    const leadTime = parseInt(document.getElementById('fairfaxTsLeadTime').value, 10);
     const timeFrame = document.getElementById('fairfaxTsTimeFrame').value;
 
     try {
-        const response = await fetch(
-            `/api/verification-time-series?location=${encodeURIComponent(location)}&variable=${variable}&lead_time=${leadTime}&days_back=${timeFrame}`
-        );
-        const data = await response.json();
+        const [tsResponse, allTimeResponse] = await Promise.all([
+            fetch(`/api/verification-time-series?location=${encodeURIComponent(location)}&variable=${variable}&lead_time=${leadTime}&days_back=${timeFrame}`),
+            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=all`)
+        ]);
+        const data = await tsResponse.json();
+        const allTimeData = await allTimeResponse.json();
 
         if (!data.success) {
             console.error('Error loading Fairfax time series:', data.error);
@@ -1863,10 +1865,26 @@ async function loadFairfaxTimeSeriesChart() {
             return;
         }
 
+        // Extract all-time averages for the selected variable/metric/lead_time
+        let allTimeAvgs = null;
+        if (allTimeData.success) {
+            const v = allTimeData.verification;
+            const ltIdx = v.lead_times ? v.lead_times.indexOf(leadTime) : -1;
+            if (ltIdx !== -1) {
+                const key = (pfx) => `${pfx}_${variable}_${metric}`;
+                allTimeAvgs = {
+                    gfs:  v[key('gfs')]?.[ltIdx]  ?? null,
+                    aifs: v[key('aifs')]?.[ltIdx] ?? null,
+                    ifs:  v[key('ifs')]?.[ltIdx]  ?? null,
+                    nws:  v[key('nws')]?.[ltIdx]  ?? null,
+                };
+            }
+        }
+
         // Show the section if data is available
         if (data.time_series && data.time_series.dates && data.time_series.dates.length > 0) {
             document.getElementById('fairfaxTimeSeriesSection').style.display = '';
-            renderFairfaxTimeSeriesChart(data.time_series, metric, variable);
+            renderFairfaxTimeSeriesChart(data.time_series, metric, variable, allTimeAvgs);
         } else {
             document.getElementById('fairfaxTimeSeriesSection').style.display = 'none';
         }
@@ -1878,7 +1896,7 @@ async function loadFairfaxTimeSeriesChart() {
 }
 
 // Render Fairfax time series chart
-function renderFairfaxTimeSeriesChart(data, metric, variable) {
+function renderFairfaxTimeSeriesChart(data, metric, variable, allTimeAvgs = null) {
     const ctx = document.getElementById('fairfaxTimeSeriesChart');
 
     // Get the appropriate data arrays based on metric
@@ -2000,7 +2018,35 @@ function renderFairfaxTimeSeriesChart(data, metric, variable) {
                     tension: 0.3,
                     pointRadius: 2,
                     pointHoverRadius: 5
-                }] : [])
+                }] : []),
+                // All-time average reference lines
+                ...(allTimeAvgs ? (() => {
+                    const n = data.dates.length;
+                    const refLines = [];
+                    const refs = [
+                        { key: 'gfs',  label: 'GFS avg',  color: '#0d6efd' },
+                        { key: 'aifs', label: 'AIFS avg', color: '#0dcaf0' },
+                        { key: 'ifs',  label: 'IFS avg',  color: '#20c997' },
+                        { key: 'nws',  label: 'NWS avg',  color: '#111111' },
+                    ];
+                    for (const r of refs) {
+                        const val = allTimeAvgs[r.key];
+                        if (val === null || val === undefined) continue;
+                        refLines.push({
+                            label: r.label,
+                            data: Array(n).fill(val),
+                            borderColor: r.color,
+                            backgroundColor: 'transparent',
+                            borderWidth: 1.5,
+                            borderDash: [4, 4],
+                            pointRadius: 0,
+                            pointHoverRadius: 0,
+                            tension: 0,
+                            fill: false,
+                        });
+                    }
+                    return refLines;
+                })() : [])
             ]
         },
         options: {
@@ -2015,16 +2061,22 @@ function renderFairfaxTimeSeriesChart(data, metric, variable) {
                     position: 'top',
                     labels: {
                         usePointStyle: true,
-                        padding: 20
+                        padding: 20,
+                        filter: function(item) {
+                            // Hide avg reference lines from legend
+                            return !item.text.endsWith(' avg');
+                        }
                     }
                 },
                 tooltip: {
                     callbacks: {
                         label: function(context) {
-                            let label = context.dataset.label || '';
-                            if (label) {
-                                label += ': ';
+                            // Skip reference line entries in tooltip
+                            if (context.dataset.label && context.dataset.label.endsWith(' avg')) {
+                                return null;
                             }
+                            let label = context.dataset.label || '';
+                            if (label) label += ': ';
                             if (context.parsed.y !== null) {
                                 label += context.parsed.y.toFixed(2) + ' ' + unit;
                             }
