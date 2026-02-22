@@ -449,6 +449,10 @@
         font-size: 0.88rem;
         color: #4b5563;
     }
+    .radar-overlay-crisp {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+    }
 
     @media (max-width: 768px) {
         .hero-main {
@@ -722,7 +726,7 @@
                     <option value="4">4×</option>
                 </select>
                 <button id="btn-export-gif" class="btn btn-sm"
-                    onclick="exportLoopGif()"
+                    onclick="showRadarGifModal()"
                     title="Export current loop as animated GIF (cropped to visible map area)"
                     style="background:#1e293b;color:#e2e8f0;border-color:#334155;margin-left:4px;">⬇ GIF</button>
             </div>
@@ -815,7 +819,42 @@
 
 </div><!-- /.tab-content -->
 
-<!-- GIF export modal -->
+<!-- Radar GIF export modal -->
+<div class="modal fade" id="radarGifModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-sm">
+        <div class="modal-content bg-dark text-light border-secondary">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title">Export Radar GIF</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label small text-muted">Start time</label>
+                    <select id="radar-gif-start" class="form-select form-select-sm bg-dark text-light border-secondary"></select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label small text-muted">End time</label>
+                    <select id="radar-gif-end" class="form-select form-select-sm bg-dark text-light border-secondary"></select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label small text-muted">Frame rate: <span id="radar-gif-fps-label">8</span> fps</label>
+                    <input type="range" id="radar-gif-fps" class="form-range" min="1" max="15" value="8">
+                </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="radar-gif-gw">
+                    <label class="form-check-label small" for="radar-gif-gw">Include gravity wave overlay</label>
+                </div>
+                <div id="radar-gif-status" class="small text-muted mt-2"></div>
+            </div>
+            <div class="modal-footer border-secondary">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary btn-sm" id="radar-gif-generate-btn">Generate &amp; Download</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Gravity GIF export modal -->
 <div class="modal fade" id="gravityGifModal" tabindex="-1" aria-labelledby="gravityGifModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content bg-dark text-light border-secondary">
@@ -1074,6 +1113,9 @@ let radarInitialized = false;
 let radarPollTimer   = null;
 let radarRefreshTimer = null;
 let radarLastValidTime = null;
+let radarRenderStep = 4;
+let radarRenderDefaultStep = 4;
+let radarRenderSteps = [4, 2, 1];
 let currentProduct   = 'mrms-composite';
 let wmsLayer         = null;
 let wmsRefreshTimer  = null;
@@ -1086,6 +1128,74 @@ let radarGwCurrentFrameIdx = -1;   // last rendered GW frame index
 const RADAR_BOUNDS = [[20.005, -130.005], [54.995, -60.005]];
 const RADAR_METADATA_URL  = '/api/radar/metadata';
 const RADAR_COMPOSITE_URL = '/api/radar/composite.png';
+
+function _clampRadarRenderStep(step) {
+    if (!radarRenderSteps || radarRenderSteps.length === 0) return radarRenderDefaultStep;
+    let req = parseInt(step, 10);
+    if (!Number.isFinite(req) || req < 1) req = radarRenderDefaultStep;
+    let best = radarRenderSteps[0];
+    let bestDelta = Math.abs(best - req);
+    for (const s of radarRenderSteps) {
+        const d = Math.abs(s - req);
+        if (d < bestDelta) {
+            best = s;
+            bestDelta = d;
+        }
+    }
+    return best;
+}
+
+function _desiredRadarRenderStep() {
+    const z = radarMap ? radarMap.getZoom() : 4;
+    const dpr = window.devicePixelRatio || 1;
+    let target = 4;
+    if (z >= 8 || (z >= 7 && dpr >= 1.5)) {
+        target = 1;
+    } else if (z >= 6 || (z >= 5 && dpr >= 2.0)) {
+        target = 2;
+    }
+    return _clampRadarRenderStep(target);
+}
+
+function _clampLoopRenderStep(step) {
+    if (!loopRenderSteps || loopRenderSteps.length === 0) return loopRenderDefaultStep;
+    let req = parseInt(step, 10);
+    if (!Number.isFinite(req) || req < 1) req = loopRenderDefaultStep;
+    let best = loopRenderSteps[0];
+    let bestDelta = Math.abs(best - req);
+    for (const s of loopRenderSteps) {
+        const d = Math.abs(s - req);
+        if (d < bestDelta) {
+            best = s;
+            bestDelta = d;
+        }
+    }
+    return best;
+}
+
+function _desiredLoopRenderStep() {
+    const z = radarMap ? radarMap.getZoom() : 4;
+    const dpr = window.devicePixelRatio || 1;
+    let target = 4;
+    if (z >= 8 || (z >= 7 && dpr >= 1.5)) {
+        target = 1;
+    } else if (z >= 6 || (z >= 5 && dpr >= 2.0)) {
+        target = 2;
+    }
+    return _clampLoopRenderStep(target);
+}
+
+function _applyRadarMetadata(meta) {
+    if (!meta) return;
+    if (Array.isArray(meta.render_steps) && meta.render_steps.length > 0) {
+        radarRenderSteps = [...meta.render_steps]
+            .map(v => parseInt(v, 10))
+            .filter(v => Number.isFinite(v) && v >= 1)
+            .sort((a, b) => b - a);
+    }
+    const d = parseInt(meta.render_default_step, 10);
+    if (Number.isFinite(d) && d >= 1) radarRenderDefaultStep = d;
+}
 
 async function initRadarMap() {
     if (radarInitialized) return;
@@ -1113,6 +1223,26 @@ async function initRadarMap() {
         pane: 'overlayPane',
         zIndex: 500,
     }).addTo(radarMap);
+
+    radarMap.on('zoomend', () => {
+        if (radarMode === 'live') {
+            if (currentProduct !== 'mrms-composite' || !radarLastValidTime) return;
+            const desired = _desiredRadarRenderStep();
+            if (desired !== radarRenderStep) {
+                refreshRadarImage(radarLastValidTime, desired).catch(e => {
+                    console.error('Radar zoom re-render error:', e);
+                });
+            }
+            return;
+        }
+        if (radarMode === 'loop' && loopFrames.length > 0) {
+            const desired = _desiredLoopRenderStep();
+            if (desired !== loopRenderStep) {
+                loopRenderStep = desired;
+                showLoopFrame(loopIdx);
+            }
+        }
+    });
 
     // Start polling for data readiness
     setStatusMessage('Fetching NEXRAD MRMS data from NOAA AWS...', 'loading');
@@ -1244,11 +1374,12 @@ async function fetchRadarMetadata() {
     return r.json();
 }
 
-async function refreshRadarImage(validTime) {
+async function refreshRadarImage(validTime, forceStep = null) {
     if (!radarMap) return;
+    const renderStep = _clampRadarRenderStep(forceStep ?? _desiredRadarRenderStep());
 
     // Cache-bust with the valid time so the browser fetches the new frame
-    const url = `${RADAR_COMPOSITE_URL}?t=${encodeURIComponent(validTime || Date.now())}`;
+    const url = `${RADAR_COMPOSITE_URL}?t=${encodeURIComponent(validTime || Date.now())}&step=${encodeURIComponent(renderStep)}`;
 
     // Pre-load image before swapping to avoid flicker
     await new Promise((resolve, reject) => {
@@ -1265,6 +1396,7 @@ async function refreshRadarImage(validTime) {
         opacity:     0.8,
         interactive: false,
         zIndex:      200,
+        className:   'radar-overlay-crisp',
     });
     // Only show when MRMS composite is the active product
     if (currentProduct === 'mrms-composite') {
@@ -1273,11 +1405,14 @@ async function refreshRadarImage(validTime) {
 
     if (validTime) {
         const dt = new Date(validTime);
-        const label = dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' })
-                    + ' ' + dt.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' })
-                    + ' UTC · NOAA MRMS Composite Reflectivity';
+        const label = dt.toLocaleString([], {
+            month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', timeZone: 'UTC',
+            timeZoneName: 'short', hour12: false,
+        }) + ' · NOAA MRMS Composite Reflectivity';
         setStatusMessage(label, 'ok');
         radarLastValidTime = validTime;
+        radarRenderStep = renderStep;
     }
 }
 
@@ -1290,6 +1425,7 @@ async function pollForRadarReady() {
     const poll = async () => {
         try {
             const meta = await fetchRadarMetadata();
+            _applyRadarMetadata(meta);
             if (meta.ready) {
                 clearTimeout(radarPollTimer);
                 await refreshRadarImage(meta.valid_time);
@@ -1316,6 +1452,7 @@ function scheduleRadarRefresh(ttlSeconds) {
         try {
             if (currentProduct === 'mrms-composite') {
                 const meta = await fetchRadarMetadata();
+                _applyRadarMetadata(meta);
                 if (meta.ready && meta.valid_time !== radarLastValidTime) {
                     await refreshRadarImage(meta.valid_time);
                 }
@@ -1501,6 +1638,10 @@ function _activateMrmsMode() {
     if (radarOverlay && radarMap) radarOverlay.addTo(radarMap);
     if (radarMap) radarMap.setView([38.5, -97], 4);
     if (!radarRefreshTimer) scheduleRadarRefresh(120);
+    const desired = _desiredRadarRenderStep();
+    if (radarLastValidTime && desired !== radarRenderStep) {
+        refreshRadarImage(radarLastValidTime, desired).catch(e => console.error('MRMS re-render error:', e));
+    }
     const vt = radarLastValidTime;
     if (vt) {
         const dt = new Date(vt);
@@ -1650,6 +1791,9 @@ let loopTimer      = null;
 let loopSpeed      = 1.0;
 let loopOverlay    = null;
 let loopIndexTimer = null;
+let loopRenderStep = 4;
+let loopRenderDefaultStep = 4;
+let loopRenderSteps = [4, 2, 1];
 
 // ── Gravity-wave pressure perturbation map ───────────────────────────────────
 let gravityMap = null;
@@ -1855,6 +1999,14 @@ async function loadFrameIndex() {
         const idx = await r.json();
         const frames = idx.frames || [];
         const prevCount = loopFrames.length;
+        if (Array.isArray(idx.render_steps) && idx.render_steps.length > 0) {
+            loopRenderSteps = [...idx.render_steps]
+                .map(v => parseInt(v, 10))
+                .filter(v => Number.isFinite(v) && v >= 1)
+                .sort((a, b) => b - a);
+        }
+        const d = parseInt(idx.render_default_step, 10);
+        if (Number.isFinite(d) && d >= 1) loopRenderDefaultStep = d;
 
         loopFrames = frames;
 
@@ -1879,10 +2031,16 @@ async function loadFrameIndex() {
 
 function preloadFrames(frames, archiveKey) {
     // Fire-and-forget: prime the browser cache so animation is smooth
+    const step = _desiredLoopRenderStep();
     frames.forEach(f => {
         const img = new window.Image();
-        img.src = `${FRAMES_BASE_URL}${archiveKey}/${f.f}`;
+        img.src = _loopFrameUrl(f, archiveKey, step);
     });
+}
+
+function _loopFrameUrl(frame, archiveKey, step = null) {
+    const s = _clampLoopRenderStep(step ?? _desiredLoopRenderStep());
+    return `${FRAMES_BASE_URL}${archiveKey}/${frame.f}?step=${encodeURIComponent(s)}`;
 }
 
 function showLoopFrame(idx) {
@@ -1892,7 +2050,9 @@ function showLoopFrame(idx) {
 
     const prod  = RADAR_PRODUCTS[currentProduct];
     const frame = loopFrames[idx];
-    const url   = `${FRAMES_BASE_URL}${prod.archiveKey}/${frame.f}`;
+    const desiredStep = _desiredLoopRenderStep();
+    loopRenderStep = desiredStep;
+    const url   = _loopFrameUrl(frame, prod.archiveKey, desiredStep);
     const bounds = prod.loopBounds || RADAR_BOUNDS;
 
     if (!loopOverlay) {
@@ -1900,6 +2060,7 @@ function showLoopFrame(idx) {
             opacity: 0.85,
             interactive: false,
             zIndex: 200,
+            className: 'radar-overlay-crisp',
         }).addTo(radarMap);
     } else {
         loopOverlay.setUrl(url);
@@ -1918,7 +2079,7 @@ function showLoopFrame(idx) {
         tsEl.textContent = dt.toLocaleString([], {
             month: 'short', day: 'numeric',
             hour: '2-digit', minute: '2-digit', timeZone: 'UTC',
-            timeZoneName: 'short',
+            timeZoneName: 'short', hour12: false,
         });
     }
 
@@ -1975,7 +2136,7 @@ function setLoopSpeed(value) {
     if (loopPlaying) { pauseLoop(); playLoop(); }
 }
 
-async function exportLoopGif() {
+async function exportLoopGif({ frames = null, fps = 8, gwData = null } = {}) {
     const prod = RADAR_PRODUCTS[currentProduct];
     if (!prod || !prod.archiveKey || loopFrames.length === 0) return;
 
@@ -1984,7 +2145,6 @@ async function exportLoopGif() {
     btn.textContent = '⏳ Building…';
 
     try {
-        // Use the current Leaflet viewport bounds for cropping
         const mapBounds = radarMap.getBounds();
         const bounds = {
             south: mapBounds.getSouth(),
@@ -1993,16 +2153,18 @@ async function exportLoopGif() {
             east:  mapBounds.getEast(),
         };
 
-        const delayMs = Math.round(500 / loopSpeed);
+        const selectedFrames = frames || loopFrames;
+        const delayMs = Math.round(1000 / fps);
 
         const resp = await fetch('/api/radar/export-gif', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 product_key: prod.archiveKey,
-                frames:      loopFrames,
+                frames:      selectedFrames,
                 bounds:      bounds,
                 delay_ms:    delayMs,
+                gw_data:     gwData,   // null or {frames:[…], stations:[…]}
             }),
         });
 
@@ -2012,12 +2174,10 @@ async function exportLoopGif() {
             return;
         }
 
-        // Trigger browser download
         const blob = await resp.blob();
         const url  = URL.createObjectURL(blob);
         const a    = document.createElement('a');
         a.href     = url;
-        // Try to use the Content-Disposition filename, otherwise fall back
         const cd   = resp.headers.get('Content-Disposition') || '';
         const match = cd.match(/filename="?([^"]+)"?/);
         a.download = match ? match[1] : `radar_${prod.archiveKey}.gif`;
@@ -2032,6 +2192,82 @@ async function exportLoopGif() {
         btn.textContent = '⬇ GIF';
     }
 }
+
+function _fmtFrameTime(isoStr) {
+    const d = new Date(isoStr);
+    return d.toLocaleString([], {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        timeZone: 'UTC', timeZoneName: 'short', hour12: false,
+    });
+}
+
+function showRadarGifModal() {
+    const prod = RADAR_PRODUCTS[currentProduct];
+    if (!prod || !prod.archiveKey || loopFrames.length === 0) {
+        alert('Switch to Loop mode and wait for frames to load first.');
+        return;
+    }
+    const total   = loopFrames.length;
+    const startSel = document.getElementById('radar-gif-start');
+    const endSel   = document.getElementById('radar-gif-end');
+    startSel.innerHTML = '';
+    endSel.innerHTML   = '';
+    loopFrames.forEach((frame, i) => {
+        const label = frame.t ? _fmtFrameTime(frame.t) : `Frame ${i + 1}`;
+        startSel.appendChild(new Option(label, i));
+        endSel.appendChild(new Option(label, i));
+    });
+    // Default start: ~6 hours before last frame
+    const lastTime  = loopFrames[total - 1]?.t ? new Date(loopFrames[total - 1].t) : null;
+    const sixHrsAgo = lastTime ? new Date(lastTime.getTime() - 6 * 3600 * 1000) : null;
+    let defaultStart = 0;
+    if (sixHrsAgo) {
+        for (let i = total - 1; i >= 0; i--) {
+            if (loopFrames[i]?.t && new Date(loopFrames[i].t) <= sixHrsAgo) {
+                defaultStart = i;
+                break;
+            }
+        }
+    }
+    startSel.value = String(defaultStart);
+    endSel.value   = String(total - 1);
+    document.getElementById('radar-gif-fps').value = '8';
+    document.getElementById('radar-gif-fps-label').textContent = '8';
+    // Auto-enable GW overlay if it's currently shown on the map
+    const gwChk = document.getElementById('radar-gif-gw');
+    gwChk.checked = radarGwVisible && radarGwData != null;
+    gwChk.disabled = !radarGwData;
+    gwChk.closest('.form-check').querySelector('label').textContent =
+        radarGwData ? 'Include gravity wave overlay' : 'Include gravity wave overlay (load GW first)';
+    document.getElementById('radar-gif-status').textContent = '';
+    new bootstrap.Modal(document.getElementById('radarGifModal')).show();
+}
+
+document.getElementById('radar-gif-fps').addEventListener('input', e => {
+    document.getElementById('radar-gif-fps-label').textContent = e.target.value;
+});
+
+document.getElementById('radar-gif-generate-btn').addEventListener('click', async () => {
+    const startIdx  = parseInt(document.getElementById('radar-gif-start').value, 10);
+    const endIdx    = parseInt(document.getElementById('radar-gif-end').value, 10);
+    const fps       = parseInt(document.getElementById('radar-gif-fps').value, 10);
+    const includeGw = document.getElementById('radar-gif-gw').checked;
+    if (startIdx >= endIdx) {
+        document.getElementById('radar-gif-status').textContent = 'Start must be before end.';
+        return;
+    }
+    const frames = loopFrames.slice(startIdx, endIdx + 1);
+    // Pass full GW data so backend can colour dots correctly per frame
+    const gwData = (includeGw && radarGwData) ? radarGwData : null;
+    const btn = document.getElementById('radar-gif-generate-btn');
+    btn.disabled = true;
+    document.getElementById('radar-gif-status').textContent = 'Building GIF…';
+    bootstrap.Modal.getInstance(document.getElementById('radarGifModal'))?.hide();
+    await exportLoopGif({ frames, fps, gwData });
+    btn.disabled = false;
+    document.getElementById('radar-gif-status').textContent = '';
+});
 
 function scheduleIndexRefresh() {
     clearTimeout(loopIndexTimer);
@@ -2538,10 +2774,25 @@ function renderStationPressureChart(data) {
     const labels = (data.frames || []).map(t => new Date(t));
     const obsData = (data.obs || []).map(o => ({ x: new Date(o.t), y: o.v }));
 
+    // Always display in UTC to match the gravity wave status label
+    const _fmtUtcTick = (ms) => {
+        const d = new Date(ms);
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' });
+    };
+    const _tooltipTitleUtc = (items) => {
+        if (!items.length) return '';
+        const d = new Date(items[0].parsed.x);
+        return d.toLocaleString([], {
+            month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit',
+            timeZone: 'UTC'
+        }) + ' UTC';
+    };
+
     const sharedXOptions = {
         type: 'time',
         time: { tooltipFormat: 'MMM d, HH:mm', displayFormats: { hour: 'HH:mm', day: 'MMM d' } },
-        ticks: { ..._chartAxisStyle.ticks, maxTicksLimit: 10 },
+        ticks: { ..._chartAxisStyle.ticks, maxTicksLimit: 10, callback: _fmtUtcTick },
         grid:  _chartAxisStyle.grid,
     };
 
@@ -2603,7 +2854,7 @@ function renderStationPressureChart(data) {
             interaction: { mode: 'index', intersect: false },
             plugins: {
                 legend: { labels: { color: '#111827', boxWidth: 14, padding: 10, font: { size: 11 } } },
-                tooltip: { callbacks: { label: _chartTooltipLabel } },
+                tooltip: { callbacks: { title: _tooltipTitleUtc, label: _chartTooltipLabel } },
             },
             scales: {
                 x: { ...sharedXOptions, ticks: { ...sharedXOptions.ticks, display: false } },
@@ -2645,7 +2896,7 @@ function renderStationPressureChart(data) {
             interaction: { mode: 'index', intersect: false },
             plugins: {
                 legend: { labels: { color: '#111827', boxWidth: 14, padding: 10, font: { size: 11 } } },
-                tooltip: { callbacks: { label: _chartTooltipLabel } },
+                tooltip: { callbacks: { title: _tooltipTitleUtc, label: _chartTooltipLabel } },
             },
             scales: {
                 x: sharedXOptions,

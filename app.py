@@ -3098,7 +3098,8 @@ def api_verification_by_lead_time():
                     "success": True,
                     "location": location_name,
                     "verification": cached.get("verification", {}),
-                    "period": period
+                    "period": period,
+                    "monthly_active": period == 'monthly' and get_asos_data_span_days() >= 20
                 })
 
         if period == 'monthly':
@@ -3121,7 +3122,8 @@ def api_verification_by_lead_time():
             "success": True,
             "location": location_name,
             "verification": result,
-            "period": period
+            "period": period,
+            "monthly_active": period == 'monthly' and get_asos_data_span_days() >= 20
         })
     except Exception as e:
         logger.error(f"Error calculating lead-time verification: {e}")
@@ -6825,6 +6827,29 @@ def _clean_pressure_points(
     return cleaned
 
 
+def _filter_to_asos_1min_network(stations: list[dict]) -> list[dict]:
+    """
+    Keep only stations in IEM's canonical ASOS1MIN network.
+    """
+    if not stations:
+        return []
+    try:
+        one_min_ids = set(asos.fetch_asos_1min_station_list() or [])
+    except Exception:
+        one_min_ids = set()
+    if not one_min_ids:
+        return stations
+
+    filtered = []
+    for s in stations:
+        sid = str(s.get("station_id", "")).strip().upper()
+        if not sid:
+            continue
+        if _db_id_to_1min_id(sid) in one_min_ids:
+            filtered.append(s)
+    return filtered
+
+
 def _moving_average_nan(arr: np.ndarray, n: int) -> np.ndarray:
     """Centered moving average that tolerates NaNs."""
     n = max(1, int(n))
@@ -7628,6 +7653,10 @@ def api_asos_gravity_waves():
             else:
                 cached = load_asos_pressure_perturbation_cache(hours=requested_hours)
                 if cached and cached.get("stations") and cached.get("frames"):
+                    cached = dict(cached)
+                    cached["stations"] = _filter_to_asos_1min_network(cached.get("stations", []))
+                    if not cached["stations"]:
+                        return jsonify({"success": False, "error": "No ASOS1MIN stations available in cache"}), 404
                     return jsonify({"success": True, **cached})
                 # If cache is missing/stale, try rebuilding once so the tab can render immediately.
                 try:
@@ -7636,6 +7665,10 @@ def api_asos_gravity_waves():
                     )
                     cached = load_asos_pressure_perturbation_cache(hours=requested_hours)
                     if cached and cached.get("stations") and cached.get("frames"):
+                        cached = dict(cached)
+                        cached["stations"] = _filter_to_asos_1min_network(cached.get("stations", []))
+                        if not cached["stations"]:
+                            return jsonify({"success": False, "error": "No ASOS1MIN stations available in cache"}), 404
                         return jsonify({"success": True, **cached})
                 except Exception as _cache_exc:
                     logger.warning(f"Gravity-wave cache rebuild fallback failed: {_cache_exc}")
@@ -7652,6 +7685,7 @@ def api_asos_gravity_waves():
         one_min_stations = one_min_cache.get("stations", {}) if one_min_cache else {}
         if not one_min_stations:
             return jsonify({"success": False, "error": "No 1-min ASOS pressure data available (runs overnight)"}), 404
+        one_min_ids = set(asos.fetch_asos_1min_station_list() or [])
 
         station_raw = {}
         dbg_total_obs_stations = len(one_min_stations)
@@ -7661,6 +7695,8 @@ def api_asos_gravity_waves():
         latest_time = None
 
         for sid, sid_data in one_min_stations.items():
+            if one_min_ids and sid not in one_min_ids:
+                continue
             meta = _lookup_station_meta(stations_meta, sid)
             lat = meta.get("lat")
             lon = meta.get("lon")
@@ -8644,7 +8680,7 @@ def api_asos_verification_map():
     model = request.args.get('model', 'gfs')
     lead_time = int(request.args.get('lead_time', 24))
     period = request.args.get('period', 'all')
-    if period == 'monthly' and get_asos_data_span_days() < 30:
+    if period == 'monthly' and get_asos_data_span_days() < 20:
         period = 'all'
 
     # Check cache
@@ -8820,7 +8856,7 @@ def api_asos_station_verification():
     station_id = request.args.get('station_id')
     model = request.args.get('model') # Required model filter
     period = request.args.get('period', 'all')
-    if period == 'monthly' and get_asos_data_span_days() < 30:
+    if period == 'monthly' and get_asos_data_span_days() < 20:
         period = 'all'
 
     if not station_id:
@@ -8880,7 +8916,7 @@ def api_asos_station_observations():
     """Return saved ASOS observations (temp/mslp) for a station."""
     station_id = request.args.get('station_id', '').upper()
     period = request.args.get('period', 'all').lower()
-    if period == 'monthly' and get_asos_data_span_days() < 30:
+    if period == 'monthly' and get_asos_data_span_days() < 20:
         period = 'all'
 
     if not station_id:
@@ -8939,7 +8975,7 @@ def api_asos_station_obs_timeseries():
     model = request.args.get('model', 'gfs').lower()
     lead_time = int(request.args.get('lead_time', 24))
     period = request.args.get('period', 'all').lower()
-    if period == 'monthly' and get_asos_data_span_days() < 30:
+    if period == 'monthly' and get_asos_data_span_days() < 20:
         period = 'all'
 
     if not station_id:
@@ -9254,20 +9290,22 @@ def api_asos_mean_verification():
     # The 'model' parameter is no longer taken here, as we fetch for all models.
     # Location is not directly used for mean across all stations.
     period = request.args.get('period', 'all').lower()
-    if period == 'monthly' and get_asos_data_span_days() < 30:
+    if period == 'monthly' and get_asos_data_span_days() < 20:
         period = 'all'
+    valid_hour_str = request.args.get('valid_hour', '').strip()
+    valid_hour = int(valid_hour_str) if valid_hour_str else None
 
     try:
         if period == 'monthly':
-            gfs_results = asos.get_mean_verification_from_monthly_cache('gfs')
-            aifs_results = asos.get_mean_verification_from_monthly_cache('aifs')
-            ifs_results = asos.get_mean_verification_from_monthly_cache('ifs')
-            nws_results = asos.get_mean_verification_from_monthly_cache('nws')
+            gfs_results = asos.get_mean_verification_from_monthly_cache('gfs', valid_hour=valid_hour)
+            aifs_results = asos.get_mean_verification_from_monthly_cache('aifs', valid_hour=valid_hour)
+            ifs_results = asos.get_mean_verification_from_monthly_cache('ifs', valid_hour=valid_hour)
+            nws_results = asos.get_mean_verification_from_monthly_cache('nws', valid_hour=valid_hour)
         else:
-            gfs_results = asos.get_mean_verification_from_cache('gfs')
-            aifs_results = asos.get_mean_verification_from_cache('aifs')
-            ifs_results = asos.get_mean_verification_from_cache('ifs')
-            nws_results = asos.get_mean_verification_from_cache('nws')
+            gfs_results = asos.get_mean_verification_from_cache('gfs', valid_hour=valid_hour)
+            aifs_results = asos.get_mean_verification_from_cache('aifs', valid_hour=valid_hour)
+            ifs_results = asos.get_mean_verification_from_cache('ifs', valid_hour=valid_hour)
+            nws_results = asos.get_mean_verification_from_cache('nws', valid_hour=valid_hour)
 
         # Check for errors from asos functions
         if "error" in gfs_results:
@@ -9298,9 +9336,17 @@ def api_asos_mean_verification():
             return [arr[i] for i in indices if i < len(arr)]
 
         lead_times = filter_array(all_lead_times, filtered_indices)
+        gfs_run_counts = asos.get_run_counts_by_lead_time('gfs', period, valid_hour=valid_hour)
+        aifs_run_counts = asos.get_run_counts_by_lead_time('aifs', period, valid_hour=valid_hour)
+        ifs_run_counts = asos.get_run_counts_by_lead_time('ifs', period, valid_hour=valid_hour)
+        nws_run_counts = asos.get_run_counts_by_lead_time('nws', period, valid_hour=valid_hour)
 
         combined_verification = {
             "lead_times": lead_times,
+            "gfs_run_count": [gfs_run_counts.get(int(lt), 0) for lt in lead_times],
+            "aifs_run_count": [aifs_run_counts.get(int(lt), 0) for lt in lead_times],
+            "ifs_run_count": [ifs_run_counts.get(int(lt), 0) for lt in lead_times],
+            "nws_run_count": [nws_run_counts.get(int(lt), 0) for lt in lead_times],
             "gfs_temp_mae": filter_array(gfs_results["temp_mae"], filtered_indices),
             "gfs_temp_bias": filter_array(gfs_results["temp_bias"], filtered_indices),
             "aifs_temp_mae": filter_array(aifs_results["temp_mae"], filtered_indices),
@@ -9352,6 +9398,7 @@ def api_asos_mean_verification():
             "verification": combined_verification,
             "cache_timestamp": cache_timestamp,
             "period": period,
+            "monthly_active": period == 'monthly',
             "window_start": window_start,
             "window_end": window_end
         })
@@ -9485,11 +9532,12 @@ def api_asos_sync():
                 logger.warning(f"WPC QPF fetch failed, using NWS precipitation: {e}")
                 wpc_precip = {}
 
-            # Transform to ASOS format (temps/mslps/precips aligned with forecast_hours)
-            nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, forecast_hours, gfs_init, wpc_precip=wpc_precip)
+            # NWS forecasts only extend to 7 days (168h) — filter before transform and store
+            nws_forecast_hours = [h for h in forecast_hours if h <= 168]
+            nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init, wpc_precip=wpc_precip)
 
             # Use GFS init time for NWS (aligns verification timing)
-            asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
+            asos.store_asos_forecasts(gfs_init, nws_forecast_hours, 'nws', nws_forecasts)
 
             success_count = sum(1 for f in nws_raw.values() if f is not None)
             results['nws'] = {'status': 'success', 'stations': success_count}
@@ -9596,7 +9644,7 @@ def api_asos_nws_resync():
             logger.warning(f"WPC QPF fetch failed, using NWS precipitation: {e}")
             wpc_precip = {}
         nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init, wpc_precip=wpc_precip)
-        asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
+        asos.store_asos_forecasts(gfs_init, nws_forecast_hours, 'nws', nws_forecasts)
 
         # Rebuild verification cache
         asos.precompute_verification_cache()
@@ -9936,7 +9984,7 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init, wpc_precip=wpc_precip)
 
                 # Use GFS init time for NWS forecasts (aligns verification timing)
-                asos.store_asos_forecasts(gfs_init, forecast_hours, 'nws', nws_forecasts)
+                asos.store_asos_forecasts(gfs_init, nws_forecast_hours, 'nws', nws_forecasts)
 
                 success_count = sum(1 for f in nws_raw.values() if f is not None)
                 broadcast_sync_log(f"NWS forecasts synced for {success_count}/{len(stations)} stations", 'success')
@@ -9999,8 +10047,11 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                     pass
             if _monthly_age_hours is None or _monthly_age_hours > 20:
                 broadcast_sync_log("Rebuilding monthly ASOS cache (last 30 days)...", 'info')
-                asos.rebuild_monthly_station_cache(days_back=30)
+                asos.rebuild_monthly_station_cache(days_back=20)
                 broadcast_sync_log("Monthly ASOS cache updated", 'success')
+                broadcast_sync_log("Rebuilding ASOS verification cache...", 'info')
+                asos.precompute_verification_cache()
+                broadcast_sync_log("ASOS verification cache updated", 'success')
             else:
                 broadcast_sync_log(f"Monthly ASOS cache is {_monthly_age_hours:.1f}h old, skipping rebuild", 'info')
 
@@ -10529,6 +10580,130 @@ def api_rebuild_eof_cache():
     return jsonify({"success": True, "message": "EOF cache rebuild started in background"})
 
 
+# ── Basemap tile cache (used by GIF exporter) ─────────────────────────────────
+
+_BASEMAP_TILE_CACHE: dict = {}  # url -> (bytes, fetched_at_unix)
+_BASEMAP_TILE_TTL = 3600        # 1 hour
+
+# Browser-like headers so CartoDB tile servers don't reject server-side requests
+_TILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Referer": "http://localhost:5001/",
+}
+
+
+def _get_tile_bytes(url: str) -> bytes | None:
+    """Fetch a CartoDB tile, returning raw bytes, with in-memory TTL cache."""
+    now = time.time()
+    entry = _BASEMAP_TILE_CACHE.get(url)
+    if entry and now - entry[1] < _BASEMAP_TILE_TTL:
+        return entry[0]
+    try:
+        r = requests.get(url, timeout=10, headers=_TILE_HEADERS)
+        r.raise_for_status()
+        _BASEMAP_TILE_CACHE[url] = (r.content, now)
+        # Evict oldest entries to prevent unbounded growth
+        if len(_BASEMAP_TILE_CACHE) > 2000:
+            oldest = sorted(_BASEMAP_TILE_CACHE, key=lambda k: _BASEMAP_TILE_CACHE[k][1])[:500]
+            for k in oldest:
+                del _BASEMAP_TILE_CACHE[k]
+        return r.content
+    except Exception as exc:
+        logger.debug("Tile fetch failed %s: %s", url, exc)
+        return None
+
+
+def _build_basemap_images(south: float, north: float, west: float, east: float,
+                           out_w: int, out_h: int):
+    """
+    Fetch and stitch CartoDB tiles for the given lat/lon viewport.
+
+    Returns a tuple (base_img, labels_img), both PIL RGBA Images at (out_w × out_h).
+    - base_img:   dark_nolabels  — dark background with coastlines/borders, no text
+    - labels_img: dark_only_labels — city/state labels on transparent background
+
+    In the GIF render pipeline composite as:
+      base_img  →  alpha_composite(radar_frame)  →  alpha_composite(labels_img)  →  draw GW markers
+
+    Falls back to solid dark colour if all tile fetches fail.
+    """
+    import io as _bio, math as _m
+    from PIL import Image as _Img
+
+    # Match the exact tile styles Leaflet uses for the radar map
+    BASE_URL   = "https://a.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png"
+    LABELS_URL = "https://a.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png"
+    TILE_SZ = 256
+
+    lon_range = max(east - west, 0.01)
+    z = max(3, min(9, int(_m.ceil(_m.log2(out_w / TILE_SZ * 360 / lon_range)))))
+    n = 2 ** z
+
+    def _lon2x(lon):
+        return (lon + 180) / 360 * n
+
+    def _lat2y(lat):
+        lr = _m.radians(lat)
+        return (1 - _m.log(_m.tan(lr) + 1 / _m.cos(lr)) / _m.pi) / 2 * n
+
+    x0f, x1f = _lon2x(west),  _lon2x(east)
+    y0f, y1f = _lat2y(north), _lat2y(south)  # north → smaller tile-y
+
+    xi0, xi1 = int(_m.floor(x0f)), int(_m.floor(x1f))
+    yi0, yi1 = int(_m.floor(y0f)), int(_m.floor(y1f))
+    cols, rows = xi1 - xi0 + 1, yi1 - yi0 + 1
+    canvas_size = (cols * TILE_SZ, rows * TILE_SZ)
+
+    def _stitch(url_template, fallback_color):
+        canvas = _Img.new("RGBA", canvas_size, fallback_color)
+        for ty in range(yi0, yi1 + 1):
+            for tx in range(xi0, xi1 + 1):
+                url = url_template.format(z=z, x=tx % n, y=ty)
+                tb  = _get_tile_bytes(url)
+                if tb:
+                    try:
+                        tile = _Img.open(_bio.BytesIO(tb)).convert("RGBA")
+                        canvas.paste(tile, ((tx - xi0) * TILE_SZ, (ty - yi0) * TILE_SZ))
+                    except Exception:
+                        pass
+        cl = (x0f - xi0) * TILE_SZ
+        ct = (y0f - yi0) * TILE_SZ
+        cr = cl + (x1f - x0f) * TILE_SZ
+        cb = ct + (y1f - y0f) * TILE_SZ
+        cropped = canvas.crop((int(cl), int(ct), int(cr), int(cb)))
+        if cropped.size[0] < 1 or cropped.size[1] < 1:
+            return _Img.new("RGBA", (out_w, out_h), fallback_color)
+        return cropped.resize((out_w, out_h), _Img.LANCZOS)
+
+    base   = _stitch(BASE_URL,   (18, 26, 46, 255))
+    labels = _stitch(LABELS_URL, (0, 0, 0, 0))
+    return base, labels
+
+
+def _gravity_color_rgb(v) -> tuple:
+    """Python equivalent of the JS gravityColor() function → (R, G, B)."""
+    if v is None or not isinstance(v, (int, float)) or not (-1e9 < v < 1e9):
+        return (156, 163, 175)  # gray (#9ca3af)
+    x = max(-1.0, min(1.0, float(v)))
+    if x < 0:
+        t = x + 1
+        return (int(30 + t * 225), int(64 + t * 191), 255)
+    else:
+        return (255, int(255 - x * 205), int(255 - x * 205))
+
+
+def _gravity_radius_px(v, base_px: int) -> int:
+    """Python equivalent of gravityRadius() scaled to pixel units."""
+    if v is None or not isinstance(v, (int, float)) or not (-1e9 < v < 1e9):
+        return base_px
+    scale = base_px / 2.5
+    return base_px + min(int(4.5 * scale), int(abs(float(v)) * 1.2 * scale))
+
+
 # ── NEXRAD MRMS radar endpoints ───────────────────────────────────────────────
 
 @app.route("/api/radar/metadata")
@@ -10538,11 +10713,11 @@ def radar_metadata():
     if not fresh:
         # Return metadata even if stale so the frontend knows bounds
         pass
-    r = _radar._cache   # read under lock for metadata (png_bytes not needed here)
     with _radar._cache_lock:
         vt    = _radar._cache["valid_time"]
         err   = _radar._cache["error"]
         ready = _radar._cache["png_bytes"] is not None
+        steps = sorted([int(s) for s in (_radar._cache.get("png_by_step") or {}).keys()])
 
     return jsonify({
         "ready":      ready,
@@ -10553,15 +10728,16 @@ def radar_metadata():
             [_radar.MRMS_BOUNDS["north"], _radar.MRMS_BOUNDS["east"]],
         ],
         "cache_ttl": _radar.CACHE_TTL,
+        "render_steps": steps if steps else list(getattr(_radar, "RENDER_STEPS", (getattr(_radar, "RENDER_STEP", 4),))),
+        "render_default_step": getattr(_radar, "RENDER_STEP", 4),
     })
 
 
 @app.route("/api/radar/composite.png")
 def radar_composite_png():
     """Serve the current MRMS reflectivity composite as a PNG."""
-    with _radar._cache_lock:
-        png_bytes  = _radar._cache["png_bytes"]
-        valid_time = _radar._cache["valid_time"]
+    requested_step = request.args.get("step", default=None, type=int)
+    png_bytes, used_step, valid_time = _radar.get_cached_composite_png(requested_step)
 
     if png_bytes is None:
         return Response("Radar data not yet available", status=503,
@@ -10572,6 +10748,7 @@ def radar_composite_png():
     resp.headers["X-Radar-Valid-Time"] = (
         valid_time.isoformat() if valid_time else "unknown"
     )
+    resp.headers["X-Radar-Render-Step"] = str(used_step)
     return resp
 
 
@@ -10588,6 +10765,49 @@ RADAR_ARCHIVE_PRODUCTS = frozenset([
     "klwx_sr_bref", "klwx_sr_bvel", "klwx_bdhc",
     "tiad_bref1", "tiad_brefl", "tiad_bvel",
 ])
+RADAR_ARCHIVE_RENDER_STEPS = (4, 2, 1)
+
+
+def _select_archive_step(requested_step: int | None, available_steps: list[int]) -> int:
+    if not available_steps:
+        return RADAR_ARCHIVE_RENDER_STEPS[0]
+    if requested_step is None:
+        return available_steps[0]
+    try:
+        req = max(1, int(requested_step))
+    except (TypeError, ValueError):
+        req = available_steps[0]
+    return min(available_steps, key=lambda s: abs(s - req))
+
+
+def _resolve_archive_variant(product: str, base_filename: str, requested_step: int | None) -> tuple[str, int]:
+    """
+    Return (filename, step) for the closest available archived frame variant.
+    Falls back to the base filename when no variants are indexed.
+    """
+    index_file = RADAR_FRAMES_DIR / product / "index.json"
+    try:
+        data = json.loads(index_file.read_text())
+    except Exception:
+        return base_filename, RADAR_ARCHIVE_RENDER_STEPS[0]
+
+    frame = next((f for f in (data.get("frames") or []) if f.get("f") == base_filename), None)
+    if not frame:
+        return base_filename, RADAR_ARCHIVE_RENDER_STEPS[0]
+
+    variant_map = frame.get("s") or {}
+    parsed = {}
+    for k, v in variant_map.items():
+        try:
+            parsed[int(k)] = v
+        except Exception:
+            continue
+    if not parsed:
+        return base_filename, RADAR_ARCHIVE_RENDER_STEPS[0]
+
+    available = sorted(parsed.keys(), reverse=True)
+    chosen = _select_archive_step(requested_step, available)
+    return parsed.get(chosen, base_filename), chosen
 
 
 @app.route("/api/radar/frames/<product>/index")
@@ -10600,6 +10820,18 @@ def radar_frames_index(product):
         return jsonify({"product": product, "frames": [], "ready": False})
     try:
         data = json.loads(index_file.read_text())
+        all_steps = set()
+        for frame in data.get("frames", []):
+            s_map = frame.get("s") or {}
+            for k in s_map.keys():
+                try:
+                    all_steps.add(int(k))
+                except Exception:
+                    pass
+        if not all_steps:
+            all_steps = {RADAR_ARCHIVE_RENDER_STEPS[0]}
+        data["render_steps"] = sorted(all_steps, reverse=True)
+        data["render_default_step"] = RADAR_ARCHIVE_RENDER_STEPS[0]
         data["ready"] = len(data.get("frames", [])) > 0
         return jsonify(data)
     except Exception as e:
@@ -10619,7 +10851,9 @@ def radar_frames_file(product, filename):
         or ".." in filename
     ):
         return Response("Invalid filename", status=400, mimetype="text/plain")
-    frame_path = RADAR_FRAMES_DIR / product / filename
+    requested_step = request.args.get("step", default=None, type=int)
+    resolved_filename, used_step = _resolve_archive_variant(product, filename, requested_step)
+    frame_path = RADAR_FRAMES_DIR / product / resolved_filename
     if not frame_path.exists():
         return Response("Frame not found", status=404, mimetype="text/plain")
     try:
@@ -10629,6 +10863,7 @@ def radar_frames_file(product, filename):
         return Response("Frame unavailable", status=503, mimetype="text/plain")
     resp = Response(png_bytes, mimetype="image/png")
     resp.headers["Cache-Control"] = "public, max-age=86400"
+    resp.headers["X-Radar-Render-Step"] = str(used_step)
     return resp
 
 
@@ -10870,10 +11105,14 @@ def export_radar_gif():
     """Generate an animated GIF of the current loop cropped to the requested viewport.
 
     Request JSON:
-      product_key  — archive subdirectory key (e.g. "precip", "klwx_sr_bref")
-      frames       — list of {f: filename, t: ISO timestamp}
-      bounds       — {south, north, west, east} in decimal degrees (Leaflet viewport)
-      delay_ms     — ms per frame (default 500)
+      product_key — archive subdirectory key (e.g. "precip", "klwx_sr_bref")
+      frames      — list of {f: filename, t: ISO timestamp}
+      bounds      — {south, north, west, east} in decimal degrees (Leaflet viewport)
+      delay_ms    — ms per frame (default 125 → 8 fps)
+      gw_data     — optional gravity-wave data: {frames: [ISO…], stations: [{lat,lon,values:[…]}]}
+                    When provided, renders perturbation markers (same colours as the live map)
+                    on top of labels in the correct layer order:
+                      base tiles → radar → labels → GW markers → timestamp
     """
     import io as _io
     import math as _math
@@ -10884,7 +11123,8 @@ def export_radar_gif():
         product_key = body["product_key"]
         frame_list  = body["frames"]
         vp          = body["bounds"]
-        delay_ms    = max(100, min(int(body.get("delay_ms", 500)), 5000))
+        delay_ms    = max(50, min(int(body.get("delay_ms", 125)), 5000))
+        gw_data     = body.get("gw_data")  # None or {frames:[…], stations:[…]}
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -10920,8 +11160,41 @@ def export_radar_gif():
     def _merc_y(lat_deg):
         return _math.log(_math.tan(_math.pi / 4 + _math.radians(lat_deg) / 2))
 
-    product_dir = DATA_DIR / "radar_frames" / product_key
-    gif_frames  = []
+    # Pre-parse gravity-wave data for per-frame station rendering
+    gw_frame_times = []   # list of aware datetimes
+    gw_stations    = []   # raw station dicts from request
+    if gw_data:
+        try:
+            gw_frame_times = [
+                datetime.fromisoformat(t.replace("Z", "+00:00"))
+                for t in (gw_data.get("frames") or [])
+            ]
+            gw_stations = gw_data.get("stations") or []
+            # Pre-compute static pixel-fraction positions (lat/lon doesn't change)
+            if use_mercator:
+                _yn = _merc_y(north)
+                _ys = _merc_y(south)
+            for s in gw_stations:
+                lat, lon = s.get("lat"), s.get("lon")
+                if lat is None or lon is None:
+                    s["_skip"] = True
+                    continue
+                if not (south <= lat <= north and west <= lon <= east):
+                    s["_skip"] = True
+                    continue
+                s["_xf"] = (lon - west) / (east - west)
+                if use_mercator:
+                    s["_yf"] = (_yn - _merc_y(lat)) / (_yn - _ys)
+                else:
+                    s["_yf"] = (north - lat) / (north - south)
+        except Exception as exc:
+            logger.warning("GIF: GW data pre-processing failed: %s", exc)
+            gw_frame_times = []
+            gw_stations    = []
+
+    product_dir    = DATA_DIR / "radar_frames" / product_key
+    gif_frames     = []
+    basemap_cache  = None   # (base_img, labels_img) built lazily on first frame
 
     for frame in frame_list[:288]:   # hard cap at 288 frames
         frame_path = product_dir / frame.get("f", "")
@@ -10958,10 +11231,62 @@ def export_radar_gif():
             if cW > 900:
                 scale   = 900 / cW
                 cropped = cropped.resize((900, int(cH * scale)), Image.LANCZOS)
+            cW, cH = cropped.size
 
-            # Composite radar (RGBA) onto the dark map background colour
-            bg        = Image.new("RGBA", cropped.size, (26, 26, 46, 255))
-            composite = Image.alpha_composite(bg, cropped)
+            # Build basemap (base + labels) on the first frame; reuse for all others
+            if basemap_cache is None:
+                try:
+                    basemap_cache = _build_basemap_images(south, north, west, east, cW, cH)
+                    logger.info("GIF: basemap built (%dx%d)", cW, cH)
+                except Exception as bme:
+                    logger.warning("GIF basemap build failed: %s", bme)
+                    _dark = Image.new("RGBA", (cW, cH), (18, 26, 46, 255))
+                    _transp = Image.new("RGBA", (cW, cH), (0, 0, 0, 0))
+                    basemap_cache = (_dark, _transp)
+
+            base_img, labels_img = basemap_cache
+
+            # Layer order (matches live Leaflet map):
+            #   1. base tiles (dark background, borders, coastlines)
+            #   2. radar RGBA frame (semi-transparent precipitation/reflectivity)
+            #   3. labels tiles (city/state names on transparent background)
+            #   4. gravity-wave markers (if provided)
+            #   5. timestamp burn-in
+            composite = Image.alpha_composite(base_img.copy(), cropped)
+            composite = Image.alpha_composite(composite, labels_img)
+
+            # Gravity-wave station markers — find closest GW frame for this radar time
+            if gw_frame_times and gw_stations:
+                gw_frame_idx = None
+                t_str_raw = frame.get("t", "")
+                if t_str_raw:
+                    try:
+                        radar_t = datetime.fromisoformat(t_str_raw.replace("Z", "+00:00"))
+                        diffs   = [abs((radar_t - gf).total_seconds()) for gf in gw_frame_times]
+                        min_d   = min(diffs)
+                        if min_d <= 15 * 60:
+                            gw_frame_idx = diffs.index(min_d)
+                    except Exception:
+                        pass
+
+                if gw_frame_idx is not None:
+                    draw   = ImageDraw.Draw(composite)
+                    base_r = max(2, int(cW / 350))
+                    for s in gw_stations:
+                        if s.get("_skip"):
+                            continue
+                        vals = s.get("values") or []
+                        val  = vals[gw_frame_idx] if gw_frame_idx < len(vals) else None
+                        rgb  = _gravity_color_rgb(val)
+                        r    = _gravity_radius_px(val, base_r)
+                        fill_opacity = int(255 * (0.15 if val is None else 0.85))
+                        px = int(s["_xf"] * cW)
+                        py = int(s["_yf"] * cH)
+                        draw.ellipse(
+                            [(px - r, py - r), (px + r, py + r)],
+                            fill=rgb + (fill_opacity,),
+                            outline=(17, 17, 17, 200),
+                        )
 
             # Burn timestamp into the bottom-left corner
             t_str = frame.get("t", "")

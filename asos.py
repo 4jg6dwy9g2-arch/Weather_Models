@@ -21,6 +21,7 @@ import urllib.request
 import urllib.parse
 import urllib.error # Added for specific error handling
 import socket # Added for specific error handling
+import math
 from rate_limiter import RateLimiter
 from pathlib import Path
 import logging
@@ -47,6 +48,8 @@ PRECIP_MM_STATIONS = {"PAAK"}
 # rather than the true accumulation.  These are not real precipitation and must
 # be discarded before computing hourly maxima.
 _TIPPING_BUCKET_OVERFLOW_IN = 2.56
+_MAX_REASONABLE_P01I_IN = 3.0
+_MAX_REASONABLE_P01I_MM = _MAX_REASONABLE_P01I_IN * 25.4
 
 
 def _is_overflow_value(v: float) -> bool:
@@ -55,6 +58,18 @@ def _is_overflow_value(v: float) -> bool:
         return False
     ratio = v / _TIPPING_BUCKET_OVERFLOW_IN
     return abs(ratio - round(ratio)) < 1e-4
+
+
+def _is_implausible_precip_value(station_id: str, v: float) -> bool:
+    """
+    Return True for clearly bad hourly p01i values that should be excluded.
+
+    Most stations report p01i in inches; a small set report mm (PRECIP_MM_STATIONS).
+    """
+    if not math.isfinite(v) or v < 0:
+        return True
+    max_allowed = _MAX_REASONABLE_P01I_MM if station_id in PRECIP_MM_STATIONS else _MAX_REASONABLE_P01I_IN
+    return v > max_allowed
 
 
 def should_include_precip(fcst_val, obs_val) -> bool:
@@ -416,7 +431,8 @@ def fetch_observations(
                     if val == 'T':
                         obs['precip'] = 0.001  # Trace
                     elif val not in ['M', '']:
-                        obs['precip'] = float(val)
+                        precip_val = float(val)
+                        obs['precip'] = None if _is_implausible_precip_value(station, precip_val) else precip_val
                     else:
                         obs['precip'] = None
 
@@ -611,10 +627,13 @@ def accumulate_stats_from_run(
 
     # Initialize cumulative stats if needed
     if "cumulative_stats" not in data:
-        data["cumulative_stats"] = {"by_station": {}, "by_lead_time": {}, "time_series": {}}
+        data["cumulative_stats"] = {"by_station": {}, "by_lead_time": {}, "by_lead_time_by_valid_hour": {}, "time_series": {}}
+    if "by_lead_time_by_valid_hour" not in data["cumulative_stats"]:
+        data["cumulative_stats"]["by_lead_time_by_valid_hour"] = {}
 
     cumulative_by_station = data["cumulative_stats"]["by_station"]
     cumulative_by_lead_time = data["cumulative_stats"]["by_lead_time"]
+    cumulative_by_lt_by_vh = data["cumulative_stats"]["by_lead_time_by_valid_hour"]
 
     # Initialize time series structure if needed
     if "time_series" not in data["cumulative_stats"]:
@@ -644,9 +663,11 @@ def accumulate_stats_from_run(
         if not model_data:
             continue
 
-        # Initialize model in by_lead_time if needed
+        # Initialize model in by_lead_time and by_lead_time_by_valid_hour if needed
         if model not in cumulative_by_lead_time:
             cumulative_by_lead_time[model] = {}
+        if model not in cumulative_by_lt_by_vh:
+            cumulative_by_lt_by_vh[model] = {}
 
         # Process each station
         for station_id, fcst_data in model_data.items():
@@ -720,6 +741,22 @@ def accumulate_stats_from_run(
                     cumulative_by_lead_time[model][var][lt_str]["sum_abs_errors"] += abs_error
                     cumulative_by_lead_time[model][var][lt_str]["sum_errors"] += error
                     cumulative_by_lead_time[model][var][lt_str]["count"] += 1
+
+                    # Update by_lead_time_by_valid_hour stats (store at exact lt; snapping happens at read time)
+                    vh_str = str(valid_time.hour)
+                    if var not in cumulative_by_lt_by_vh[model]:
+                        cumulative_by_lt_by_vh[model][var] = {}
+                    if lt_str not in cumulative_by_lt_by_vh[model][var]:
+                        cumulative_by_lt_by_vh[model][var][lt_str] = {}
+                    if vh_str not in cumulative_by_lt_by_vh[model][var][lt_str]:
+                        cumulative_by_lt_by_vh[model][var][lt_str][vh_str] = {
+                            "sum_abs_errors": 0.0, "sum_errors": 0.0, "count": 0
+                        }
+                    cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["sum_abs_errors"] += abs_error
+                    cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["sum_errors"] += error
+                    cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["count"] += 1
+                    # Note: lt_str stored here may be non-canonical; _snap_to_canonical_lt() in
+                    # precompute_verification_cache() remaps it to the correct canonical bucket.
 
     # Accumulate time series data (daily errors by lead time)
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
@@ -1004,7 +1041,7 @@ def calculate_6hr_precip_total(db: dict, station_id: str, end_time: datetime) ->
             obs_time = datetime.fromisoformat(obs_time_str)
             if start_time < obs_time <= end_time:
                 precip = obs_data.get('precip')
-                if precip is not None:
+                if precip is not None and not _is_implausible_precip_value(station_id, precip):
                     window_obs.append((obs_time, precip))
         except (ValueError, AttributeError):
             continue
@@ -2021,6 +2058,21 @@ def precompute_verification_cache() -> dict:
     # Filter to only compute stats for verification lead times that exist in the data
     lead_times = sorted([lt for lt in all_forecast_hours if lt in verification_lead_times])
 
+    def _snap_to_canonical_lt(lt: int) -> Optional[int]:
+        """Return nearest canonical lead time for lt, or None if gap > 12h."""
+        lo = bisect.bisect_left(lead_times, lt)
+        best = None
+        best_dist = 13  # must be <= 12 to qualify
+        if lo < len(lead_times):
+            d = lead_times[lo] - lt
+            if d <= 12:
+                best, best_dist = lead_times[lo], d
+        if lo > 0:
+            d = lt - lead_times[lo - 1]
+            if d < best_dist:
+                best, best_dist = lead_times[lo - 1], d
+        return best
+
     if not lead_times:
         logger.warning("No lead times available for verification cache")
         return {}
@@ -2112,7 +2164,7 @@ def precompute_verification_cache() -> dict:
             if obs_data is None:
                 continue
             precip = obs_data.get('precip')
-            if precip is None:
+            if precip is None or _is_implausible_precip_value(station_id, precip):
                 continue
             obs_time = datetime.fromtimestamp(sorted_ts[idx], tz=timezone.utc)
             window_obs.append((obs_time, precip))
@@ -2263,6 +2315,13 @@ def precompute_verification_cache() -> dict:
         'ifs': {'temp': {}, 'mslp': {}, 'precip': {}},
         'nws': {'temp': {}, 'mslp': {}, 'precip': {}}
     }
+    # Structure: hourly_aggregated_stats[model][var][lt_str][vh_str] = {sum_abs, sum, count}
+    hourly_aggregated_stats = {
+        'gfs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'aifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'ifs': {'temp': {}, 'mslp': {}, 'precip': {}},
+        'nws': {'temp': {}, 'mslp': {}, 'precip': {}}
+    }
 
     # Initialize with zeros for all lead times
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
@@ -2274,6 +2333,7 @@ def precompute_verification_cache() -> dict:
                     'sum_errors': 0.0,
                     'count': 0
                 }
+                hourly_aggregated_stats[model][var][lt_str] = {}
                 for station_id in stations:
                     station_stats[station_id][model][var][lt_str] = {
                         'sum_abs_errors': 0.0,
@@ -2306,6 +2366,26 @@ def precompute_verification_cache() -> dict:
                     aggregated_stats[model][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
                     aggregated_stats[model][var][lt_str]['count'] += stats.get('count', 0)
 
+    # Load cumulative hourly breakdown (snap any non-canonical LT to nearest canonical)
+    cumulative_by_lt_by_vh = db.get("cumulative_stats", {}).get("by_lead_time_by_valid_hour", {})
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
+        model_cumulative = cumulative_by_lt_by_vh.get(model, {})
+        for var in ['temp', 'mslp', 'precip']:
+            var_cumulative = model_cumulative.get(var, {})
+            for lt_str, vh_data in var_cumulative.items():
+                snapped = _snap_to_canonical_lt(int(lt_str))
+                if snapped is None:
+                    continue
+                snapped_lt_str = str(snapped)
+                for vh_str, stats in vh_data.items():
+                    if vh_str not in hourly_aggregated_stats[model][var][snapped_lt_str]:
+                        hourly_aggregated_stats[model][var][snapped_lt_str][vh_str] = {
+                            'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0
+                        }
+                    hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
+                    hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_errors'] += stats.get('sum_errors', 0.0)
+                    hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['count'] += stats.get('count', 0)
+
     fresh_run_count = sum(1 for k in runs if k not in accumulated_run_keys)
     logger.info(f"Computing fresh stats from {fresh_run_count} current runs (skipping {len(accumulated_run_keys)} accumulated)...")
 
@@ -2332,8 +2412,13 @@ def precompute_verification_cache() -> dict:
                 if station_id not in stations:
                     continue
 
+                lead_times_set = set(lead_times)
                 for i, lt in enumerate(forecast_hours):
-                    if lt not in lead_times:
+                    is_canonical = lt in lead_times_set
+                    snapped_lt = lt if is_canonical else _snap_to_canonical_lt(lt)
+
+                    # Skip if not canonical and can't be snapped to any canonical bucket
+                    if not is_canonical and snapped_lt is None:
                         continue
 
                     valid_time = init_time + timedelta(hours=lt)
@@ -2345,6 +2430,7 @@ def precompute_verification_cache() -> dict:
                         continue
 
                     lt_str = str(lt)
+                    snapped_lt_str = str(snapped_lt)
 
                     # Process each variable
                     for var, (fcst_key, obs_key) in var_map.items():
@@ -2361,15 +2447,25 @@ def precompute_verification_cache() -> dict:
                         error = fcst_val - obs_val
                         abs_error = abs(error)
 
-                        # Update station stats
-                        station_stats[station_id][model][var][lt_str]['sum_abs_errors'] += abs_error
-                        station_stats[station_id][model][var][lt_str]['sum_errors'] += error
-                        station_stats[station_id][model][var][lt_str]['count'] += 1
+                        if is_canonical:
+                            # Update station stats and aggregated stats (canonical LTs only)
+                            station_stats[station_id][model][var][lt_str]['sum_abs_errors'] += abs_error
+                            station_stats[station_id][model][var][lt_str]['sum_errors'] += error
+                            station_stats[station_id][model][var][lt_str]['count'] += 1
 
-                        # Update aggregated stats
-                        aggregated_stats[model][var][lt_str]['sum_abs_errors'] += abs_error
-                        aggregated_stats[model][var][lt_str]['sum_errors'] += error
-                        aggregated_stats[model][var][lt_str]['count'] += 1
+                            aggregated_stats[model][var][lt_str]['sum_abs_errors'] += abs_error
+                            aggregated_stats[model][var][lt_str]['sum_errors'] += error
+                            aggregated_stats[model][var][lt_str]['count'] += 1
+
+                        # Update hourly aggregated stats for all lead times, snapped to nearest canonical
+                        vh_str = str(valid_time.hour)
+                        if vh_str not in hourly_aggregated_stats[model][var][snapped_lt_str]:
+                            hourly_aggregated_stats[model][var][snapped_lt_str][vh_str] = {
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0
+                            }
+                        hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_abs_errors'] += abs_error
+                        hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_errors'] += error
+                        hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['count'] += 1
 
     logger.info("Finalizing cache data...")
 
@@ -2414,6 +2510,26 @@ def precompute_verification_cache() -> dict:
                         'mae': None,
                         'bias': None
                     }
+
+    # Convert hourly_aggregated_stats to final format
+    cache_data["by_lead_time_by_valid_hour"] = {}
+    for model in ['gfs', 'aifs', 'ifs', 'nws']:
+        cache_data["by_lead_time_by_valid_hour"][model] = {}
+        for lt in lead_times:
+            lt_str = str(lt)
+            cache_data["by_lead_time_by_valid_hour"][model][lt_str] = {}
+            for var in ['temp', 'mslp', 'precip']:
+                for vh_str, stats in hourly_aggregated_stats[model][var][lt_str].items():
+                    if vh_str not in cache_data["by_lead_time_by_valid_hour"][model][lt_str]:
+                        cache_data["by_lead_time_by_valid_hour"][model][lt_str][vh_str] = {}
+                    entry = cache_data["by_lead_time_by_valid_hour"][model][lt_str][vh_str]
+                    if stats['count'] > 0:
+                        entry[var] = {
+                            'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                            'bias': round(stats['sum_errors'] / stats['count'], 2)
+                        }
+                    else:
+                        entry[var] = {'mae': None, 'bias': None}
 
     # Add time series data to cache
     cache_data["time_series"] = time_series_data
@@ -2704,6 +2820,86 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = 30)
     }
 
 
+def get_run_counts_by_lead_time(model: str, period: str = "all", valid_hour: Optional[int] = None) -> dict:
+    """
+    Return forecast run counts by lead time for a model.
+
+    A run is counted for lead time LT when:
+    - that model exists for the run,
+    - LT exists in the run's forecast_hours, and
+    - run init + LT is in the past (verifiable).
+
+    When valid_hour is set, only counts forecasts whose valid time matches that
+    UTC hour, snapping non-canonical lead times to the nearest canonical bucket
+    (same logic as the hourly verification stats).
+    """
+    db = load_asos_forecasts_db()
+    runs = db.get("runs", {})
+    now = datetime.now(timezone.utc)
+    period = (period or "all").lower()
+    cutoff = now - timedelta(days=30) if period == "monthly" else None
+
+    verification_lead_times = sorted(list(range(6, 25, 6)) + list(range(48, 361, 24)))
+
+    def _snap(lt: int) -> Optional[int]:
+        lo = bisect.bisect_left(verification_lead_times, lt)
+        best, best_dist = None, 13
+        if lo < len(verification_lead_times):
+            d = verification_lead_times[lo] - lt
+            if d <= 12:
+                best, best_dist = verification_lead_times[lo], d
+        if lo > 0:
+            d = lt - verification_lead_times[lo - 1]
+            if d < best_dist:
+                best = verification_lead_times[lo - 1]
+        return best
+
+    counts_by_lt: dict[int, int] = {}
+    nws_max_lead = 168 if model.lower() == 'nws' else None
+
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        if cutoff is not None and init_time < cutoff:
+            continue
+
+        model_data = run_data.get(model.lower())
+        if not model_data:
+            continue
+
+        lead_times = run_data.get("forecast_hours", [])
+
+        # Track which canonical buckets this run has already contributed to (avoid double-counting)
+        counted_buckets: set[int] = set()
+
+        for lt in lead_times:
+            lt = int(lt)
+            if nws_max_lead is not None and lt > nws_max_lead:
+                continue
+            valid_time = init_time + timedelta(hours=lt)
+            if valid_time >= now:
+                continue
+
+            if valid_hour is not None:
+                if valid_time.hour != valid_hour:
+                    continue
+                # Snap to nearest canonical bucket
+                bucket = _snap(lt)
+                if bucket is None or bucket in counted_buckets:
+                    continue
+                counted_buckets.add(bucket)
+                counts_by_lt[bucket] = counts_by_lt.get(bucket, 0) + 1
+            else:
+                counts_by_lt[lt] = counts_by_lt.get(lt, 0) + 1
+
+    return counts_by_lt
+
+
 def get_verification_data_from_cache(
     model: str,
     variable: str,
@@ -2722,6 +2918,9 @@ def get_verification_data_from_cache(
     Returns:
         Dict mapping station_id to verification data (same format as get_verification_data)
     """
+    if model.lower() == 'nws' and lead_time_hours > 168:
+        return {}
+
     cache = load_verification_cache()
 
     if cache is None:
@@ -2760,6 +2959,9 @@ def get_verification_data_from_monthly_cache(
     """
     Get verification data from the rolling monthly cache.
     """
+    if model.lower() == 'nws' and lead_time_hours > 168:
+        return {}
+
     monthly = load_monthly_stats_cache().get("by_station_monthly", {})
     db = load_asos_forecasts_db()
 
@@ -2794,7 +2996,7 @@ def get_verification_data_from_monthly_cache(
     return results
 
 
-def rebuild_monthly_station_cache(days_back: int = 30) -> None:
+def rebuild_monthly_station_cache(days_back: int = 20) -> None:
     """
     Build rolling monthly per-station stats for the last N days.
     Stored in cumulative_stats['by_station_monthly'].
@@ -2846,7 +3048,7 @@ def rebuild_monthly_station_cache(days_back: int = 30) -> None:
             if obs_data is None:
                 continue
             precip = obs_data.get('precip')
-            if precip is None:
+            if precip is None or _is_implausible_precip_value(station_id, precip):
                 continue
             window_obs.append((datetime.fromtimestamp(sorted_ts[idx], tz=timezone.utc), precip))
         if not window_obs:
@@ -2919,7 +3121,25 @@ def rebuild_monthly_station_cache(days_back: int = 30) -> None:
             result['precip_6hr'] = None
         return result
 
+    # Canonical lead times for snapping (must match precompute_verification_cache)
+    _canonical_lts = sorted(set(list(range(6, 25, 6)) + list(range(48, 361, 24))))
+
+    def _snap_lt(lt: int) -> Optional[int]:
+        """Snap lt to nearest canonical lead time within 12h, or None."""
+        lo = bisect.bisect_left(_canonical_lts, lt)
+        best, best_dist = None, 13
+        if lo < len(_canonical_lts):
+            d = _canonical_lts[lo] - lt
+            if d <= 12:
+                best, best_dist = _canonical_lts[lo], d
+        if lo > 0:
+            d = lt - _canonical_lts[lo - 1]
+            if d < best_dist:
+                best, best_dist = _canonical_lts[lo - 1], d
+        return best
+
     monthly = {}
+    monthly_vh = {}  # {station_id: {model: {var: {canonical_lt_str: {vh_str: {sum_abs, sum, count}}}}}}
 
     var_map = {
         'temp': ('temps', 'temp'),
@@ -2989,13 +3209,26 @@ def rebuild_monthly_station_cache(days_back: int = 30) -> None:
                         stats['sum_errors'] += error
                         stats['count'] += 1
 
+                        # Also accumulate by valid hour, snapping to nearest canonical lt
+                        snapped_lt = _snap_lt(lead_time_hours)
+                        if snapped_lt is not None:
+                            vh_str = str(valid_time.hour)
+                            snapped_lt_str = str(snapped_lt)
+                            monthly_vh.setdefault(station_id, {}).setdefault(model, {}).setdefault(var, {}).setdefault(
+                                snapped_lt_str, {}).setdefault(vh_str, {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0})
+                            vh_stats = monthly_vh[station_id][model][var][snapped_lt_str][vh_str]
+                            vh_stats['sum_abs_errors'] += abs(error)
+                            vh_stats['sum_errors'] += error
+                            vh_stats['count'] += 1
+
     save_monthly_stats_cache({
         "by_station_monthly": monthly,
+        "by_station_monthly_by_valid_hour": monthly_vh,
         "monthly_generated_at": now.isoformat(),
     })
 
 
-def get_mean_verification_from_cache(model: str) -> dict:
+def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = None) -> dict:
     """
     Get mean verification from cache for a specific model.
 
@@ -3003,6 +3236,7 @@ def get_mean_verification_from_cache(model: str) -> dict:
 
     Args:
         model: Model name ('gfs', 'aifs', 'ifs', 'nws')
+        valid_hour: Optional UTC hour filter (0, 6, 12, 18). None = all hours.
 
     Returns:
         Dict with mean verification data (same format as get_mean_verification_by_lead_time)
@@ -3013,9 +3247,8 @@ def get_mean_verification_from_cache(model: str) -> dict:
         logger.warning("Cache not available, computing verification on-the-fly")
         return get_mean_verification_by_lead_time(model)
 
-    # Extract from cache
     lead_times = cache.get("lead_times", [])
-    model_data = cache.get("by_lead_time", {}).get(model.lower(), {})
+    nws_max_lead = 168 if model.lower() == 'nws' else None
 
     result = {
         "lead_times": lead_times,
@@ -3027,9 +3260,36 @@ def get_mean_verification_from_cache(model: str) -> dict:
         "precip_bias": []
     }
 
+    if valid_hour is not None:
+        vh_str = str(valid_hour)
+        model_vh_data = cache.get("by_lead_time_by_valid_hour", {}).get(model.lower(), {})
+        for lt in lead_times:
+            lt_str = str(lt)
+            if nws_max_lead is not None and lt > nws_max_lead:
+                result["temp_mae"].append(None); result["temp_bias"].append(None)
+                result["mslp_mae"].append(None); result["mslp_bias"].append(None)
+                result["precip_mae"].append(None); result["precip_bias"].append(None)
+                continue
+            lt_data = model_vh_data.get(lt_str, {}).get(vh_str, {})
+            result["temp_mae"].append(lt_data.get("temp", {}).get("mae"))
+            result["temp_bias"].append(lt_data.get("temp", {}).get("bias"))
+            result["mslp_mae"].append(lt_data.get("mslp", {}).get("mae"))
+            result["mslp_bias"].append(lt_data.get("mslp", {}).get("bias"))
+            result["precip_mae"].append(lt_data.get("precip", {}).get("mae"))
+            result["precip_bias"].append(lt_data.get("precip", {}).get("bias"))
+        return result
+
+    # All hours — use existing by_lead_time data
+    model_data = cache.get("by_lead_time", {}).get(model.lower(), {})
     for lt in lead_times:
         lt_str = str(lt)
         lt_data = model_data.get(lt_str, {})
+
+        if nws_max_lead is not None and lt > nws_max_lead:
+            result["temp_mae"].append(None); result["temp_bias"].append(None)
+            result["mslp_mae"].append(None); result["mslp_bias"].append(None)
+            result["precip_mae"].append(None); result["precip_bias"].append(None)
+            continue
 
         result["temp_mae"].append(lt_data.get("temp", {}).get("mae"))
         result["temp_bias"].append(lt_data.get("temp", {}).get("bias"))
@@ -3041,22 +3301,88 @@ def get_mean_verification_from_cache(model: str) -> dict:
     return result
 
 
-def get_mean_verification_from_monthly_cache(model: str) -> dict:
+def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[int] = None) -> dict:
     """
     Get mean verification for the last ~30 days from the monthly cache.
 
     Args:
         model: Model name ('gfs', 'aifs', 'ifs', 'nws')
+        valid_hour: Optional UTC hour filter (0, 6, 12, 18). None = all hours.
     """
-    monthly = load_monthly_stats_cache().get("by_station_monthly", {})
+    monthly_cache = load_monthly_stats_cache()
+    nws_max_lead = 168 if model.lower() == 'nws' else None
 
-    # Collect all lead times available for this model
+    canonical_lead_times = set(list(range(6, 25, 6)) + list(range(48, 361, 24)))
+
+    if valid_hour is not None:
+        monthly_vh_all = monthly_cache.get("by_station_monthly_by_valid_hour", {})
+        vh_str = str(valid_hour)
+
+        # Collect lead times that have data for this model and valid hour
+        lead_times = set()
+        for station_data in monthly_vh_all.values():
+            model_data = station_data.get(model.lower(), {})
+            for var in ["temp", "mslp", "precip"]:
+                for lt_str, vh_data in model_data.get(var, {}).items():
+                    if vh_str in vh_data:
+                        lead_times.add(int(lt_str))
+
+        lead_times &= canonical_lead_times
+        if nws_max_lead is not None:
+            lead_times = {lt for lt in lead_times if lt <= nws_max_lead}
+        lead_times = sorted(lead_times)
+
+        def _init_acc():
+            return {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+
+        result = {
+            "lead_times": lead_times,
+            "temp_mae": [], "temp_bias": [],
+            "mslp_mae": [], "mslp_bias": [],
+            "precip_mae": [], "precip_bias": []
+        }
+
+        for lt in lead_times:
+            lt_str = str(lt)
+            acc = {"temp": _init_acc(), "mslp": _init_acc(), "precip": _init_acc()}
+
+            for station_data in monthly_vh_all.values():
+                model_data = station_data.get(model.lower(), {})
+                for var in ["temp", "mslp", "precip"]:
+                    stats = model_data.get(var, {}).get(lt_str, {}).get(vh_str)
+                    if not stats or stats.get("count", 0) <= 0:
+                        continue
+                    acc[var]["sum_abs"] += stats.get("sum_abs_errors", 0.0)
+                    acc[var]["sum"] += stats.get("sum_errors", 0.0)
+                    acc[var]["count"] += stats.get("count", 0)
+
+            for var, mae_key, bias_key in [
+                ("temp", "temp_mae", "temp_bias"),
+                ("mslp", "mslp_mae", "mslp_bias"),
+                ("precip", "precip_mae", "precip_bias")
+            ]:
+                if acc[var]["count"] > 0:
+                    result[mae_key].append(round(acc[var]["sum_abs"] / acc[var]["count"], 2))
+                    result[bias_key].append(round(acc[var]["sum"] / acc[var]["count"], 2))
+                else:
+                    result[mae_key].append(None)
+                    result[bias_key].append(None)
+
+        return result
+
+    # All hours — use existing by_station_monthly data
+    monthly = monthly_cache.get("by_station_monthly", {})
+
+    # Collect lead times available for this model, restricted to canonical set
     lead_times = set()
     for station_data in monthly.values():
         model_data = station_data.get(model.lower(), {})
         for var in ["temp", "mslp", "precip"]:
             lead_times.update({int(k) for k in model_data.get(var, {}).keys()})
 
+    lead_times &= canonical_lead_times
+    if nws_max_lead is not None:
+        lead_times = {lt for lt in lead_times if lt <= nws_max_lead}
     lead_times = sorted(lead_times)
 
     def _init_acc():

@@ -1529,6 +1529,44 @@ def api_spatial_data():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def _resolve_run_grib_file(run: dict, member_id: str | None = None) -> tuple[Path | None, str | None]:
+    """
+    Resolve the GRIB file path for a run.
+    For ensemble runs, member_id selects a member; defaults to first member.
+    Returns (path, error_message).
+    """
+    if run.get("ensemble") and run.get("members"):
+        members = run.get("members", [])
+        if not members:
+            return None, "Ensemble run has no members"
+
+        if member_id is None:
+            selected = members[0]
+        else:
+            try:
+                member_id_int = int(member_id)
+            except ValueError:
+                return None, "Invalid member_id"
+
+            selected = None
+            for m in members:
+                if int(m.get("member_id", -1)) == member_id_int:
+                    selected = m
+                    break
+            if selected is None:
+                return None, "Ensemble member not found"
+
+        output_file = selected.get("output_file")
+        if not output_file:
+            return None, "Selected ensemble member has no output file"
+        return Path(output_file), None
+
+    output_file = run.get("output_file")
+    if not output_file:
+        return None, "Run has no output file"
+    return Path(output_file), None
+
+
 @pangu_bp.route('/api/animate-spatial-data')
 def api_animate_spatial_data():
     """
@@ -1536,12 +1574,14 @@ def api_animate_spatial_data():
 
     Query params:
         run_id: Run identifier
+        member_id: Ensemble member id (optional for ensemble; defaults to first member)
         variable: Variable name (t, u, v, z, q, etc.)
         level: Pressure level (850, 500, etc.) or 'surface'
         region: Region name (optional, defaults to 'Global')
         fps: Frames per second for the GIF (optional, defaults to 5)
     """
     run_id = request.args.get('run_id')
+    member_id = request.args.get('member_id')
     variable = request.args.get('variable', 't')
     level = request.args.get('level', '850')
     region_name = request.args.get('region', 'Global')
@@ -1560,7 +1600,9 @@ def api_animate_spatial_data():
     if not run:
         return jsonify({"success": False, "error": "Run not found"}), 404
 
-    grib_file = Path(run["output_file"])
+    grib_file, err = _resolve_run_grib_file(run, member_id=member_id)
+    if err:
+        return jsonify({"success": False, "error": err}), 400
     if not grib_file.exists():
         return jsonify({"success": False, "error": "GRIB file not found"}), 404
 

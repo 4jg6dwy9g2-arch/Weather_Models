@@ -81,13 +81,19 @@ with open(log_file, "w") as f:
     f.write(f"Completed at: {datetime.now()}\n")
     f.write("=" * 50 + "\n")
 
-# Cleanup old logs (keep last 48 hours)
+# Cleanup rotating METAR logs (keep only the newest one)
 try:
-    for filename in os.listdir(log_dir):
-        if filename.startswith("metar_perturb_") and filename.endswith(".log"):
-            filepath = os.path.join(log_dir, filename)
-            if os.path.getmtime(filepath) < (datetime.now().timestamp() - 48 * 3600):
-                os.remove(filepath)
+    perturb_logs = sorted(
+        [
+            os.path.join(log_dir, fn)
+            for fn in os.listdir(log_dir)
+            if fn.startswith("metar_perturb_") and fn.endswith(".log")
+        ],
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for old_file in perturb_logs[1:]:
+        os.remove(old_file)
 except Exception as e:
     print(f"Error cleaning up logs: {e}", file=sys.stderr)
 

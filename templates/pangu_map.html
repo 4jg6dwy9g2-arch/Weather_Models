@@ -74,6 +74,15 @@
                     <input type="range" class="form-range" id="time-slider" min="0" max="0" value="0">
                     <small class="text-muted" id="valid-time"></small>
                 </div>
+                <div class="mb-3" id="animation-member-group" style="display: none;">
+                    <label for="animation-member-select" class="form-label">Animation Member</label>
+                    <select class="form-select" id="animation-member-select"></select>
+                    <small class="text-muted">Used for ensemble GIF animation.</small>
+                </div>
+                <div class="form-check mb-3" id="ensemble-show-all-group" style="display: none;">
+                    <input class="form-check-input" type="checkbox" id="ensemble-show-all">
+                    <label class="form-check-label" for="ensemble-show-all">Show all members grid</label>
+                </div>
             </div>
         </div>
 
@@ -270,12 +279,55 @@ function toggleViewMode() {
         document.getElementById('compare-map-view').style.display = 'block';
         document.getElementById('run-2-selector').style.display = 'block';
     }
+    updateAnimationMemberControl();
 }
 
 let allRuns = [];
 
 function getRunById(runId) {
     return allRuns.find(r => r.run_id === runId);
+}
+
+function updateAnimationMemberControl() {
+    const runId = document.getElementById('run-select-1').value;
+    const run = getRunById(runId);
+    const group = document.getElementById('animation-member-group');
+    const sel = document.getElementById('animation-member-select');
+    const showAllGroup = document.getElementById('ensemble-show-all-group');
+    if (!group || !sel) return;
+
+    sel.innerHTML = '';
+    if (!run || !run.ensemble || !Array.isArray(run.members) || run.members.length === 0 || viewMode !== 'single') {
+        group.style.display = 'none';
+        if (showAllGroup) showAllGroup.style.display = 'none';
+        return;
+    }
+
+    run.members.forEach((member, idx) => {
+        const memberId = (member && member.member_id !== undefined && member.member_id !== null) ? member.member_id : idx;
+        const opt = document.createElement('option');
+        opt.value = String(memberId);
+        opt.textContent = `M${String(memberId).padStart(3, '0')}`;
+        sel.appendChild(opt);
+    });
+    group.style.display = '';
+    if (showAllGroup) showAllGroup.style.display = '';
+}
+
+function getEnsembleAnimationMemberId(runId) {
+    const run = getRunById(runId);
+    if (!run || !run.ensemble || !Array.isArray(run.members) || run.members.length === 0) {
+        return null;
+    }
+    const sel = document.getElementById('animation-member-select');
+    if (sel && sel.value !== '') {
+        return sel.value;
+    }
+    const first = run.members[0];
+    if (first && first.member_id !== undefined && first.member_id !== null) {
+        return String(first.member_id);
+    }
+    return '0';
 }
 
 function loadRuns() {
@@ -323,6 +375,7 @@ function loadRuns() {
 
                 // Update time slider for selected run
                 updateTimeSlider();
+                updateAnimationMemberControl();
 
                 // Load map for first run automatically
                 loadMap();
@@ -389,6 +442,11 @@ function loadSingleMap() {
 
     const run = getRunById(runId);
     if (run && run.ensemble) {
+        const showAll = document.getElementById('ensemble-show-all')?.checked;
+        if (!showAll) {
+            loadSingleEnsembleMemberMap(run, variable, level, timeIndex, region);
+            return;
+        }
         loadEnsembleMaps(run, variable, level, timeIndex, region);
         return;
     }
@@ -419,6 +477,39 @@ function loadSingleMap() {
         .finally(() => {
             document.getElementById('loading-spinner-1').style.display = 'none';
             document.getElementById('map-container-1').style.display = 'block';
+        });
+}
+
+function loadSingleEnsembleMemberMap(run, variable, level, timeIndex, region) {
+    const container = document.getElementById('map-container-1');
+    container.style.display = 'none';
+    document.getElementById('loading-spinner-1').style.display = 'block';
+    document.getElementById('stats-card').style.display = 'none';
+
+    const memberId = getEnsembleAnimationMemberId(run.run_id);
+    const memberLabel = `M${String(memberId).padStart(3, '0')}`;
+    const url = `/pangu/api/spatial-data?run_id=${encodeURIComponent(run.run_id)}&member_id=${encodeURIComponent(memberId)}` +
+        `&variable=${variable}&level=${level}&time_index=${timeIndex}&region=${encodeURIComponent(region)}`;
+
+    fetch(url)
+        .then(res => res.json())
+        .then(data => {
+            if (!data.success) {
+                alert(`Error loading ensemble member ${memberLabel}: ${data.error || 'unknown error'}`);
+                return;
+            }
+            currentMapData[0] = data;
+            displayMapInContainer(data, 'map-container-1');
+            displayStats(data.stats);
+            document.getElementById('valid-time').textContent = `${data.valid_time || ''} · ${memberLabel}`;
+        })
+        .catch(err => {
+            console.error('Error loading ensemble member map:', err);
+            alert('Error loading ensemble member map');
+        })
+        .finally(() => {
+            document.getElementById('loading-spinner-1').style.display = 'none';
+            container.style.display = 'block';
         });
 }
 
@@ -581,7 +672,17 @@ function animateTimesteps() {
     animateButton.disabled = true;
     animateButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Generating GIF...';
 
-    const url = `/pangu/api/animate-spatial-data?run_id=${encodeURIComponent(runId)}&variable=${variable}&level=${level}&region=${encodeURIComponent(region)}`;
+    const params = new URLSearchParams({
+        run_id: runId,
+        variable,
+        level,
+        region
+    });
+    const memberId = getEnsembleAnimationMemberId(runId);
+    if (memberId !== null) {
+        params.set('member_id', String(memberId));
+    }
+    const url = `/pangu/api/animate-spatial-data?${params.toString()}`;
 
     fetch(url)
         .then(response => {
@@ -659,10 +760,13 @@ document.getElementById('variable-select').addEventListener('change', loadMap);
 document.getElementById('level-select').addEventListener('change', loadMap);
 document.getElementById('region-select').addEventListener('change', loadMap);
 document.getElementById('time-slider').addEventListener('change', loadMap);
+document.getElementById('animation-member-select').addEventListener('change', loadMap);
+document.getElementById('ensemble-show-all').addEventListener('change', loadMap);
 
 // Update time slider when run selection changes
 document.getElementById('run-select-1').addEventListener('change', () => {
     updateTimeSlider();
+    updateAnimationMemberControl();
     loadMap();
 });
 document.getElementById('run-select-2').addEventListener('change', loadMap);

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+    MRMS PrecipRate archiver — runs every 2 minutes to download and cache
+    24 hours of NOAA MRMS PrecipRate_00.00 frames for the animation loop.
+
+    Installation:
+        cp com.weathermodels.radar-archiver.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.weathermodels.radar-archiver.plist
+
+    Verify it loaded:
+        launchctl list | grep radar-archiver
+
+    Uninstall:
+        launchctl unload ~/Library/LaunchAgents/com.weathermodels.radar-archiver.plist
+        rm ~/Library/LaunchAgents/com.weathermodels.radar-archiver.plist
+
+    To find your Python path:
+        which python3
+        # or: python3 -c "import sys; print(sys.executable)"
+        # Current path: /Users/kennypratt/anaconda3/bin/python3
+-->
+<dict>
+    <key>Label</key>
+    <string>com.weathermodels.radar-archiver</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kennypratt/anaconda3/bin/python3</string>
+        <string>/Users/kennypratt/Documents/Weather_Models/radar_archiver.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/kennypratt/Documents/Weather_Models</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>IMESSAGE_RECIPIENT</key>
+        <string>+16103480997</string>
+    </dict>
+
+    <!-- Run every 5 minutes (300 seconds) -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Also run immediately when loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/radar_archiver.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/radar_archiver.err.log</string>
+</dict>
+</plist>

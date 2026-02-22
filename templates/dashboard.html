@@ -82,7 +82,7 @@
                     <div class="d-flex align-items-center gap-3">
                         <div class="form-check form-switch mb-0">
                             <input class="form-check-input" type="checkbox" role="switch" id="fairfaxPeriodToggle">
-                            <label class="form-check-label" for="fairfaxPeriodToggle">Last 30 days</label>
+                            <label class="form-check-label" for="fairfaxPeriodToggle">Last 20 days</label>
                         </div>
                         <button class="btn btn-sm btn-outline-secondary" type="button"
                                 id="verificationTableToggle">
@@ -225,6 +225,13 @@
                     </div>
                 </div>
                 <div class="card-body">
+                    <div id="tempWinnerTally" class="alert alert-light mb-3 d-none">
+                        <strong><i class="bi bi-trophy"></i> Daily Winners (Lowest |Bias|):</strong>
+                        <span class="ms-3"><span class="badge bg-primary">GFS</span> <span id="tempGfsWins">0</span> days</span>
+                        <span class="ms-2"><span class="badge bg-info text-dark">AIFS</span> <span id="tempAifsWins">0</span> days</span>
+                        <span class="ms-2"><span class="badge bg-success">IFS</span> <span id="tempIfsWins">0</span> days</span>
+                        <span class="ms-2"><span class="badge bg-secondary">Tie</span> <span id="tempTieWins">0</span> days</span>
+                    </div>
                     <div class="chart-container chart-container-large">
                         <canvas id="tempChart"></canvas>
                     </div>
@@ -314,6 +321,13 @@
                     </div>
                 </div>
                 <div class="card-body">
+                    <div id="mslpWinnerTally" class="alert alert-light mb-3 d-none">
+                        <strong><i class="bi bi-trophy"></i> Daily Winners (Lowest |Bias|):</strong>
+                        <span class="ms-3"><span class="badge bg-primary">GFS</span> <span id="mslpGfsWins">0</span> days</span>
+                        <span class="ms-2"><span class="badge bg-info text-dark">AIFS</span> <span id="mslpAifsWins">0</span> days</span>
+                        <span class="ms-2"><span class="badge bg-success">IFS</span> <span id="mslpIfsWins">0</span> days</span>
+                        <span class="ms-2"><span class="badge bg-secondary">Tie</span> <span id="mslpTieWins">0</span> days</span>
+                    </div>
                     <div class="chart-container chart-container-large">
                         <canvas id="mslpChart"></canvas>
                     </div>
@@ -553,7 +567,7 @@ async function loadVerificationTable() {
         const data = await response.json();
         if (data.success && data.verification.lead_times.length > 0) {
             let vAll = null;
-            if (period === 'monthly') {
+            if (data.monthly_active) {
                 try {
                     const allResp = await fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=all`);
                     const allData = await allResp.json();
@@ -708,20 +722,20 @@ function renderVerificationTable(v, vAll = null) {
             <td><strong>${formatLeadTime(lt)}</strong></td>
             <td>${days.toFixed(1)}</td>
             <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) + '°F' + _pctMae(gfsTempMae, a?.gfs_temp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) + '°F' + _pctBias(gfsTempBias, a?.gfs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) + '°F' : '--'}</td>
             <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) + '°F' + _pctMae(aifsTempMae, a?.aifs_temp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + '°F' + _pctBias(aifsTempBias, a?.aifs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) + '°F' : '--'}</td>
             <td class="text-center">${ifsTempMaeVal != null ? ifsTempMaeVal.toFixed(1) + '°F' + _pctMae(ifsTempMaeVal, aIfs[i]) : '--'}</td>
-            <td class="text-center">${ifsTempBias != null ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + '°F' + _pctBias(ifsTempBias, a?.ifs_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${ifsTempBias != null ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) + '°F' : '--'}</td>
             <td class="text-center">${nwsTempMae != null ? nwsTempMae.toFixed(1) + '°F' + _pctMae(nwsTempMae, a?.nws_temp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${nwsTempBias != null ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) + '°F' + _pctBias(nwsTempBias, a?.nws_temp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${nwsTempBias != null ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) + '°F' : '--'}</td>
             <td><span class="${winnerClass}">${winner}</span></td>
             <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + ' mb' + _pctMae(gfsMslpMae, a?.gfs_mslp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + ' mb' + _pctBias(gfsMslpBias, a?.gfs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) + ' mb' : '--'}</td>
             <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + ' mb' + _pctMae(aifsMslpMae, a?.aifs_mslp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) + ' mb' + _pctBias(aifsMslpBias, a?.aifs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
             <td class="text-center">${ifsMslpMaeVal != null ? ifsMslpMaeVal.toFixed(1) + ' mb' + _pctMae(ifsMslpMaeVal, aIfsMslp[i]) : '--'}</td>
-            <td class="text-center">${ifsMslpBias != null ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) + ' mb' + _pctBias(ifsMslpBias, a?.ifs_mslp_bias?.[i]) : '--'}</td>
+            <td class="text-center">${ifsMslpBias != null ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) + ' mb' : '--'}</td>
             <td>${samples}</td>
         `;
         tbody.appendChild(row);
@@ -998,42 +1012,90 @@ function renderTempChart(data, tempHistoryData, panguData, nwsData) {
         }
     });
 
-    // Render bias panel chart
+    // Winner tally for temperature bias
+    const tempTallyEl = document.getElementById('tempWinnerTally');
+    if (tempTallyEl && tempHistoryData && tempHistoryData.dates && tempHistoryData.dates.length) {
+        let tGfsWins = 0, tAifsWins = 0, tIfsWins = 0, tTieWins = 0;
+        for (let i = 0; i < tempHistoryData.dates.length; i++) {
+            const candidates = [];
+            const g = tempHistoryData.gfs_bias?.[i];
+            const a = tempHistoryData.aifs_bias?.[i];
+            const f = tempHistoryData.ifs_bias?.[i];
+            if (g !== null && g !== undefined) candidates.push({ key: 'gfs',  val: Math.abs(g) });
+            if (a !== null && a !== undefined) candidates.push({ key: 'aifs', val: Math.abs(a) });
+            if (f !== null && f !== undefined) candidates.push({ key: 'ifs',  val: Math.abs(f) });
+            if (!candidates.length) continue;
+            const minVal = Math.min(...candidates.map(c => c.val));
+            const winners = candidates.filter(c => c.val === minVal);
+            if (winners.length === 1) {
+                if (winners[0].key === 'gfs')  tGfsWins++;
+                else if (winners[0].key === 'aifs') tAifsWins++;
+                else if (winners[0].key === 'ifs')  tIfsWins++;
+            } else { tTieWins++; }
+        }
+        document.getElementById('tempGfsWins').textContent  = tGfsWins;
+        document.getElementById('tempAifsWins').textContent = tAifsWins;
+        document.getElementById('tempIfsWins').textContent  = tIfsWins;
+        document.getElementById('tempTieWins').textContent  = tTieWins;
+        tempTallyEl.classList.remove('d-none');
+    } else if (tempTallyEl) {
+        tempTallyEl.classList.add('d-none');
+    }
+
+    // Render bias panel chart with overlapping bars
     if (tempBiasPanelChart) tempBiasPanelChart.destroy();
-    const biasLabels = tempHistoryData && tempHistoryData.dates
-        ? tempHistoryData.dates.map(d => new Date(d))
-        : [];
+    const tempBiasDefs = [
+        { key: 'gfs',  label: 'GFS',  bg: 'rgba(13, 110, 253, 0.8)',  border: '#0d6efd' },
+        { key: 'aifs', label: 'AIFS', bg: 'rgba(13, 202, 240, 0.8)',  border: '#0dcaf0' },
+        { key: 'ifs',  label: 'IFS',  bg: 'rgba(32, 201, 151, 0.8)', border: '#20c997' }
+    ];
     const biasDatasets = [];
     if (tempHistoryData && tempHistoryData.dates) {
-        biasDatasets.push({
-            label: 'GFS Bias',
-            data: tempHistoryData.dates.map((d, i) => ({
-                x: new Date(d),
-                y: tempHistoryData.gfs_bias[i]
-            })),
-            backgroundColor: 'rgba(13, 110, 253, 0.7)',
-            borderColor: '#0d6efd',
-            borderWidth: 1
-        });
-        biasDatasets.push({
-            label: 'AIFS Bias',
-            data: tempHistoryData.dates.map((d, i) => ({
-                x: new Date(d),
-                y: tempHistoryData.aifs_bias[i]
-            })),
-            backgroundColor: 'rgba(13, 202, 240, 0.7)',
-            borderColor: '#0dcaf0',
-            borderWidth: 1
-        });
-        biasDatasets.push({
-            label: 'IFS Bias',
-            data: tempHistoryData.dates.map((d, i) => ({
-                x: new Date(d),
-                y: tempHistoryData.ifs_bias[i]
-            })),
-            backgroundColor: 'rgba(32, 201, 151, 0.7)',
-            borderColor: '#20c997',
-            borderWidth: 1
+        const tempBiasArrays = {
+            gfs:  tempHistoryData.gfs_bias,
+            aifs: tempHistoryData.aifs_bias,
+            ifs:  tempHistoryData.ifs_bias
+        };
+        const tDates = tempHistoryData.dates.map(d => new Date(d));
+        const tNumRanks = tempBiasDefs.length;
+        const tRankData     = Array.from({ length: tNumRanks }, () => []);
+        const tRankBg       = Array.from({ length: tNumRanks }, () => []);
+        const tRankBorder   = Array.from({ length: tNumRanks }, () => []);
+        const tRankModelKey = Array.from({ length: tNumRanks }, () => []);
+
+        for (let i = 0; i < tDates.length; i++) {
+            const entries = tempBiasDefs
+                .map(m => ({ ...m, value: tempBiasArrays[m.key]?.[i] ?? null }))
+                .filter(e => e.value !== null);
+            entries.sort((a, b) => Math.abs(a.value) - Math.abs(b.value));
+            for (let r = 0; r < tNumRanks; r++) {
+                const e = entries[r];
+                if (e) {
+                    tRankData[r].push({ x: tDates[i], y: e.value });
+                    tRankBg[r].push(e.bg);
+                    tRankBorder[r].push(e.border);
+                    tRankModelKey[r].push(e.key);
+                } else {
+                    tRankData[r].push({ x: tDates[i], y: null });
+                    tRankBg[r].push('rgba(0,0,0,0)');
+                    tRankBorder[r].push('rgba(0,0,0,0)');
+                    tRankModelKey[r].push(null);
+                }
+            }
+        }
+        tRankData.forEach((data, r) => {
+            if (!data.some(p => p.y !== null)) return;
+            biasDatasets.push({
+                label: `Layer ${r + 1}`,
+                data,
+                backgroundColor: tRankBg[r],
+                borderColor: tRankBorder[r],
+                borderWidth: 1,
+                grouped: false,
+                barPercentage: 0.9,
+                categoryPercentage: 1.0,
+                modelByIndex: tRankModelKey[r]
+            });
         });
     }
 
@@ -1050,15 +1112,18 @@ function renderTempChart(data, tempHistoryData, panguData, nwsData) {
                 radius: 120
             },
             plugins: {
-                legend: { position: 'top' },
+                legend: { display: false },
                 tooltip: {
                     mode: 'x',
                     intersect: false,
                     callbacks: {
                         label: function(context) {
-                            const label = context.dataset.label || '';
+                            const modelKey = context.dataset.modelByIndex?.[context.dataIndex];
+                            const modelDef = tempBiasDefs.find(m => m.key === modelKey);
+                            const modelName = modelDef ? modelDef.label : null;
                             const value = context.parsed.y;
-                            return label + ': ' +
+                            if (!modelName) return null;
+                            return modelName + ': ' +
                                 (value !== null && value !== undefined ? (value > 0 ? '+' : '') + value.toFixed(2) + '°F' : 'N/A');
                         }
                     }
@@ -1323,39 +1388,90 @@ function renderMslpChart(data, mslpHistoryData, panguData) {
         }
     });
 
-    // Render bias panel chart
+    // Winner tally for MSLP bias
+    const mslpTallyEl = document.getElementById('mslpWinnerTally');
+    if (mslpTallyEl && mslpHistoryData && mslpHistoryData.dates && mslpHistoryData.dates.length) {
+        let mGfsWins = 0, mAifsWins = 0, mIfsWins = 0, mTieWins = 0;
+        for (let i = 0; i < mslpHistoryData.dates.length; i++) {
+            const candidates = [];
+            const g = mslpHistoryData.gfs_bias?.[i];
+            const a = mslpHistoryData.aifs_bias?.[i];
+            const f = mslpHistoryData.ifs_bias?.[i];
+            if (g !== null && g !== undefined) candidates.push({ key: 'gfs',  val: Math.abs(g) });
+            if (a !== null && a !== undefined) candidates.push({ key: 'aifs', val: Math.abs(a) });
+            if (f !== null && f !== undefined) candidates.push({ key: 'ifs',  val: Math.abs(f) });
+            if (!candidates.length) continue;
+            const minVal = Math.min(...candidates.map(c => c.val));
+            const winners = candidates.filter(c => c.val === minVal);
+            if (winners.length === 1) {
+                if (winners[0].key === 'gfs')  mGfsWins++;
+                else if (winners[0].key === 'aifs') mAifsWins++;
+                else if (winners[0].key === 'ifs')  mIfsWins++;
+            } else { mTieWins++; }
+        }
+        document.getElementById('mslpGfsWins').textContent  = mGfsWins;
+        document.getElementById('mslpAifsWins').textContent = mAifsWins;
+        document.getElementById('mslpIfsWins').textContent  = mIfsWins;
+        document.getElementById('mslpTieWins').textContent  = mTieWins;
+        mslpTallyEl.classList.remove('d-none');
+    } else if (mslpTallyEl) {
+        mslpTallyEl.classList.add('d-none');
+    }
+
+    // Render bias panel chart with overlapping bars
     if (mslpBiasPanelChart) mslpBiasPanelChart.destroy();
+    const mslpBiasDefs = [
+        { key: 'gfs',  label: 'GFS',  bg: 'rgba(13, 110, 253, 0.8)',  border: '#0d6efd' },
+        { key: 'aifs', label: 'AIFS', bg: 'rgba(13, 202, 240, 0.8)',  border: '#0dcaf0' },
+        { key: 'ifs',  label: 'IFS',  bg: 'rgba(32, 201, 151, 0.8)', border: '#20c997' }
+    ];
     const mslpBiasDatasets = [];
     if (mslpHistoryData && mslpHistoryData.dates) {
-        mslpBiasDatasets.push({
-            label: 'GFS Bias',
-            data: mslpHistoryData.dates.map((d, i) => ({
-                x: new Date(d),
-                y: mslpHistoryData.gfs_bias[i]
-            })),
-            backgroundColor: 'rgba(13, 110, 253, 0.7)',
-            borderColor: '#0d6efd',
-            borderWidth: 1
-        });
-        mslpBiasDatasets.push({
-            label: 'AIFS Bias',
-            data: mslpHistoryData.dates.map((d, i) => ({
-                x: new Date(d),
-                y: mslpHistoryData.aifs_bias[i]
-            })),
-            backgroundColor: 'rgba(13, 202, 240, 0.7)',
-            borderColor: '#0dcaf0',
-            borderWidth: 1
-        });
-        mslpBiasDatasets.push({
-            label: 'IFS Bias',
-            data: mslpHistoryData.dates.map((d, i) => ({
-                x: new Date(d),
-                y: mslpHistoryData.ifs_bias[i]
-            })),
-            backgroundColor: 'rgba(32, 201, 151, 0.7)',
-            borderColor: '#20c997',
-            borderWidth: 1
+        const mslpBiasArrays = {
+            gfs:  mslpHistoryData.gfs_bias,
+            aifs: mslpHistoryData.aifs_bias,
+            ifs:  mslpHistoryData.ifs_bias
+        };
+        const mDates = mslpHistoryData.dates.map(d => new Date(d));
+        const mNumRanks = mslpBiasDefs.length;
+        const mRankData     = Array.from({ length: mNumRanks }, () => []);
+        const mRankBg       = Array.from({ length: mNumRanks }, () => []);
+        const mRankBorder   = Array.from({ length: mNumRanks }, () => []);
+        const mRankModelKey = Array.from({ length: mNumRanks }, () => []);
+
+        for (let i = 0; i < mDates.length; i++) {
+            const entries = mslpBiasDefs
+                .map(m => ({ ...m, value: mslpBiasArrays[m.key]?.[i] ?? null }))
+                .filter(e => e.value !== null);
+            entries.sort((a, b) => Math.abs(a.value) - Math.abs(b.value));
+            for (let r = 0; r < mNumRanks; r++) {
+                const e = entries[r];
+                if (e) {
+                    mRankData[r].push({ x: mDates[i], y: e.value });
+                    mRankBg[r].push(e.bg);
+                    mRankBorder[r].push(e.border);
+                    mRankModelKey[r].push(e.key);
+                } else {
+                    mRankData[r].push({ x: mDates[i], y: null });
+                    mRankBg[r].push('rgba(0,0,0,0)');
+                    mRankBorder[r].push('rgba(0,0,0,0)');
+                    mRankModelKey[r].push(null);
+                }
+            }
+        }
+        mRankData.forEach((data, r) => {
+            if (!data.some(p => p.y !== null)) return;
+            mslpBiasDatasets.push({
+                label: `Layer ${r + 1}`,
+                data,
+                backgroundColor: mRankBg[r],
+                borderColor: mRankBorder[r],
+                borderWidth: 1,
+                grouped: false,
+                barPercentage: 0.9,
+                categoryPercentage: 1.0,
+                modelByIndex: mRankModelKey[r]
+            });
         });
     }
 
@@ -1372,15 +1488,18 @@ function renderMslpChart(data, mslpHistoryData, panguData) {
                 radius: 120
             },
             plugins: {
-                legend: { position: 'top' },
+                legend: { display: false },
                 tooltip: {
                     mode: 'x',
                     intersect: false,
                     callbacks: {
                         label: function(context) {
-                            const label = context.dataset.label || '';
+                            const modelKey = context.dataset.modelByIndex?.[context.dataIndex];
+                            const modelDef = mslpBiasDefs.find(m => m.key === modelKey);
+                            const modelName = modelDef ? modelDef.label : null;
                             const value = context.parsed.y;
-                            return label + ': ' +
+                            if (!modelName) return null;
+                            return modelName + ': ' +
                                 (value !== null && value !== undefined ? (value > 0 ? '+' : '') + value.toFixed(2) + ' mb' : 'N/A');
                         }
                     }
@@ -1572,42 +1691,56 @@ function renderPrecipChart(precipHistoryData) {
         }
     });
 
-    // Render precipitation bias panel (model - observed)
-    const biasDatasets = [
-        {
-            label: 'GFS Bias',
-            data: dates.map((d, i) => ({
-                x: d,
-                y: gfsBias[i] ?? null
-            })),
-            backgroundColor: 'rgba(13, 110, 253, 0.7)',
-            borderColor: '#0d6efd',
-            borderWidth: 1
-        },
-        {
-            label: 'AIFS Bias',
-            data: dates.map((d, i) => ({
-                x: d,
-                y: aifsBias[i] ?? null
-            })),
-            backgroundColor: 'rgba(13, 202, 240, 0.7)',
-            borderColor: '#0dcaf0',
-            borderWidth: 1
-        }
+    // Render precipitation bias panel (model - observed) with overlapping bars
+    const biasDefs = [
+        { key: 'gfs',  label: 'GFS',  bg: 'rgba(13, 110, 253, 0.8)',  border: '#0d6efd' },
+        { key: 'aifs', label: 'AIFS', bg: 'rgba(13, 202, 240, 0.8)',  border: '#0dcaf0' },
+        ...(ifs && ifs.length ? [{ key: 'ifs', label: 'IFS', bg: 'rgba(32, 201, 151, 0.8)', border: '#20c997' }] : [])
     ];
+    const biasArrays = { gfs: gfsBias, aifs: aifsBias, ifs: ifsBias };
 
-    if (ifs && ifs.length) {
-        biasDatasets.push({
-            label: 'IFS Bias',
-            data: dates.map((d, i) => ({
-                x: d,
-                y: ifsBias[i] ?? null
-            })),
-            backgroundColor: 'rgba(32, 201, 151, 0.7)',
-            borderColor: '#20c997',
-            borderWidth: 1
-        });
+    const numRanks = biasDefs.length;
+    const rankData     = Array.from({ length: numRanks }, () => []);
+    const rankBg       = Array.from({ length: numRanks }, () => []);
+    const rankBorder   = Array.from({ length: numRanks }, () => []);
+    const rankModelKey = Array.from({ length: numRanks }, () => []);
+
+    for (let i = 0; i < dates.length; i++) {
+        const entries = biasDefs
+            .map(m => ({ ...m, value: biasArrays[m.key]?.[i] ?? null }))
+            .filter(e => e.value !== null);
+        // Smallest |bias| first → dataset[0] → rendered on top by Chart.js
+        entries.sort((a, b) => Math.abs(a.value) - Math.abs(b.value));
+
+        for (let r = 0; r < numRanks; r++) {
+            const e = entries[r];
+            if (e) {
+                rankData[r].push({ x: dates[i], y: e.value });
+                rankBg[r].push(e.bg);
+                rankBorder[r].push(e.border);
+                rankModelKey[r].push(e.key);
+            } else {
+                rankData[r].push({ x: dates[i], y: null });
+                rankBg[r].push('rgba(0,0,0,0)');
+                rankBorder[r].push('rgba(0,0,0,0)');
+                rankModelKey[r].push(null);
+            }
+        }
     }
+
+    const biasDatasets = rankData
+        .map((data, r) => ({
+            label: `Layer ${r + 1}`,
+            data,
+            backgroundColor: rankBg[r],
+            borderColor: rankBorder[r],
+            borderWidth: 1,
+            grouped: false,
+            barPercentage: 0.9,
+            categoryPercentage: 1.0,
+            modelByIndex: rankModelKey[r]
+        }))
+        .filter(ds => ds.data.some(p => p.y !== null));
 
     if (precipBiasPanelChart) precipBiasPanelChart.destroy();
     precipBiasPanelChart = new Chart(document.getElementById('precipBiasChart'), {
@@ -1623,15 +1756,18 @@ function renderPrecipChart(precipHistoryData) {
                 radius: 120
             },
             plugins: {
-                legend: { position: 'top' },
+                legend: { display: false },
                 tooltip: {
                     mode: 'x',
                     intersect: false,
                     callbacks: {
                         label: function(context) {
-                            const label = context.dataset.label || '';
+                            const modelKey = context.dataset.modelByIndex?.[context.dataIndex];
+                            const modelDef = biasDefs.find(m => m.key === modelKey);
+                            const modelName = modelDef ? modelDef.label : null;
                             const value = context.parsed.y;
-                            return label + ': ' +
+                            if (!modelName) return null;
+                            return modelName + ': ' +
                                 (value !== null && value !== undefined ? (value > 0 ? '+' : '') + value.toFixed(2) + ' in' : 'N/A');
                         }
                     }
