@@ -82,6 +82,14 @@ os.chdir(script_dir)
 log_dir = os.path.join(script_dir, 'logs')
 os.makedirs(log_dir, exist_ok=True)
 
+# Reset launchd stream logs each run so they do not grow indefinitely.
+for _stream_name in ("launchd.log", "launchd_error.log"):
+    try:
+        with open(os.path.join(log_dir, _stream_name), "w"):
+            pass
+    except Exception:
+        pass
+
 # Create log file
 log_file = os.path.join(log_dir, f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
@@ -138,13 +146,19 @@ with open(log_file, 'w') as f:
     f.write(f"Sync completed at: {datetime.now()}\n")
     f.write("=" * 50 + "\n")
 
-# Cleanup old logs (keep last 48 hours)
+# Cleanup rotating sync logs (keep only the newest one)
 try:
-    for filename in os.listdir(log_dir):
-        if filename.startswith('sync_') and filename.endswith('.log'):
-            filepath = os.path.join(log_dir, filename)
-            if os.path.getmtime(filepath) < (datetime.now().timestamp() - 48 * 3600):
-                os.remove(filepath)
+    sync_logs = sorted(
+        [
+            os.path.join(log_dir, fn)
+            for fn in os.listdir(log_dir)
+            if fn.startswith("sync_") and fn.endswith(".log")
+        ],
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for old_file in sync_logs[1:]:
+        os.remove(old_file)
 except Exception as e:
     print(f"Error cleaning up logs: {e}", file=sys.stderr)
 
