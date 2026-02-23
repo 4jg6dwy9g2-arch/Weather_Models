@@ -30,7 +30,7 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-23 13:29 UTC &mdash; <span id="stationCount">loading...</span></small>
+    <small class="text-muted">Updated 2026-02-23 13:32 UTC &mdash; <span id="stationCount">loading...</span></small>
   </div>
 </div>
 
@@ -218,6 +218,7 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
 // ============================================================
 // Data loaded async from sibling JSON files
 // ============================================================
+const MODELS    = ['gfs','aifs','ifs','nws'];
 const MODEL_IDX = {gfs:0,aifs:1,ifs:2,nws:3};
 const VAR_IDX   = {temp:0,precip:1,dewpoint:2,mslp:3};
 const VAR_UNITS = {temp:'°F',precip:'in',dewpoint:'°F',mslp:'mb'};
