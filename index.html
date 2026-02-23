@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-23 15:39 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-23 22:17 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -356,7 +356,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-02-23_15:39_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-02-23_22:17_UTC').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs;
 
@@ -396,7 +396,7 @@ function initMap() {
 }
 
 function getMaeColor(value, variable) {
-  const max = variable === VAR_PRECIP ? 1 : 10;
+  const max = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
   const r = Math.max(0, Math.min(1, value / max));
   if (r < 0.5) {
     const t = r * 2;
@@ -407,7 +407,7 @@ function getMaeColor(value, variable) {
   }
 }
 function getBiasColor(value, variable) {
-  const max = variable === VAR_PRECIP ? 1 : 10;
+  const max = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
   const r = Math.max(-1, Math.min(1, value / max));
   if (variable === VAR_PRECIP) {
     const g = (r+1)/2;
@@ -431,16 +431,17 @@ function updateColorScale(variable, metric) {
   const mn  = document.getElementById('scaleMin');
   const mx  = document.getElementById('scaleMax');
   document.getElementById('scaleUnits').textContent = VAR_UNITS[variable] || '';
+  const isTD = variable === 'temp' || variable === 'dewpoint';
+  const scaleMax = isP ? '1.0' : isTD ? '20.0' : '10.0';
   if (metric === 'bias') {
-    const lim = isP ? '±1.0' : '±10.0';
-    mn.textContent = '-' + (isP ? '1.0' : '10.0');
-    mx.textContent = isP ? '1.0' : '10.0';
+    mn.textContent = '-' + scaleMax;
+    mx.textContent = scaleMax;
     bar.style.background = isP
       ? 'linear-gradient(to right,rgb(139,69,19),white,rgb(34,139,34))'
       : 'linear-gradient(to right,#3b82f6,white 50%,#ef4444)';
   } else {
     mn.textContent = '0';
-    mx.textContent = isP ? '1.0' : '10.0';
+    mx.textContent = scaleMax;
     bar.style.background = 'linear-gradient(to right,#22c55e,#eab308 50%,#ef4444)';
   }
 }
@@ -463,7 +464,7 @@ function renderMap() {
   markers.forEach(m => asosMap.removeLayer(m));
   markers = [];
 
-  const maxScale = variable === VAR_PRECIP ? 1 : 10;
+  const maxScale = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
 
   for (const [sid, st] of Object.entries(stationSet)) {
     const entry = st.d?.[mi]?.[vi]?.[ltIdx];
