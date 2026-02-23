@@ -18,7 +18,8 @@ body { font-size: 0.875rem; }
 .chart-wrap { position: relative; height: 260px; }
 .chart-wrap-sm { position: relative; height: 200px; }
 th, td { white-space: nowrap; font-size: 0.78rem; padding: 0.25rem 0.4rem !important; }
-thead th { position: sticky; top: 0; background: white; z-index: 1; }
+thead tr:first-child th { position: sticky; top: 0; background: white; z-index: 2; }
+thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index: 1; }
 .color-scale-bar { width: 200px; height: 12px; border-radius: 4px; }
 .card-header { font-size: 0.85rem; }
 .form-select-sm { font-size: 0.8rem; }
@@ -31,7 +32,7 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-23 14:57 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-23 15:10 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -689,8 +690,18 @@ document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventL
 ['tsVar','tsMetric','tsLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderTs));
 
+// Fix two-row sticky thead: offset second row by first row's rendered height
+function fixStickyHeader() {
+  const row1 = document.querySelector('thead tr:first-child');
+  if (!row1) return;
+  const h = row1.getBoundingClientRect().height;
+  document.querySelectorAll('thead tr:nth-child(2) th').forEach(th => {
+    th.style.top = h + 'px';
+  });
+}
+
 // Boot
-loadAll();
+loadAll().then(fixStickyHeader);
 </script>
 </body>
 </html>
