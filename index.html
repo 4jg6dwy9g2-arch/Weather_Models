@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASOS Model Verification</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+<style>
+body { font-size: 0.875rem; }
+#map { height: 450px; background: #e8e8e8; }
+.leaflet-tooltip { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 6px 10px; font-size: 13px; box-shadow: 0 2px 4px rgba(0,0,0,.15); }
+.chart-wrap { position: relative; height: 260px; }
+.chart-wrap-sm { position: relative; height: 200px; }
+th, td { white-space: nowrap; font-size: 0.78rem; padding: 0.25rem 0.4rem !important; }
+thead th { position: sticky; top: 0; background: white; z-index: 1; }
+.color-scale-bar { width: 200px; height: 12px; border-radius: 4px; }
+.card-header { font-size: 0.85rem; }
+.form-select-sm { font-size: 0.8rem; }
+</style>
+</head>
+<body class="bg-light">
+
+<div class="container-fluid py-3">
+
+<div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+  <div>
+    <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
+    <small class="text-muted">Updated 2026-02-23 13:24 UTC &mdash; <span id="stationCount">loading...</span></small>
+  </div>
+</div>
+
+<!-- Loading banner -->
+<div id="loadingBanner" class="alert alert-info py-2">
+  <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+  Loading verification data&hellip;
+</div>
+
+<!-- MAP CARD -->
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span><i class="bi bi-geo-alt"></i> Station Map</span>
+    <div class="d-flex gap-2 flex-wrap">
+      <select class="form-select form-select-sm" id="selVar" style="width:auto">
+        <option value="temp">Temperature</option>
+        <option value="mslp">Pressure</option>
+        <option value="precip">Precipitation</option>
+        <option value="dewpoint">Dew Point</option>
+      </select>
+      <select class="form-select form-select-sm" id="selMetric" style="width:auto">
+        <option value="mae">MAE</option>
+        <option value="bias">Bias</option>
+      </select>
+      <select class="form-select form-select-sm" id="selModel" style="width:auto">
+        <option value="gfs">GFS</option>
+        <option value="aifs">AIFS</option>
+        <option value="ifs">IFS</option>
+        <option value="nws">NWS</option>
+      </select>
+      <select class="form-select form-select-sm" id="selLt" style="width:auto"></select>
+    </div>
+  </div>
+  <div class="card-body p-0">
+    <div id="map"></div>
+    <!-- Color scale -->
+    <div class="d-flex align-items-center justify-content-center gap-3 py-2 border-top bg-light">
+      <span id="scaleMin" class="text-muted small">0</span>
+      <div id="scaleBar" class="color-scale-bar"></div>
+      <span id="scaleMax" class="text-muted small">10</span>
+      <span id="scaleUnits" class="text-muted small ms-1"></span>
+    </div>
+  </div>
+</div>
+
+<!-- STATION DETAIL (hidden until click) -->
+<div id="stationDetail" class="card mb-3 d-none">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-pin-map"></i> <strong id="detailName"></strong></span>
+    <button class="btn btn-sm btn-outline-secondary" onclick="closeDetail()"><i class="bi bi-x"></i></button>
+  </div>
+  <div class="card-body">
+    <p class="small text-muted mb-2">MAE and Bias vs lead time. Click legend items to toggle models.</p>
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-thermometer-half"></i> Temperature</div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="dtTempChart"></canvas></div></div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-cloud-rain"></i> Precipitation</div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="dtPrecipChart"></canvas></div></div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-droplet-half"></i> Dew Point</div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="dtDewChart"></canvas></div></div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-speedometer"></i> Pressure</div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="dtMslpChart"></canvas></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MEAN VERIFICATION TABLE -->
+<div class="card mb-3">
+  <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+    <span><i class="bi bi-table"></i> Mean Verification — All Stations</span>
+    <div class="d-flex gap-2 flex-wrap align-items-center">
+      <div class="form-check form-switch mb-0 me-1">
+        <input class="form-check-input" type="checkbox" id="periodToggle">
+        <label class="form-check-label small" for="periodToggle">Last 20 days</label>
+      </div>
+      <div class="btn-group btn-group-sm">
+        <input type="radio" class="btn-check" name="tableMetric" id="tm-mae" value="mae" autocomplete="off" checked>
+        <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
+        <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
+        <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
+      </div>
+      <div class="btn-group btn-group-sm" id="validHourFilter">
+        <input type="radio" class="btn-check" name="validHour" id="vh-all" value="" autocomplete="off" checked>
+        <label class="btn btn-outline-secondary" for="vh-all">All</label>
+        <input type="radio" class="btn-check" name="validHour" id="vh-00" value="0" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="vh-00">00Z</label>
+        <input type="radio" class="btn-check" name="validHour" id="vh-06" value="6" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="vh-06">06Z</label>
+        <input type="radio" class="btn-check" name="validHour" id="vh-12" value="12" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="vh-12">12Z</label>
+        <input type="radio" class="btn-check" name="validHour" id="vh-18" value="18" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="vh-18">18Z</label>
+      </div>
+    </div>
+  </div>
+  <div class="card-body p-0">
+    <div class="table-responsive" style="max-height:60vh">
+      <table class="table table-hover table-sm mb-0">
+        <thead>
+          <tr>
+            <th rowspan="2">Lead</th><th rowspan="2">Runs</th>
+            <th colspan="5" class="text-center border-start">Temp (°F)</th>
+            <th colspan="5" class="text-center border-start">Precip (in)</th>
+            <th colspan="5" class="text-center border-start">Dew Point (°F)</th>
+            <th colspan="3" class="text-center border-start">Pressure (mb)</th>
+          </tr>
+          <tr>
+            <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
+            <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
+            <th class="text-center" style="background:rgba(33,37,41,.10)">NWS</th>
+            <th class="text-center">Win</th>
+            <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
+            <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
+            <th class="text-center" style="background:rgba(33,37,41,.10)">NWS</th>
+            <th class="text-center">Win</th>
+            <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
+            <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
+            <th class="text-center" style="background:rgba(33,37,41,.10)">NWS</th>
+            <th class="text-center">Win</th>
+            <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
+            <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- TIME SERIES CHART -->
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span><i class="bi bi-graph-up"></i> Verification Trends (Last 30 Days)</span>
+    <div class="d-flex gap-2 flex-wrap">
+      <select class="form-select form-select-sm" id="tsVar" style="width:auto">
+        <option value="temp">Temperature</option>
+        <option value="mslp">Pressure</option>
+        <option value="precip">Precipitation</option>
+        <option value="dewpoint">Dew Point</option>
+      </select>
+      <select class="form-select form-select-sm" id="tsMetric" style="width:auto">
+        <option value="mae">MAE</option>
+        <option value="bias">Bias</option>
+      </select>
+      <select class="form-select form-select-sm" id="tsLt" style="width:auto">
+        <option value="6">6h</option>
+        <option value="24" selected>24h</option>
+        <option value="72">72h</option>
+        <option value="168">7d</option>
+      </select>
+    </div>
+  </div>
+  <div class="card-body">
+    <div style="position:relative;height:350px"><canvas id="tsChart"></canvas></div>
+  </div>
+</div>
+
+</div><!-- /container-fluid -->
+
+<script>
+// ============================================================
+// Data loaded async from sibling JSON files
+// ============================================================
+const MODEL_IDX = {gfs:0,aifs:1,ifs:2,nws:3};
+const VAR_IDX   = {temp:0,precip:1,dewpoint:2,mslp:3};
+const VAR_UNITS = {temp:'°F',precip:'in',dewpoint:'°F',mslp:'mb'};
+const VAR_PRECIP = 'precip';
+
+let MAP_DATA = null, TABLE_DATA = null, TS_DATA = null;
+let asosMap = null, markers = [];
+let dtCharts = {};
+let tsChart = null;
+
+async function loadAll() {
+  const [m, t, ts] = await Promise.all([
+    fetch('data/map.json').then(r => r.json()),
+    fetch('data/table.json').then(r => r.json()),
+    fetch('data/timeseries.json').then(r => r.json()),
+  ]);
+  MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts;
+
+  // Populate lead-time dropdown from published lead times
+  const sel = document.getElementById('selLt');
+  const ltLabels = {6:'6h',12:'12h',24:'24h',48:'48h',72:'72h',120:'5d',168:'7d',240:'10d',288:'12d',360:'15d'};
+  MAP_DATA.lead_times.forEach(lt => {
+    const opt = document.createElement('option');
+    opt.value = lt; opt.textContent = ltLabels[lt] || lt + 'h';
+    if (lt === 24) opt.selected = true;
+    sel.appendChild(opt);
+  });
+
+  document.getElementById('stationCount').textContent =
+    Object.keys(MAP_DATA.stations).length + ' stations';
+  document.getElementById('loadingBanner').classList.add('d-none');
+
+  initMap();
+  renderMap();
+  renderTable();
+  renderTs();
+}
+
+// ============================================================
+// Map
+// ============================================================
+function initMap() {
+  asosMap = L.map('map', {center:[39.5,-98.5], zoom:4, minZoom:3, maxZoom:10});
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution:'&copy; OpenStreetMap contributors', maxZoom:19
+  }).addTo(asosMap);
+}
+
+function getMaeColor(value, variable) {
+  const max = variable === VAR_PRECIP ? 1 : 10;
+  const r = Math.max(0, Math.min(1, value / max));
+  if (r < 0.5) {
+    const t = r * 2;
+    return `rgb(${Math.round(34+t*200)},${Math.round(197-t*18)},${Math.round(94-t*86)})`;
+  } else {
+    const t = (r-0.5)*2;
+    return `rgb(${Math.round(234+t*5)},${Math.round(179-t*111)},${Math.round(8+t*60)})`;
+  }
+}
+function getBiasColor(value, variable) {
+  const max = variable === VAR_PRECIP ? 1 : 10;
+  const r = Math.max(-1, Math.min(1, value / max));
+  if (variable === VAR_PRECIP) {
+    const g = (r+1)/2;
+    if (g < 0.5) {
+      const t=g*2; return `rgb(${Math.round(139+t*116)},${Math.round(69+t*186)},${Math.round(19+t*236)})`;
+    } else {
+      const t=(g-0.5)*2; return `rgb(${Math.round(255-t*221)},${Math.round(255-t*116)},${Math.round(255-t*221)})`;
+    }
+  } else {
+    if (r < 0) {
+      const t=1+r; return `rgb(${Math.round(59+t*196)},${Math.round(130+t*125)},${Math.round(246+t*9)})`;
+    } else {
+      const t=r; return `rgb(255,${Math.round(255-t*187)},${Math.round(255-t*187)})`;
+    }
+  }
+}
+
+function updateColorScale(variable, metric) {
+  const isP = variable === VAR_PRECIP;
+  const bar = document.getElementById('scaleBar');
+  const mn  = document.getElementById('scaleMin');
+  const mx  = document.getElementById('scaleMax');
+  document.getElementById('scaleUnits').textContent = VAR_UNITS[variable] || '';
+  if (metric === 'bias') {
+    const lim = isP ? '±1.0' : '±10.0';
+    mn.textContent = '-' + (isP ? '1.0' : '10.0');
+    mx.textContent = isP ? '1.0' : '10.0';
+    bar.style.background = isP
+      ? 'linear-gradient(to right,rgb(139,69,19),white,rgb(34,139,34))'
+      : 'linear-gradient(to right,#3b82f6,white 50%,#ef4444)';
+  } else {
+    mn.textContent = '0';
+    mx.textContent = isP ? '1.0' : '10.0';
+    bar.style.background = 'linear-gradient(to right,#22c55e,#eab308 50%,#ef4444)';
+  }
+}
+
+function renderMap() {
+  if (!asosMap || !MAP_DATA) return;
+  const variable = document.getElementById('selVar').value;
+  const metric   = document.getElementById('selMetric').value;
+  const model    = document.getElementById('selModel').value;
+  const lt       = parseInt(document.getElementById('selLt').value, 10);
+
+  const mi = MODEL_IDX[model] ?? 0;
+  const vi = VAR_IDX[variable] ?? 0;
+  const ltIdx = MAP_DATA.lead_times.indexOf(lt);
+
+  updateColorScale(variable, metric);
+  markers.forEach(m => asosMap.removeLayer(m));
+  markers = [];
+
+  const maxScale = variable === VAR_PRECIP ? 1 : 10;
+
+  for (const [sid, st] of Object.entries(MAP_DATA.stations)) {
+    const entry = st.d?.[mi]?.[vi]?.[ltIdx];
+    if (!entry) continue;
+    const [mae, bias] = entry;
+    const value = metric === 'mae' ? mae : bias;
+    if (value === null || value === undefined) continue;
+
+    const color = metric === 'mae'
+      ? getMaeColor(Math.abs(value), variable)
+      : getBiasColor(value, variable);
+
+    const norm = Math.min(Math.abs(metric === 'mae' ? value : value) / maxScale, 1);
+    const radius = 3 + norm * 4.5;
+
+    const marker = L.circleMarker([st.lat, st.lon], {
+      radius, fillColor: color, color:'#333', weight:1, opacity:0.8, fillOpacity:0.9
+    });
+
+    const sign = bias >= 0 ? '+' : '';
+    marker.bindTooltip(
+      `<strong>${st.name}</strong> (${sid})<br>` +
+      `MAE: ${mae?.toFixed(2)} ${VAR_UNITS[variable]}<br>` +
+      `Bias: ${sign}${bias?.toFixed(2)} ${VAR_UNITS[variable]}`,
+      {direction:'top', offset:[0,-5]}
+    );
+    marker.on('click', () => openDetail(sid, st));
+    marker.addTo(asosMap);
+    markers.push(marker);
+  }
+}
+
+// ============================================================
+// Station detail charts
+// ============================================================
+function closeDetail() {
+  document.getElementById('stationDetail').classList.add('d-none');
+  Object.values(dtCharts).forEach(c => c?.destroy());
+  dtCharts = {};
+}
+
+function openDetail(sid, st) {
+  document.getElementById('stationDetail').classList.remove('d-none');
+  document.getElementById('detailName').textContent = st.name + ' (' + sid + ')';
+
+  const labels = MAP_DATA.lead_times.map(lt =>
+    lt < 24 ? lt + 'h' : (lt % 24 === 0 ? (lt/24) + 'd' : lt + 'h'));
+
+  const colors = {
+    gfs:  {border:'#0d6efd', bg:'rgba(13,110,253,.12)'},
+    aifs: {border:'#0dcaf0', bg:'rgba(13,202,240,.12)'},
+    ifs:  {border:'#20c997', bg:'rgba(32,201,151,.12)'},
+    nws:  {border:'#212529', bg:'rgba(33,37,41,.12)'},
+  };
+
+  function buildVarChart(canvasId, varKey, unit, minY) {
+    const vi = VAR_IDX[varKey];
+    if (dtCharts[canvasId]) dtCharts[canvasId].destroy();
+
+    const maeSets = MODELS.map(m => {
+      const mi = MODEL_IDX[m];
+      return {
+        label: m.toUpperCase() + ' MAE',
+        data: MAP_DATA.lead_times.map((_,i) => st.d?.[mi]?.[vi]?.[i]?.[0] ?? null),
+        borderColor: colors[m].border,
+        backgroundColor: 'transparent',
+        borderWidth: 2,
+        tension: 0.3,
+        pointRadius: 3,
+        yAxisID: 'y',
+      };
+    });
+    const biasSets = MODELS.map(m => {
+      const mi = MODEL_IDX[m];
+      return {
+        label: m.toUpperCase() + ' Bias',
+        data: MAP_DATA.lead_times.map((_,i) => st.d?.[mi]?.[vi]?.[i]?.[1] ?? null),
+        borderColor: colors[m].border,
+        backgroundColor: colors[m].bg,
+        borderWidth: 1.5,
+        borderDash: [5,4],
+        tension: 0.3,
+        pointRadius: 2,
+        yAxisID: 'y1',
+      };
+    });
+
+    dtCharts[canvasId] = new Chart(document.getElementById(canvasId), {
+      type: 'line',
+      data: {labels, datasets: [...maeSets, ...biasSets]},
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: {mode:'index', intersect:false},
+        plugins: {
+          legend: {position:'top', labels:{usePointStyle:true, padding:12, font:{size:11}}},
+          annotation: {annotations: {
+            zero: {type:'line', yMin:0, yMax:0, borderColor:'#aaa', borderWidth:1,
+                    borderDash:[5,5], yAxisID:'y1'}
+          }}
+        },
+        scales: {
+          x: {grid:{display:false}, title:{display:true, text:'Lead Time'}},
+          y: {position:'left', grid:{color:'#e8e8e8'}, title:{display:true, text:`MAE (${unit})`},
+               min: minY !== undefined ? minY : undefined},
+          y1: {position:'right', grid:{drawOnChartArea:false}, title:{display:true, text:`Bias (${unit})`}},
+        }
+      }
+    });
+  }
+
+  buildVarChart('dtTempChart',  'temp',     '°F', 0);
+  buildVarChart('dtPrecipChart','precip',   'in',  0);
+  buildVarChart('dtDewChart',   'dewpoint', '°F', 0);
+  buildVarChart('dtMslpChart',  'mslp',    'mb',  0);
+
+  document.getElementById('stationDetail').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+// ============================================================
+// Mean verification table
+// ============================================================
+function fmtLt(lt) {
+  if (lt < 24) return lt + 'h';
+  return (lt % 24 === 0) ? (lt/24)+'d' : (lt/24).toFixed(1)+'d';
+}
+function pctMae(cur, base) {
+  if (cur == null || base == null || base === 0) return '';
+  const p = Math.round((cur-base)/base*100);
+  if (p === 0) return '';
+  return ` <span style="color:${p<0?'green':'red'};font-size:.7em">${p>0?'+':''}${p}%</span>`;
+}
+function winner(models) {
+  const v = models.filter(m => m.mae != null);
+  if (!v.length) return ['--','badge bg-secondary'];
+  const mn = Math.min(...v.map(m=>m.mae));
+  const ws = v.filter(m=>m.mae===mn);
+  return ws.length===1 ? [ws[0].n, ws[0].cls] : ['Tie','badge bg-secondary'];
+}
+
+function renderTable() {
+  const period  = document.getElementById('periodToggle').checked ? 'monthly' : 'all';
+  const vh      = document.querySelector('input[name="validHour"]:checked').value;
+  const isMae   = document.querySelector('input[name="tableMetric"]:checked').value === 'mae';
+  const key     = `${period}_${vh===''?'all':vh}`;
+  const v       = TABLE_DATA?.data?.[key];
+  const a       = TABLE_DATA?.data?.['all_all'];
+  const isMonthly = TABLE_DATA?.use_monthly && period === 'monthly';
+  const tbody   = document.getElementById('tbody');
+  tbody.innerHTML = '';
+
+  if (!v?.lead_times?.length) {
+    tbody.innerHTML = '<tr><td colspan="20" class="text-center text-muted">No data</td></tr>';
+    return;
+  }
+
+  const f1 = (val,ref) => val!=null ? val.toFixed(1) + (isMae && isMonthly ? pctMae(val,ref) : '') : '--';
+  const f2 = (val,ref) => val!=null ? val.toFixed(2) + (isMae && isMonthly ? pctMae(val,ref) : '') : '--';
+  const sg  = (val,dp=1) => val!=null ? (val>0?'+':'') + val.toFixed(dp) : '--';
+
+  for (let i=0; i<v.lead_times.length; i++) {
+    const lt   = v.lead_times[i];
+    const runs = Math.max(v.gfs_run_count?.[i]??0,v.aifs_run_count?.[i]??0,
+                          v.ifs_run_count?.[i]??0, v.nws_run_count?.[i]??0);
+    const gTm=v.gfs_temp_mae?.[i],  gTb=v.gfs_temp_bias?.[i];
+    const aTm=v.aifs_temp_mae?.[i], aTb=v.aifs_temp_bias?.[i];
+    const iTm=v.ifs_temp_mae?.[i],  iTb=v.ifs_temp_bias?.[i];
+    const nTm=v.nws_temp_mae?.[i],  nTb=v.nws_temp_bias?.[i];
+    const gRm=v.gfs_precip_mae?.[i],   gRb=v.gfs_precip_bias?.[i];
+    const aRm=v.aifs_precip_mae?.[i],  aRb=v.aifs_precip_bias?.[i];
+    const iRm=v.ifs_precip_mae?.[i],   iRb=v.ifs_precip_bias?.[i];
+    const nRm=v.nws_precip_mae?.[i],   nRb=v.nws_precip_bias?.[i];
+    const gDm=v.gfs_dewpoint_mae?.[i], gDb=v.gfs_dewpoint_bias?.[i];
+    const aDm=v.aifs_dewpoint_mae?.[i],aDb=v.aifs_dewpoint_bias?.[i];
+    const iDm=v.ifs_dewpoint_mae?.[i], iDb=v.ifs_dewpoint_bias?.[i];
+    const nDm=v.nws_dewpoint_mae?.[i], nDb=v.nws_dewpoint_bias?.[i];
+    const gPm=v.gfs_mslp_mae?.[i],     gPb=v.gfs_mslp_bias?.[i];
+    const aPm=v.aifs_mslp_mae?.[i],    aPb=v.aifs_mslp_bias?.[i];
+    const iPm=v.ifs_mslp_mae?.[i],     iPb=v.ifs_mslp_bias?.[i];
+
+    const [tW,tC]=winner([{n:'GFS',mae:gTm,cls:'badge bg-primary'},{n:'AIFS',mae:aTm,cls:'badge bg-info text-dark'},{n:'IFS',mae:iTm,cls:'badge bg-success'},{n:'NWS',mae:nTm,cls:'badge bg-dark'}]);
+    const [rW,rC]=winner([{n:'GFS',mae:gRm,cls:'badge bg-primary'},{n:'AIFS',mae:aRm,cls:'badge bg-info text-dark'},{n:'IFS',mae:iRm,cls:'badge bg-success'},{n:'NWS',mae:nRm,cls:'badge bg-dark'}]);
+    const [dW,dC]=winner([{n:'GFS',mae:gDm,cls:'badge bg-primary'},{n:'AIFS',mae:aDm,cls:'badge bg-info text-dark'},{n:'IFS',mae:iDm,cls:'badge bg-success'},{n:'NWS',mae:nDm,cls:'badge bg-dark'}]);
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><strong>${fmtLt(lt)}</strong></td><td class="text-center">${runs}</td>
+      <td class="text-center border-start">${isMae?f1(gTm,a?.gfs_temp_mae?.[i]):sg(gTb)}</td>
+      <td class="text-center">${isMae?f1(aTm,a?.aifs_temp_mae?.[i]):sg(aTb)}</td>
+      <td class="text-center">${isMae?f1(iTm,a?.ifs_temp_mae?.[i]):sg(iTb)}</td>
+      <td class="text-center">${isMae?f1(nTm,a?.nws_temp_mae?.[i]):sg(nTb)}</td>
+      <td><span class="${tC}">${tW}</span></td>
+      <td class="text-center border-start">${isMae?f2(gRm,a?.gfs_precip_mae?.[i]):sg(gRb,2)}</td>
+      <td class="text-center">${isMae?f2(aRm,a?.aifs_precip_mae?.[i]):sg(aRb,2)}</td>
+      <td class="text-center">${isMae?f2(iRm,a?.ifs_precip_mae?.[i]):sg(iRb,2)}</td>
+      <td class="text-center">${isMae?f2(nRm,a?.nws_precip_mae?.[i]):sg(nRb,2)}</td>
+      <td><span class="${rC}">${rW}</span></td>
+      <td class="text-center border-start">${isMae?f1(gDm,a?.gfs_dewpoint_mae?.[i]):sg(gDb)}</td>
+      <td class="text-center">${isMae?f1(aDm,a?.aifs_dewpoint_mae?.[i]):sg(aDb)}</td>
+      <td class="text-center">${isMae?f1(iDm,a?.ifs_dewpoint_mae?.[i]):sg(iDb)}</td>
+      <td class="text-center">${isMae?f1(nDm,a?.nws_dewpoint_mae?.[i]):sg(nDb)}</td>
+      <td><span class="${dC}">${dW}</span></td>
+      <td class="text-center border-start">${isMae?f1(gPm,a?.gfs_mslp_mae?.[i]):sg(gPb)}</td>
+      <td class="text-center">${isMae?f1(aPm,a?.aifs_mslp_mae?.[i]):sg(aPb)}</td>
+      <td class="text-center">${isMae?f1(iPm,a?.ifs_mslp_mae?.[i]):sg(iPb)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+// ============================================================
+// Time series chart
+// ============================================================
+function renderTs() {
+  const variable = document.getElementById('tsVar').value;
+  const metric   = document.getElementById('tsMetric').value;
+  const lt       = document.getElementById('tsLt').value;
+  const combo    = TS_DATA?.[variable]?.[lt];
+  const ctx      = document.getElementById('tsChart');
+
+  if (tsChart) { tsChart.destroy(); tsChart = null; }
+  if (!combo) return;
+
+  const labels = combo.dates.map(d => {
+    const dt = new Date(d);
+    return dt.toLocaleDateString('en-US', {month:'short', day:'numeric'});
+  });
+
+  const unit = VAR_UNITS[variable] || '';
+  const mColors = {
+    gfs: {border:'#0d6efd',bg:'rgba(13,110,253,.1)'},
+    aifs:{border:'#0dcaf0',bg:'rgba(13,202,240,.1)'},
+    ifs: {border:'#20c997',bg:'rgba(32,201,151,.1)'},
+    nws: {border:'#212529',bg:'rgba(33,37,41,.1)'},
+  };
+  const datasets = ['gfs','aifs','ifs','nws']
+    .filter(m => combo[m])
+    .map(m => ({
+      label: m.toUpperCase(),
+      data: combo[m][metric],
+      borderColor: mColors[m].border,
+      backgroundColor: mColors[m].bg,
+      borderWidth: 2,
+      tension: 0.3,
+      pointRadius: 1,
+      pointHoverRadius: 4,
+    }));
+
+  tsChart = new Chart(ctx, {
+    type: 'line',
+    data: {labels, datasets},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: {mode:'index', intersect:false},
+      plugins: {
+        legend: {position:'top', labels:{usePointStyle:true, padding:16}},
+        tooltip: {
+          callbacks: {
+            label: ctx => ctx.parsed.y != null
+              ? `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} ${unit}`
+              : null
+          }
+        }
+      },
+      scales: {
+        y: {grid:{color:'#e0e0e0'}, title:{display:true, text:`${metric.toUpperCase()} (${unit})`}},
+        x: {grid:{display:false}, title:{display:true, text:'Date'},
+             ticks:{maxRotation:45, minRotation:45}}
+      }
+    }
+  });
+}
+
+// ============================================================
+// Event listeners
+// ============================================================
+['selVar','selMetric','selModel','selLt'].forEach(id =>
+  document.getElementById(id).addEventListener('change', renderMap));
+
+document.getElementById('periodToggle').addEventListener('change', renderTable);
+document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
+document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
+
+['tsVar','tsMetric','tsLt'].forEach(id =>
+  document.getElementById(id).addEventListener('change', renderTs));
+
+// Boot
+loadAll();
+</script>
+</body>
+</html>
