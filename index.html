@@ -30,7 +30,7 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-23 13:32 UTC &mdash; <span id="stationCount">loading...</span></small>
+    <small class="text-muted">Updated 2026-02-23 13:46 UTC &mdash; <span id="stationCount">loading...</span></small>
   </div>
 </div>
 
@@ -82,12 +82,20 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
 
 <!-- STATION DETAIL (hidden until click) -->
 <div id="stationDetail" class="card mb-3 d-none">
-  <div class="card-header d-flex justify-content-between align-items-center">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span><i class="bi bi-pin-map"></i> <strong id="detailName"></strong></span>
-    <button class="btn btn-sm btn-outline-secondary" onclick="closeDetail()"><i class="bi bi-x"></i></button>
+    <div class="d-flex align-items-center gap-2">
+      <div class="btn-group btn-group-sm" role="group">
+        <input type="radio" class="btn-check" name="detailMetric" id="dm-mae" value="mae" autocomplete="off" checked>
+        <label class="btn btn-outline-primary" for="dm-mae">MAE</label>
+        <input type="radio" class="btn-check" name="detailMetric" id="dm-bias" value="bias" autocomplete="off">
+        <label class="btn btn-outline-primary" for="dm-bias">Bias</label>
+      </div>
+      <button class="btn btn-sm btn-outline-secondary" onclick="closeDetail()"><i class="bi bi-x"></i></button>
+    </div>
   </div>
   <div class="card-body">
-    <p class="small text-muted mb-2">MAE and Bias vs lead time. Click legend items to toggle models.</p>
+    <p class="small text-muted mb-2">One line per model. Click legend items to show/hide.</p>
     <div class="row g-3">
       <div class="col-lg-6">
         <div class="card h-100">
@@ -228,6 +236,7 @@ let MAP_DATA = null, TABLE_DATA = null, TS_DATA = null;
 let asosMap = null, markers = [];
 let dtCharts = {};
 let tsChart = null;
+let detailSt = null, detailIsMonthly = false;
 
 async function loadAll() {
   const [m, t, ts] = await Promise.all([
@@ -376,87 +385,84 @@ function renderMap() {
 // ============================================================
 // Station detail charts
 // ============================================================
+const DT_COLORS = {
+  gfs:  {border:'#0d6efd', bg:'rgba(13,110,253,.12)'},
+  aifs: {border:'#0dcaf0', bg:'rgba(13,202,240,.12)'},
+  ifs:  {border:'#20c997', bg:'rgba(32,201,151,.12)'},
+  nws:  {border:'#212529', bg:'rgba(33,37,41,.12)'},
+};
+
 function closeDetail() {
   document.getElementById('stationDetail').classList.add('d-none');
   Object.values(dtCharts).forEach(c => c?.destroy());
   dtCharts = {};
+  detailSt = null;
 }
 
-function openDetail(sid, st, isMonthly) {
-  document.getElementById('stationDetail').classList.remove('d-none');
-  const periodLabel = isMonthly ? ' — last 20 days' : '';
-  document.getElementById('detailName').textContent = st.name + ' (' + sid + ')' + periodLabel;
+function buildVarChart(canvasId, varKey, unit, metric) {
+  const vi = VAR_IDX[varKey];
+  const st = detailSt;
+  if (dtCharts[canvasId]) dtCharts[canvasId].destroy();
+  if (!st) return;
 
+  const isMae = metric === 'mae';
   const labels = MAP_DATA.lead_times.map(lt =>
     lt < 24 ? lt + 'h' : (lt % 24 === 0 ? (lt/24) + 'd' : lt + 'h'));
 
-  const colors = {
-    gfs:  {border:'#0d6efd', bg:'rgba(13,110,253,.12)'},
-    aifs: {border:'#0dcaf0', bg:'rgba(13,202,240,.12)'},
-    ifs:  {border:'#20c997', bg:'rgba(32,201,151,.12)'},
-    nws:  {border:'#212529', bg:'rgba(33,37,41,.12)'},
-  };
+  const datasets = MODELS.map(m => {
+    const mi = MODEL_IDX[m];
+    return {
+      label: m.toUpperCase(),
+      data: MAP_DATA.lead_times.map((_,i) => st.d?.[mi]?.[vi]?.[i]?.[isMae ? 0 : 1] ?? null),
+      borderColor: DT_COLORS[m].border,
+      backgroundColor: 'transparent',
+      borderWidth: 2,
+      borderDash: isMae ? [] : [5, 4],
+      tension: 0.3,
+      pointRadius: 3,
+    };
+  });
 
-  function buildVarChart(canvasId, varKey, unit, minY) {
-    const vi = VAR_IDX[varKey];
-    if (dtCharts[canvasId]) dtCharts[canvasId].destroy();
-
-    const maeSets = MODELS.map(m => {
-      const mi = MODEL_IDX[m];
-      return {
-        label: m.toUpperCase() + ' MAE',
-        data: MAP_DATA.lead_times.map((_,i) => st.d?.[mi]?.[vi]?.[i]?.[0] ?? null),
-        borderColor: colors[m].border,
-        backgroundColor: 'transparent',
-        borderWidth: 2,
-        tension: 0.3,
-        pointRadius: 3,
-        yAxisID: 'y',
-      };
-    });
-    const biasSets = MODELS.map(m => {
-      const mi = MODEL_IDX[m];
-      return {
-        label: m.toUpperCase() + ' Bias',
-        data: MAP_DATA.lead_times.map((_,i) => st.d?.[mi]?.[vi]?.[i]?.[1] ?? null),
-        borderColor: colors[m].border,
-        backgroundColor: colors[m].bg,
-        borderWidth: 1.5,
-        borderDash: [5,4],
-        tension: 0.3,
-        pointRadius: 2,
-        yAxisID: 'y1',
-      };
-    });
-
-    dtCharts[canvasId] = new Chart(document.getElementById(canvasId), {
-      type: 'line',
-      data: {labels, datasets: [...maeSets, ...biasSets]},
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        interaction: {mode:'index', intersect:false},
-        plugins: {
-          legend: {position:'top', labels:{usePointStyle:true, padding:12, font:{size:11}}},
-          annotation: {annotations: {
-            zero: {type:'line', yMin:0, yMax:0, borderColor:'#aaa', borderWidth:1,
-                    borderDash:[5,5], yAxisID:'y1'}
-          }}
+  dtCharts[canvasId] = new Chart(document.getElementById(canvasId), {
+    type: 'line',
+    data: {labels, datasets},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: {mode:'index', intersect:false},
+      plugins: {
+        legend: {position:'top', labels:{usePointStyle:true, padding:12, font:{size:11}}},
+        annotation: {annotations: isMae ? {} : {
+          zero: {type:'line', yMin:0, yMax:0, borderColor:'#aaa', borderWidth:1, borderDash:[5,5]}
+        }}
+      },
+      scales: {
+        x: {grid:{display:false}, title:{display:true, text:'Lead Time'}},
+        y: {
+          grid:{color:'#e8e8e8'},
+          title:{display:true, text:`${isMae ? 'MAE' : 'Bias'} (${unit})`},
+          min: isMae ? 0 : undefined,
         },
-        scales: {
-          x: {grid:{display:false}, title:{display:true, text:'Lead Time'}},
-          y: {position:'left', grid:{color:'#e8e8e8'}, title:{display:true, text:`MAE (${unit})`},
-               min: minY !== undefined ? minY : undefined},
-          y1: {position:'right', grid:{drawOnChartArea:false}, title:{display:true, text:`Bias (${unit})`}},
-        }
       }
-    });
-  }
+    }
+  });
+}
 
-  buildVarChart('dtTempChart',  'temp',     '°F', 0);
-  buildVarChart('dtPrecipChart','precip',   'in',  0);
-  buildVarChart('dtDewChart',   'dewpoint', '°F', 0);
-  buildVarChart('dtMslpChart',  'mslp',    'mb',  0);
+function renderDetailCharts() {
+  if (!detailSt) return;
+  const metric = document.querySelector('input[name="detailMetric"]:checked').value;
+  buildVarChart('dtTempChart',  'temp',     '°F', metric);
+  buildVarChart('dtPrecipChart','precip',   'in',  metric);
+  buildVarChart('dtDewChart',   'dewpoint', '°F', metric);
+  buildVarChart('dtMslpChart',  'mslp',    'mb',  metric);
+}
 
+function openDetail(sid, st, isMonthly) {
+  detailSt = st;
+  detailIsMonthly = isMonthly;
+  document.getElementById('stationDetail').classList.remove('d-none');
+  const periodLabel = isMonthly ? ' — last 20 days' : '';
+  document.getElementById('detailName').textContent = st.name + ' (' + sid + ')' + periodLabel;
+  renderDetailCharts();
   document.getElementById('stationDetail').scrollIntoView({behavior:'smooth', block:'start'});
 }
 
@@ -624,6 +630,7 @@ document.getElementById('mapPeriodToggle').addEventListener('change', renderMap)
 document.getElementById('periodToggle').addEventListener('change', renderTable);
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
+document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventListener('change', renderDetailCharts));
 
 ['tsVar','tsMetric','tsLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderTs));
