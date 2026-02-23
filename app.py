@@ -85,7 +85,6 @@ FORECASTS_FILE = DATA_DIR / "forecasts.json"
 
 # ASOS forecast trends storage file (last 2 runs with 6-hourly data)
 ASOS_TRENDS_FILE = DATA_DIR / "asos_forecast_trends.json"
-ASOS_PRESSURE_PERTURBATION_FILE = DATA_DIR / "asos_pressure_perturbations.json"
 ASOS_METAR_PERTURBATION_FILE    = DATA_DIR / "asos_metar_perturbations.json"
 
 # ERA5 analog forecast history (tracks predictions over time)
@@ -113,6 +112,12 @@ _CLIMATOLOGY_CACHE: dict = {}
 # ---------------------------------------------------------------------------
 _forecasts_db_cache: dict | None = None
 _forecasts_db_mtime: float | None = None
+
+# ---------------------------------------------------------------------------
+# In-memory cache for verification_lead_time_cache.json
+# ---------------------------------------------------------------------------
+_verif_lead_cache: dict | None = None
+_verif_lead_cache_mtime: float | None = None
 
 # EOF cache (loaded/built in background thread)
 _EOF_CACHE: dict | None = None
@@ -377,19 +382,30 @@ def save_verif_ts_cache(payload: dict):
 
 
 def load_verif_lead_cache() -> dict:
-    if VERIF_LEAD_CACHE_PATH.exists():
-        try:
-            with open(VERIF_LEAD_CACHE_PATH, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"Error loading verification lead-time cache: {e}")
+    global _verif_lead_cache, _verif_lead_cache_mtime
+    if not VERIF_LEAD_CACHE_PATH.exists():
+        return {"entries": {}}
+    try:
+        current_mtime = VERIF_LEAD_CACHE_PATH.stat().st_mtime
+        if _verif_lead_cache is not None and _verif_lead_cache_mtime == current_mtime:
+            return _verif_lead_cache
+        with open(VERIF_LEAD_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        _verif_lead_cache = data
+        _verif_lead_cache_mtime = current_mtime
+        return _verif_lead_cache
+    except Exception as e:
+        logger.warning(f"Error loading verification lead-time cache: {e}")
     return {"entries": {}}
 
 
 def save_verif_lead_cache(payload: dict):
+    global _verif_lead_cache, _verif_lead_cache_mtime
     try:
         with open(VERIF_LEAD_CACHE_PATH, "w") as f:
             json.dump(payload, f, indent=2)
+        _verif_lead_cache = payload
+        _verif_lead_cache_mtime = VERIF_LEAD_CACHE_PATH.stat().st_mtime
     except Exception as e:
         logger.warning(f"Error saving verification lead-time cache: {e}")
 
@@ -1284,6 +1300,16 @@ Z500_GFS = Variable(
     category="upper_air",
     colormap="viridis",
     contour_levels=list(range(480, 600, 6))
+)
+
+DEWPOINT_2M_GFS = Variable(
+    name="dewpoint",
+    display_name="2m Dew Point",
+    units="F",
+    herbie_search=":DPT:2 m above ground:",
+    category="surface",
+    colormap="BrBG",
+    contour_levels=list(range(-40, 80, 5))
 )
 
 
@@ -3099,7 +3125,7 @@ def api_verification_by_lead_time():
                     "location": location_name,
                     "verification": cached.get("verification", {}),
                     "period": period,
-                    "monthly_active": period == 'monthly' and get_asos_data_span_days() >= 20
+                    "monthly_active": period == 'monthly'
                 })
 
         if period == 'monthly':
@@ -3123,7 +3149,7 @@ def api_verification_by_lead_time():
             "location": location_name,
             "verification": result,
             "period": period,
-            "monthly_active": period == 'monthly' and get_asos_data_span_days() >= 20
+            "monthly_active": period == 'monthly'
         })
     except Exception as e:
         logger.error(f"Error calculating lead-time verification: {e}")
@@ -6612,16 +6638,19 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
         temp_var = TEMP_2M_GFS
         mslp_var = MSLP_GFS
         precip_var = PRECIP_GFS
+        dewpoint_var = DEWPOINT_2M_GFS
     elif model_name.lower() == 'aifs':
         model = AIFSModel()
         temp_var = AIFS_VARIABLES['t2m']
         mslp_var = AIFS_VARIABLES['mslp']
         precip_var = AIFS_VARIABLES['tp']
+        dewpoint_var = AIFS_VARIABLES['d2m']
     elif model_name.lower() == 'ifs':
         model = IFSModel()
         temp_var = IFS_VARIABLES['t2m']
         mslp_var = IFS_VARIABLES['mslp']
         precip_var = IFS_VARIABLES['tp']
+        dewpoint_var = IFS_VARIABLES['d2m']
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -6641,7 +6670,7 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
 
     # Initialize result dict
     station_forecasts = {
-        s['station_id']: {'temps': [], 'mslps': [], 'precips': []}
+        s['station_id']: {'temps': [], 'mslps': [], 'precips': [], 'dewpoints': []}
         for s in stations
     }
 
@@ -6678,12 +6707,22 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
             broadcast_sync_log(f"  [{model_name.upper()}] WARNING: precip F{hour:03d} failed: {e}", 'warning')
             precip_vals = [None] * len(stations)
 
+        # Fetch dewpoint
+        try:
+            data = model.fetch_data(dewpoint_var, init_time, hour, region)
+            dewpoint_vals = extract_model_at_stations(data, stations)
+        except Exception as e:
+            logger.warning(f"{model_name.upper()} dewpoint F{hour} failed: {e}")
+            broadcast_sync_log(f"  [{model_name.upper()}] WARNING: dewpoint F{hour:03d} failed: {e}", 'warning')
+            dewpoint_vals = [None] * len(stations)
+
         # Store values
         for i, station in enumerate(stations):
             sid = station['station_id']
             station_forecasts[sid]['temps'].append(temp_vals[i])
             station_forecasts[sid]['mslps'].append(mslp_vals[i])
             station_forecasts[sid]['precips'].append(precip_vals[i])
+            station_forecasts[sid]['dewpoints'].append(dewpoint_vals[i])
 
     # Pad IFS with None for hours beyond its range
     if model_name.lower() == 'ifs':
@@ -6692,6 +6731,7 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
             station_forecasts[sid]['temps'].extend([None] * pad_count)
             station_forecasts[sid]['mslps'].extend([None] * pad_count)
             station_forecasts[sid]['precips'].extend([None] * pad_count)
+            station_forecasts[sid]['dewpoints'].extend([None] * pad_count)
 
     # Convert AIFS/IFS cumulative precipitation to interval totals (6-hour accumulation)
     if model_name.lower() in ['aifs', 'ifs']:
@@ -6741,13 +6781,6 @@ def api_asos_stations():
     except Exception as e:
         logger.error(f"Error fetching ASOS stations: {e}")
         return jsonify({"success": False, "error": str(e)})
-
-
-def _db_id_to_1min_id(db_id: str) -> str:
-    """Convert a 4-char METAR station ID (KIAD / PHOG) to 3-char 1-min ID (IAD / HOG)."""
-    if len(db_id) == 4 and db_id[0] in ("K", "P"):
-        return db_id[1:]
-    return db_id
 
 
 def _floor_to_cadence(dt: datetime, cadence_minutes: int) -> datetime:
@@ -6825,29 +6858,6 @@ def _clean_pressure_points(
         cleaned.append((dt, val))
 
     return cleaned
-
-
-def _filter_to_asos_1min_network(stations: list[dict]) -> list[dict]:
-    """
-    Keep only stations in IEM's canonical ASOS1MIN network.
-    """
-    if not stations:
-        return []
-    try:
-        one_min_ids = set(asos.fetch_asos_1min_station_list() or [])
-    except Exception:
-        one_min_ids = set()
-    if not one_min_ids:
-        return stations
-
-    filtered = []
-    for s in stations:
-        sid = str(s.get("station_id", "")).strip().upper()
-        if not sid:
-            continue
-        if _db_id_to_1min_id(sid) in one_min_ids:
-            filtered.append(s)
-    return filtered
 
 
 def _moving_average_nan(arr: np.ndarray, n: int) -> np.ndarray:
@@ -7045,379 +7055,6 @@ def _compute_station_perturbation(
     return p_prime, valid_mask
 
 
-def rebuild_asos_pressure_perturbation_cache(
-    hours: int = 24,
-    cadence_minutes: int = 5,
-    short_minutes: int = 10,
-    long_minutes: int = 180,
-) -> dict:
-    """
-    Build a standard ASOS pressure-perturbation snapshot.
-
-    Standard method:
-        p' = LP(short_minutes) - LP(long_minutes)
-    """
-    hours = max(1, min(72, int(hours)))
-    cadence_minutes = max(1, min(30, int(cadence_minutes)))
-    short_minutes = max(1, int(short_minutes))
-    long_minutes = max(short_minutes + 1, int(long_minutes))
-
-    db = asos.load_asos_forecasts_db()
-    stations_meta = db.get("stations", {})
-    if not stations_meta:
-        try:
-            stations_meta = asos.get_stations_dict()
-        except Exception:
-            stations_meta = {}
-
-    one_min_cache = asos.load_asos_1min_pressure_cache()
-    one_min_stations = one_min_cache.get("stations", {}) if one_min_cache else {}
-    if not one_min_stations:
-        raise ValueError("No 1-min ASOS pressure data available (runs overnight)")
-
-    station_raw = {}
-    total_obs_stations = len(one_min_stations)
-    stations_with_coords = 0
-    stations_with_points = 0
-    stations_with_consistent_cadence = 0
-    latest_time = None
-
-    for sid, sid_data in one_min_stations.items():
-        meta = _lookup_station_meta(stations_meta, sid)
-        lat = meta.get("lat")
-        lon = meta.get("lon")
-        if lat is None or lon is None:
-            continue
-        stations_with_coords += 1
-
-        points = []
-        for entry in sid_data.get("obs", []):
-            try:
-                ts_str, pres_mb = entry[0], entry[1]
-                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-                points.append((dt, float(pres_mb)))
-            except Exception:
-                continue
-
-        if len(points) < 6:
-            continue
-        stations_with_points += 1
-        stations_with_consistent_cadence += 1
-        points.sort(key=lambda x: x[0])
-        points = _clean_pressure_points(points)
-        if len(points) < 6:
-            continue
-        station_raw[sid] = {
-            "station_id": sid,
-            "name": meta.get("name", sid),
-            "state": meta.get("state", ""),
-            "lat": lat,
-            "lon": lon,
-            "points": points,
-        }
-        if latest_time is None or points[-1][0] > latest_time:
-            latest_time = points[-1][0]
-
-    if not station_raw or latest_time is None:
-        raise ValueError("No station pressure observations available")
-
-    cadence_sec = cadence_minutes * 60
-    short_n = max(1, int(round(short_minutes / cadence_minutes)))
-    win_n   = max(short_n + 1, int(round(long_minutes / cadence_minutes)))
-    n_pad   = win_n // 2 + 2   # just past the reflect zone; ~100 min at 5-min cadence
-
-    # Step end_time back by n_pad frames so the padded future window contains real
-    # observations, giving the centered LP filter valid data on both sides at the boundary.
-    raw_end  = _floor_to_cadence(latest_time, cadence_minutes)
-    end_time = raw_end - timedelta(minutes=cadence_minutes * n_pad)
-    start_time = end_time - timedelta(hours=hours)
-
-    frame_times = []
-    t = start_time
-    while t <= end_time:
-        frame_times.append(t)
-        t += timedelta(minutes=cadence_minutes)
-    frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
-
-    # Padded frame grid: n_pad extra frames on each side supply real observation
-    # data to the centered filter, eliminating boundary bias entirely.
-    pad_frame_start = start_time - timedelta(minutes=cadence_minutes * n_pad)
-    pad_frame_end   = end_time   + timedelta(minutes=cadence_minutes * n_pad)
-    pad_frame_times = []
-    t = pad_frame_start
-    while t <= pad_frame_end:
-        pad_frame_times.append(t)
-        t += timedelta(minutes=cadence_minutes)
-    pad_frame_ts = np.array([int(ft.timestamp()) for ft in pad_frame_times], dtype=np.float64)
-
-    # Observation selection: just outside the padded frame grid.
-    pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
-    pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
-
-    stations_out = []
-    stations_with_window = 0
-    stations_with_valid_frames = 0
-    for sid, payload in station_raw.items():
-        pts = payload["points"]
-        sel = [(dt, p) for dt, p in pts if pad_start <= dt <= pad_end]
-        if len(sel) < 6:
-            continue
-        stations_with_window += 1
-
-        ts = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
-        vals = np.array([p for _, p in sel], dtype=np.float64)
-
-        p_prime, valid_mask = _compute_station_perturbation(
-            ts, vals, frame_ts, pad_frame_ts, n_pad, cadence_sec,
-            short_n, win_n, "bandpass"
-        )
-        if valid_mask.sum() < 6:
-            continue
-        stations_with_valid_frames += 1
-
-        p_prime = _detrend_and_center(p_prime, valid_mask)
-
-        values = [None if not np.isfinite(v) else round(float(v), 3) for v in p_prime]
-        if all(v is None for v in values):
-            continue
-        # Null out individual frames with implausibly large perturbations (bad sensor / QC failure)
-        values = [None if (v is not None and abs(v) > 20) else v for v in values]
-        if all(v is None for v in values):
-            continue
-
-        station_entry = {
-            "station_id": payload["station_id"],
-            "name": payload["name"],
-            "state": payload["state"],
-            "lat": payload["lat"],
-            "lon": payload["lon"],
-            "values": values,
-        }
-        stations_out.append(station_entry)
-
-    if not stations_out:
-        raise ValueError(
-            "No perturbation values computed "
-            f"(obs_stations={total_obs_stations}, coords={stations_with_coords}, "
-            f"points={stations_with_points}, cadence={stations_with_consistent_cadence}, "
-            f"window={stations_with_window}, valid={stations_with_valid_frames})"
-        )
-
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "hours": hours,
-        "window_minutes": long_minutes,
-        "cadence_minutes": cadence_minutes,
-        "frames": [ft.isoformat() for ft in frame_times],
-        "latest_time": latest_time.isoformat(),
-        "method": {
-            "name": "band-pass perturbation",
-            "equation": f"p' = LP({short_minutes}m) - LP({long_minutes}m)",
-            "notes": "Standard gravity-wave perturbation cache for ASOS MSLP.",
-            "short_minutes": short_minutes,
-            "long_minutes": long_minutes,
-        },
-        "stations": stations_out,
-    }
-
-    return payload
-
-
-def append_asos_pressure_perturbation_history(latest_payload: dict) -> dict:
-    """
-    Append newly available frames from latest_payload into the persistent history file.
-    """
-    existing = load_asos_pressure_perturbation_cache()
-    if not existing or not existing.get("frames") or not existing.get("stations"):
-        with open(ASOS_PRESSURE_PERTURBATION_FILE, "w") as f:
-            json.dump(latest_payload, f)
-        return {
-            "station_count": len(latest_payload.get("stations", [])),
-            "frame_count": len(latest_payload.get("frames", [])),
-            "appended_frames": len(latest_payload.get("frames", [])),
-            "latest_time": latest_payload.get("latest_time"),
-            "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
-        }
-
-    old_frames = existing.get("frames", [])
-    new_frames = latest_payload.get("frames", [])
-    if not new_frames:
-        return {
-            "station_count": len(existing.get("stations", [])),
-            "frame_count": len(old_frames),
-            "appended_frames": 0,
-            "latest_time": existing.get("latest_time"),
-            "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
-        }
-
-    old_last = old_frames[-1] if old_frames else None
-    append_start = 0
-    if old_last is not None:
-        append_start = len(new_frames)
-        for i, ft in enumerate(new_frames):
-            if ft > old_last:
-                append_start = i
-                break
-    new_tail_frames = new_frames[append_start:]
-    n_new = len(new_tail_frames)
-
-    if n_new <= 0:
-        # Keep method metadata fresh even when there are no new frames.
-        existing["generated_at"] = latest_payload.get("generated_at", existing.get("generated_at"))
-        existing["latest_time"] = latest_payload.get("latest_time", existing.get("latest_time"))
-        existing["method"] = latest_payload.get("method", existing.get("method"))
-        with open(ASOS_PRESSURE_PERTURBATION_FILE, "w") as f:
-            json.dump(existing, f)
-        return {
-            "station_count": len(existing.get("stations", [])),
-            "frame_count": len(old_frames),
-            "appended_frames": 0,
-            "latest_time": existing.get("latest_time"),
-            "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
-        }
-
-    existing["frames"] = old_frames + new_tail_frames
-    existing["generated_at"] = latest_payload.get("generated_at", existing.get("generated_at"))
-    existing["latest_time"] = latest_payload.get("latest_time", existing.get("latest_time"))
-    existing["window_minutes"] = latest_payload.get("window_minutes", existing.get("window_minutes", 180))
-    existing["cadence_minutes"] = latest_payload.get("cadence_minutes", existing.get("cadence_minutes", 5))
-    existing["method"] = latest_payload.get("method", existing.get("method"))
-
-    old_frame_count = len(old_frames)
-    existing_stations = existing.get("stations", [])
-    by_sid = {s.get("station_id"): s for s in existing_stations if s.get("station_id")}
-
-    # Pad existing stations for newly appended frame slots.
-    for s in existing_stations:
-        vals = s.get("values", [])
-        if len(vals) < old_frame_count:
-            vals.extend([None] * (old_frame_count - len(vals)))
-        vals.extend([None] * n_new)
-        s["values"] = vals
-
-    # Write latest values into new slots.
-    for new_s in latest_payload.get("stations", []):
-        sid = new_s.get("station_id")
-        if not sid:
-            continue
-
-        tail_vals = (new_s.get("values", []) or [])[append_start:]
-        if len(tail_vals) < n_new:
-            tail_vals.extend([None] * (n_new - len(tail_vals)))
-        elif len(tail_vals) > n_new:
-            tail_vals = tail_vals[:n_new]
-
-        if sid not in by_sid:
-            vals = [None] * old_frame_count + tail_vals
-            station_entry = {
-                "station_id": sid,
-                "name": new_s.get("name", sid),
-                "state": new_s.get("state", ""),
-                "lat": new_s.get("lat"),
-                "lon": new_s.get("lon"),
-                "values": vals,
-            }
-            existing_stations.append(station_entry)
-            by_sid[sid] = station_entry
-            continue
-
-        target = by_sid[sid]
-        target["name"] = new_s.get("name", target.get("name", sid))
-        target["state"] = new_s.get("state", target.get("state", ""))
-        if new_s.get("lat") is not None:
-            target["lat"] = new_s.get("lat")
-        if new_s.get("lon") is not None:
-            target["lon"] = new_s.get("lon")
-
-        vals = target.get("values", [])
-        start_idx = old_frame_count
-        for i, v in enumerate(tail_vals):
-            if start_idx + i < len(vals):
-                vals[start_idx + i] = v
-        target["values"] = vals
-
-    existing["stations"] = existing_stations
-    with open(ASOS_PRESSURE_PERTURBATION_FILE, "w") as f:
-        json.dump(existing, f)
-
-    return {
-        "station_count": len(existing_stations),
-        "frame_count": len(existing.get("frames", [])),
-        "appended_frames": n_new,
-        "latest_time": existing.get("latest_time"),
-        "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
-    }
-
-
-def build_and_append_asos_pressure_perturbation_history(
-    hours: int = 24,
-    cadence_minutes: int = 5,
-    short_minutes: int = 10,
-    long_minutes: int = 180,
-) -> dict:
-    """Build latest snapshot and append newly available frames into history."""
-    latest = rebuild_asos_pressure_perturbation_cache(
-        hours=hours,
-        cadence_minutes=cadence_minutes,
-        short_minutes=short_minutes,
-        long_minutes=long_minutes,
-    )
-    stats = append_asos_pressure_perturbation_history(latest)
-    return {
-        "station_count": len(latest.get("stations", [])),
-        "frame_count": len(latest.get("frames", [])),  # snapshot frame count
-        "latest_time": latest.get("latest_time"),  # snapshot latest
-        "history_station_count": stats.get("station_count"),
-        "history_frame_count": stats.get("frame_count"),
-        "appended_frames": stats.get("appended_frames"),
-        "file": str(ASOS_PRESSURE_PERTURBATION_FILE),
-    }
-
-
-def load_asos_pressure_perturbation_cache(hours: int | None = None) -> dict | None:
-    """Load saved ASOS pressure perturbation cache if present."""
-    if not ASOS_PRESSURE_PERTURBATION_FILE.exists():
-        return None
-    try:
-        with open(ASOS_PRESSURE_PERTURBATION_FILE) as f:
-            data = json.load(f)
-        if not data:
-            return None
-
-        if hours is None:
-            return data
-
-        frames = data.get("frames", [])
-        if not frames:
-            return data
-        cadence = int(data.get("cadence_minutes", 5) or 5)
-        need = int(max(1, hours * 60 // max(1, cadence)) + 1)
-        if need >= len(frames):
-            return data
-
-        start_idx = len(frames) - need
-        sliced = {
-            **data,
-            "hours": hours,
-            "frames": frames[start_idx:],
-            "stations": [],
-        }
-        for s in data.get("stations", []):
-            vals = s.get("values", [])
-            sliced["stations"].append({
-                "station_id": s.get("station_id"),
-                "name": s.get("name"),
-                "state": s.get("state", ""),
-                "lat": s.get("lat"),
-                "lon": s.get("lon"),
-                "values": vals[start_idx:] if isinstance(vals, list) else [],
-            })
-        return sliced
-    except Exception as e:
-        logger.warning(f"Error loading ASOS pressure perturbation cache: {e}")
-        return None
-
-
 def rebuild_asos_metar_perturbation_cache(
     hours: int = 24,
     cadence_minutes: int = 5,
@@ -7427,7 +7064,7 @@ def rebuild_asos_metar_perturbation_cache(
     """
     Build a pressure-perturbation snapshot from the regular 5-min METAR observations
     already stored in asos_forecasts.json.  Near-real-time (~hours old) with ~2500 stations.
-    Same algorithm as rebuild_asos_pressure_perturbation_cache but uses METAR mslp.
+    Uses METAR mslp observations from the 5-min METAR pressure file.
     """
     hours          = max(1, min(240, int(hours)))
     cadence_minutes = max(1, min(30, int(cadence_minutes)))
@@ -7623,10 +7260,6 @@ def api_asos_gravity_waves():
         if method not in {"running_mean", "bandpass"}:
             method = "bandpass"
 
-        source = request.args.get("source", "metar").strip().lower()
-        if source not in {"metar", "1min"}:
-            source = "metar"
-
         requested_hours = max(1, min(24 * 366, requested_hours))
         # Keep on-the-fly computation bounded; historical requests should come from cache.
         hours = max(1, min(72, requested_hours))
@@ -7635,219 +7268,32 @@ def api_asos_gravity_waves():
 
         # Fast path: use precomputed standard band-pass cache.
         if method == "bandpass" and window_minutes == 180 and cadence_minutes == 5:
-            if source == "metar":
+            cached = load_asos_metar_perturbation_cache(hours=requested_hours)
+            if cached and cached.get("stations") and cached.get("frames"):
+                return jsonify({"success": True, **cached})
+            # Cache missing/stale — rebuild from METAR obs now.
+            try:
+                payload = rebuild_asos_metar_perturbation_cache(hours=24)
+                with open(ASOS_METAR_PERTURBATION_FILE, "w") as _f:
+                    json.dump(payload, _f)
                 cached = load_asos_metar_perturbation_cache(hours=requested_hours)
                 if cached and cached.get("stations") and cached.get("frames"):
                     return jsonify({"success": True, **cached})
-                # Cache missing/stale — rebuild from METAR obs now.
-                try:
-                    payload = rebuild_asos_metar_perturbation_cache(hours=24)
-                    with open(ASOS_METAR_PERTURBATION_FILE, "w") as _f:
-                        json.dump(payload, _f)
-                    cached = load_asos_metar_perturbation_cache(hours=requested_hours)
-                    if cached and cached.get("stations") and cached.get("frames"):
-                        return jsonify({"success": True, **cached})
-                except Exception as _cache_exc:
-                    logger.warning(f"METAR gravity-wave cache rebuild failed: {_cache_exc}")
-                return jsonify({"success": False, "error": "METAR pressure perturbation cache unavailable"}), 404
-            else:
-                cached = load_asos_pressure_perturbation_cache(hours=requested_hours)
-                if cached and cached.get("stations") and cached.get("frames"):
-                    cached = dict(cached)
-                    cached["stations"] = _filter_to_asos_1min_network(cached.get("stations", []))
-                    if not cached["stations"]:
-                        return jsonify({"success": False, "error": "No ASOS1MIN stations available in cache"}), 404
-                    return jsonify({"success": True, **cached})
-                # If cache is missing/stale, try rebuilding once so the tab can render immediately.
-                try:
-                    build_and_append_asos_pressure_perturbation_history(
-                        hours=24, cadence_minutes=5, short_minutes=10, long_minutes=180
-                    )
-                    cached = load_asos_pressure_perturbation_cache(hours=requested_hours)
-                    if cached and cached.get("stations") and cached.get("frames"):
-                        cached = dict(cached)
-                        cached["stations"] = _filter_to_asos_1min_network(cached.get("stations", []))
-                        if not cached["stations"]:
-                            return jsonify({"success": False, "error": "No ASOS1MIN stations available in cache"}), 404
-                        return jsonify({"success": True, **cached})
-                except Exception as _cache_exc:
-                    logger.warning(f"Gravity-wave cache rebuild fallback failed: {_cache_exc}")
+            except Exception as _cache_exc:
+                logger.warning(f"METAR gravity-wave cache rebuild failed: {_cache_exc}")
+            return jsonify({"success": False, "error": "METAR pressure perturbation cache unavailable"}), 404
 
-        db = asos.load_asos_forecasts_db()
-        stations_meta = db.get("stations", {})
-        if not stations_meta:
-            try:
-                stations_meta = asos.get_stations_dict()
-            except Exception:
-                stations_meta = {}
-
-        one_min_cache = asos.load_asos_1min_pressure_cache()
-        one_min_stations = one_min_cache.get("stations", {}) if one_min_cache else {}
-        if not one_min_stations:
-            return jsonify({"success": False, "error": "No 1-min ASOS pressure data available (runs overnight)"}), 404
-        one_min_ids = set(asos.fetch_asos_1min_station_list() or [])
-
-        station_raw = {}
-        dbg_total_obs_stations = len(one_min_stations)
-        dbg_stations_with_coords = 0
-        dbg_stations_with_points = 0
-        dbg_stations_with_consistent_cadence = 0
-        latest_time = None
-
-        for sid, sid_data in one_min_stations.items():
-            if one_min_ids and sid not in one_min_ids:
-                continue
-            meta = _lookup_station_meta(stations_meta, sid)
-            lat = meta.get("lat")
-            lon = meta.get("lon")
-            if lat is None or lon is None:
-                continue
-            dbg_stations_with_coords += 1
-
-            points = []
-            for entry in sid_data.get("obs", []):
-                try:
-                    ts_str, pres_mb = entry[0], entry[1]
-                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-                    points.append((dt, float(pres_mb)))
-                except Exception:
-                    continue
-
-            if len(points) < 6:
-                continue
-            dbg_stations_with_points += 1
-            dbg_stations_with_consistent_cadence += 1
-            points.sort(key=lambda x: x[0])
-            points = _clean_pressure_points(points)
-            if len(points) < 6:
-                continue
-            station_raw[sid] = {
-                "meta": {
-                    "station_id": sid,
-                    "name": meta.get("name", sid),
-                    "state": meta.get("state", ""),
-                    "lat": lat,
-                    "lon": lon,
-                },
-                "points": points,
-            }
-            if latest_time is None or points[-1][0] > latest_time:
-                latest_time = points[-1][0]
-
-        if not station_raw or latest_time is None:
-            return jsonify({"success": False, "error": "No station pressure observations available"}), 404
-
-        cadence_sec = cadence_minutes * 60
-        if method == "bandpass":
-            short_n = max(1, int(round(10 / cadence_minutes)))
-            win_n   = max(short_n + 1, int(round(180 / cadence_minutes)))
-        else:
-            short_n = 0
-            win_n   = max(3, int(round(window_minutes / cadence_minutes)))
-        n_pad = win_n // 2 + 2   # just past the reflect zone; ~100 min at 5-min cadence
-
-        # Step end_time back by n_pad frames so the padded future window contains real
-        # observations, giving the centered LP filter valid data on both sides at the boundary.
-        raw_end  = _floor_to_cadence(latest_time, cadence_minutes)
-        end_time = raw_end - timedelta(minutes=cadence_minutes * n_pad)
-        start_time = end_time - timedelta(hours=hours)
-
-        frame_times = []
-        t = start_time
-        while t <= end_time:
-            frame_times.append(t)
-            t += timedelta(minutes=cadence_minutes)
-        frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
-
-        # Padded frame grid: n_pad extra frames on each side supply real observation
-        # data to the centered filter, eliminating boundary bias entirely.
-        pad_frame_start = start_time - timedelta(minutes=cadence_minutes * n_pad)
-        pad_frame_end   = end_time   + timedelta(minutes=cadence_minutes * n_pad)
-        pad_frame_times = []
-        t = pad_frame_start
-        while t <= pad_frame_end:
-            pad_frame_times.append(t)
-            t += timedelta(minutes=cadence_minutes)
-        pad_frame_ts = np.array([int(ft.timestamp()) for ft in pad_frame_times], dtype=np.float64)
-
-        # Observation selection: just outside the padded frame grid.
-        pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
-        pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
-
-        stations_out = []
-        dbg_stations_with_window = 0
-        dbg_stations_with_valid_frames = 0
-        for sid, payload in station_raw.items():
-            pts = payload["points"]
-            sel = [(dt, p) for dt, p in pts if pad_start <= dt <= pad_end]
-            if len(sel) < 6:
-                continue
-            dbg_stations_with_window += 1
-
-            ts = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
-            vals = np.array([p for _, p in sel], dtype=np.float64)
-
-            # Project observations onto the regular frame grid (nearest obs within tolerance).
-            p_prime, valid_mask = _compute_station_perturbation(
-                ts, vals, frame_ts, pad_frame_ts, n_pad, cadence_sec,
-                short_n, win_n, method
+        # Non-default params: live computation from METAR observations.
+        try:
+            payload = rebuild_asos_metar_perturbation_cache(
+                hours=hours,
+                cadence_minutes=cadence_minutes,
+                short_minutes=10,
+                long_minutes=window_minutes,
             )
-            if valid_mask.sum() < 6:
-                continue
-            dbg_stations_with_valid_frames += 1
-            p_prime = _detrend_and_center(p_prime, valid_mask)
-            values = [None if not np.isfinite(v) else round(float(v), 3) for v in p_prime]
-            if all(v is None for v in values):
-                continue
-            # Null out individual frames with implausibly large perturbations (bad sensor / QC failure)
-            values = [None if (v is not None and abs(v) > 20) else v for v in values]
-            if all(v is None for v in values):
-                continue
-
-            station_entry = payload["meta"].copy()
-            station_entry["values"] = values
-            stations_out.append(station_entry)
-
-        if not stations_out:
-            return jsonify({
-                "success": False,
-                "error": "No perturbation values computed for selected window",
-                "debug": {
-                    "obs_stations": dbg_total_obs_stations,
-                    "with_coords": dbg_stations_with_coords,
-                    "with_points": dbg_stations_with_points,
-                    "with_5min_cadence": dbg_stations_with_consistent_cadence,
-                    "with_window_points": dbg_stations_with_window,
-                    "with_valid_frames": dbg_stations_with_valid_frames,
-                    "hours_requested": requested_hours,
-                    "hours_computed": hours,
-                    "window_minutes": window_minutes,
-                    "cadence_minutes": cadence_minutes,
-                    "method": method,
-                }
-            }), 404
-
-        return jsonify({
-            "success": True,
-            "hours": hours,
-            "window_minutes": window_minutes,
-            "cadence_minutes": cadence_minutes,
-            "frames": [ft.isoformat() for ft in frame_times],
-            "latest_time": latest_time.isoformat(),
-            "method": {
-                "name": "band-pass perturbation" if method == "bandpass" else "running-mean perturbation",
-                "equation": "p' = LP(10m) - LP(180m)" if method == "bandpass" else "p' = p - running_mean(p)",
-                "notes": (
-                    "Perturbation uses a difference-of-means band-pass filter (~10-180 min periods)."
-                    if method == "bandpass"
-                    else (
-                        "Perturbation is computed from station MSLP by subtracting a centered running "
-                        f"mean over {window_minutes} minutes."
-                    )
-                ),
-            },
-            "stations": stations_out,
-        })
+            return jsonify({"success": True, **payload})
+        except Exception as _live_exc:
+            return jsonify({"success": False, "error": str(_live_exc)}), 500
     except Exception as e:
         logger.error(f"Error computing gravity-wave perturbations: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -7865,13 +7311,9 @@ def api_gravity_wave_structures():
     Returns contour paths, detected structures, and propagation vector.
     """
     try:
-        source    = request.args.get('source', 'metar').strip().lower()
         frame_idx = int(request.args.get('frame', -1))
 
-        if source == 'metar':
-            cached = load_asos_metar_perturbation_cache()
-        else:
-            cached = load_asos_pressure_perturbation_cache()
+        cached = load_asos_metar_perturbation_cache()
 
         if not cached or not cached.get('stations') or not cached.get('frames'):
             return jsonify({'success': False, 'error': 'No perturbation data available'}), 404
@@ -7944,9 +7386,8 @@ def api_gravity_wave_structures():
 @app.route('/api/asos/gravity-wave-frame-times')
 def api_gravity_wave_frame_times():
     """Return the list of gravity wave frame timestamps for radar sync."""
-    source = request.args.get('source', 'metar').strip().lower()
     try:
-        cached = load_asos_metar_perturbation_cache() if source == 'metar' else load_asos_pressure_perturbation_cache()
+        cached = load_asos_metar_perturbation_cache()
         if not cached or not cached.get('frames'):
             return jsonify({'success': False, 'error': 'No data available'}), 404
         return jsonify({
@@ -7971,7 +7412,6 @@ def api_asos_export_gif():
 
     try:
         body         = request.get_json(force=True) or {}
-        source       = body.get('source', 'metar').strip().lower()
         frame_indices = body.get('frames', [])
         fps          = max(1, min(10, int(body.get('fps', 2))))
         include_analysis = bool(body.get('include_analysis', False))
@@ -7980,10 +7420,7 @@ def api_asos_export_gif():
             return jsonify({'error': 'No frames specified'}), 400
 
         # Load perturbation data
-        if source == 'metar':
-            cached = load_asos_metar_perturbation_cache()
-        else:
-            cached = load_asos_pressure_perturbation_cache()
+        cached = load_asos_metar_perturbation_cache()
 
         if not cached or not cached.get('stations') or not cached.get('frames'):
             return jsonify({'error': 'No perturbation data available'}), 404
@@ -8149,167 +7586,36 @@ def api_asos_station_pressure_detail():
         if not station_id:
             return jsonify({"success": False, "error": "station_id required"}), 400
 
-        source          = request.args.get('source', 'metar').strip().lower()
-        if source not in {'metar', '1min'}:
-            source = 'metar'
         hours          = max(1, min(72, int(request.args.get('hours', 24))))
         cadence_minutes = 5
         short_minutes   = 10
         long_minutes    = 180
 
         # --- METAR source: use dedicated 5-min pressure file ---
-        if source == 'metar':
-            pressure_cache = asos.load_asos_metar_pressure_cache()
-            sid_data = (pressure_cache or {}).get("stations", {}).get(station_id, {})
-            points = []
-            for entry in sid_data.get("obs", []):
-                try:
-                    ts_str, pres_mb = entry[0], entry[1]
-                    dt = _parse_iso_utc(ts_str.replace(" ", "T") + "+00:00")
-                    points.append((dt, float(pres_mb)))
-                except Exception:
-                    continue
-            if len(points) < 6:
-                return jsonify({"success": False, "error": f"No METAR pressure data for {station_id}"}), 404
-
-            meta = {
-                "name":  sid_data.get("name", station_id),
-                "state": sid_data.get("state", ""),
-                "lat":   sid_data.get("lat"),
-                "lon":   sid_data.get("lon"),
-            }
-
-            points.sort(key=lambda x: x[0])
-            points = _clean_pressure_points(points)
-            if len(points) < 6:
-                return jsonify({"success": False, "error": f"Insufficient valid METAR pressure data for {station_id}"}), 404
-            latest_time = points[-1][0]
-
-            cadence_sec = cadence_minutes * 60
-            short_n = max(1, int(round(short_minutes / cadence_minutes)))
-            win_n   = max(short_n + 1, int(round(long_minutes / cadence_minutes)))
-            n_pad   = win_n // 2 + 2
-
-            raw_end  = _floor_to_cadence(latest_time, cadence_minutes)
-            end_time = raw_end - timedelta(minutes=cadence_minutes * n_pad)
-            start_time = end_time - timedelta(hours=hours)
-
-            frame_times = []
-            t = start_time
-            while t <= end_time:
-                frame_times.append(t)
-                t += timedelta(minutes=cadence_minutes)
-            frame_ts = np.array([int(ft.timestamp()) for ft in frame_times], dtype=np.float64)
-
-            pad_frame_start = start_time  - timedelta(minutes=cadence_minutes * n_pad)
-            pad_frame_end   = end_time    + timedelta(minutes=cadence_minutes * n_pad)
-            pad_frame_times = []
-            t = pad_frame_start
-            while t <= pad_frame_end:
-                pad_frame_times.append(t)
-                t += timedelta(minutes=cadence_minutes)
-            pad_frame_ts = np.array([int(pt.timestamp()) for pt in pad_frame_times], dtype=np.float64)
-
-            pad_start = pad_frame_start - timedelta(seconds=cadence_sec)
-            pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
-            sel = [(dt, p) for dt, p in points if pad_start <= dt <= pad_end]
-            if len(sel) < 6:
-                return jsonify({"success": False, "error": "Insufficient METAR observations in display window"}), 404
-
-            obs_ts   = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
-            obs_vals = np.array([p for _, p in sel],               dtype=np.float64)
-
-            pad_raw, pad_mask = _build_frame_series_with_gap_mask(
-                obs_ts, obs_vals, pad_frame_ts, cadence_sec, max_gap_sec=3600.0
-            )
-            lp_short_pad = _moving_average_nan(pad_raw, short_n)
-            lp_long_pad  = _moving_average_nan(pad_raw, win_n)
-            pad_prime    = lp_short_pad - lp_long_pad
-            pad_prime[~pad_mask] = np.nan
-
-            n = len(frame_ts)
-            raw_disp      = pad_raw[n_pad : n_pad + n]
-            lp_short_disp = lp_short_pad[n_pad : n_pad + n]
-            lp_long_disp  = lp_long_pad[n_pad : n_pad + n]
-            prime_disp    = pad_prime[n_pad : n_pad + n]
-
-            def _to_list(arr):
-                return [None if not np.isfinite(v) else round(float(v), 3) for v in arr]
-
-            disp_obs = [
-                {"t": dt.isoformat(), "v": round(p, 3)}
-                for dt, p in points
-                if start_time <= dt <= end_time
-            ]
-
-            return jsonify({
-                "success": True,
-                "source": "metar",
-                "station_id": station_id,
-                "name": meta.get("name", station_id),
-                "state": meta.get("state", ""),
-                "lat": meta.get("lat"),
-                "lon": meta.get("lon"),
-                "frames": [ft.isoformat() for ft in frame_times],
-                "raw": _to_list(raw_disp),
-                "lp_short": _to_list(lp_short_disp),
-                "lp_long": _to_list(lp_long_disp),
-                "perturbation": _to_list(prime_disp),
-                "obs": disp_obs,
-            })
-
-        # --- 1-min source: use IEM 1-min pressure archive ---
-        db = asos.load_asos_forecasts_db()
-        stations_meta = db.get("stations", {})
-        meta = _lookup_station_meta(stations_meta, station_id)
-
-        one_min_cache = asos.load_asos_1min_pressure_cache()
-        one_min_stations = one_min_cache.get("stations", {}) if one_min_cache else {}
-        one_min_id = _db_id_to_1min_id(station_id)
-
+        pressure_cache = asos.load_asos_metar_pressure_cache()
+        sid_data = (pressure_cache or {}).get("stations", {}).get(station_id, {})
         points = []
-        if one_min_id in one_min_stations:
-            for entry in one_min_stations[one_min_id].get("obs", []):
-                try:
-                    ts_str, pres_mb = entry[0], entry[1]
-                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-                    points.append((dt, float(pres_mb)))
-                except Exception:
-                    continue
-        else:
-            # Raw 1-min observations not in current cache (typically a failed IEM batch
-            # request during the overnight sync).  Fall back to the precomputed perturbation
-            # history, which still holds valid values from the last successful sync for
-            # this station.
-            pert_cache = load_asos_pressure_perturbation_cache(hours=hours)
-            if pert_cache and pert_cache.get("stations"):
-                station_entry = next(
-                    (s for s in pert_cache["stations"] if s.get("station_id") == one_min_id),
-                    None,
-                )
-                if station_entry:
-                    pert_values = station_entry.get("values", [])
-                    non_null = [v for v in pert_values if v is not None]
-                    if len(non_null) >= 6:
-                        return jsonify({
-                            "success": True,
-                            "perturbation_only": True,
-                            "station_id": station_id,
-                            "name": station_entry.get("name") or meta.get("name", station_id),
-                            "state": station_entry.get("state") or meta.get("state", ""),
-                            "lat": station_entry.get("lat") or meta.get("lat"),
-                            "lon": station_entry.get("lon") or meta.get("lon"),
-                            "frames": pert_cache.get("frames", []),
-                            "perturbation": pert_values,
-                        })
-            return jsonify({"success": False, "error": f"No 1-min pressure data for {station_id}"}), 404
+        for entry in sid_data.get("obs", []):
+            try:
+                ts_str, pres_mb = entry[0], entry[1]
+                dt = _parse_iso_utc(ts_str.replace(" ", "T") + "+00:00")
+                points.append((dt, float(pres_mb)))
+            except Exception:
+                continue
+        if len(points) < 6:
+            return jsonify({"success": False, "error": f"No METAR pressure data for {station_id}"}), 404
+
+        meta = {
+            "name":  sid_data.get("name", station_id),
+            "state": sid_data.get("state", ""),
+            "lat":   sid_data.get("lat"),
+            "lon":   sid_data.get("lon"),
+        }
 
         points.sort(key=lambda x: x[0])
         points = _clean_pressure_points(points)
-
         if len(points) < 6:
-            return jsonify({"success": False, "error": "Insufficient valid pressure observations"}), 404
-
+            return jsonify({"success": False, "error": f"Insufficient valid METAR pressure data for {station_id}"}), 404
         latest_time = points[-1][0]
 
         cadence_sec = cadence_minutes * 60
@@ -8341,12 +7647,11 @@ def api_asos_station_pressure_detail():
         pad_end   = pad_frame_end   + timedelta(seconds=cadence_sec)
         sel = [(dt, p) for dt, p in points if pad_start <= dt <= pad_end]
         if len(sel) < 6:
-            return jsonify({"success": False, "error": "Insufficient observations in display window"}), 404
+            return jsonify({"success": False, "error": "Insufficient METAR observations in display window"}), 404
 
         obs_ts   = np.array([dt.timestamp() for dt, _ in sel], dtype=np.float64)
         obs_vals = np.array([p for _, p in sel],               dtype=np.float64)
 
-        # Build padded frame series for each signal
         pad_raw, pad_mask = _build_frame_series_with_gap_mask(
             obs_ts, obs_vals, pad_frame_ts, cadence_sec, max_gap_sec=3600.0
         )
@@ -8364,7 +7669,6 @@ def api_asos_station_pressure_detail():
         def _to_list(arr):
             return [None if not np.isfinite(v) else round(float(v), 3) for v in arr]
 
-        # Actual observations within the display window for scatter plot
         disp_obs = [
             {"t": dt.isoformat(), "v": round(p, 3)}
             for dt, p in points
@@ -8373,6 +7677,7 @@ def api_asos_station_pressure_detail():
 
         return jsonify({
             "success": True,
+            "source": "metar",
             "station_id": station_id,
             "name": meta.get("name", station_id),
             "state": meta.get("state", ""),
@@ -8385,6 +7690,7 @@ def api_asos_station_pressure_detail():
             "perturbation": _to_list(prime_disp),
             "obs": disp_obs,
         })
+
     except Exception as e:
         logger.error(f"Error fetching station pressure detail: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -8879,6 +8185,8 @@ def api_asos_station_verification():
                 "mslp_bias": raw_result["mslp_bias"],
                 "precip_mae": raw_result["precip_mae"],
                 "precip_bias": raw_result["precip_bias"],
+                "dewpoint_mae": raw_result.get("dewpoint_mae", []),
+                "dewpoint_bias": raw_result.get("dewpoint_bias", []),
             }
         else:
             # Use the precomputed verification cache which uses composite observation matching.
@@ -8896,7 +8204,19 @@ def api_asos_station_verification():
                 "precip_mae": raw_result["precip_mae"],
                 "precip_bias": raw_result["precip_bias"],
                 "precip_count": raw_result.get("precip_count", []),
+                "dewpoint_mae": raw_result.get("dewpoint_mae", []),
+                "dewpoint_bias": raw_result.get("dewpoint_bias", []),
+                "dewpoint_count": raw_result.get("dewpoint_count", []),
             }
+
+        # NWS forecasts only go to 168h (7 days) — strip any stale longer-range entries
+        if model == 'nws':
+            lead_times = verification_data['lead_times']
+            keep = [lt <= 168 for lt in lead_times]
+            verification_data['lead_times'] = [lt for lt, k in zip(lead_times, keep) if k]
+            for key, val in verification_data.items():
+                if key != 'lead_times' and isinstance(val, list):
+                    verification_data[key] = [v for v, k in zip(val, keep) if k]
 
         return jsonify({
             "success": True,
@@ -9034,33 +8354,40 @@ def api_asos_station_obs_timeseries():
                 return best_val
 
             obs_temp = _nearest_var('temp', max_delta_minutes=90)
+            obs_dewpoint = _nearest_var('dewpoint', max_delta_minutes=90)
             # For precip, use 6-hr accumulation logic (synoptic times)
             obs = asos.get_stored_observation(db, station_id, valid_time, max_delta_minutes=70)
             obs_precip = obs.get("precip_6hr") if obs else None
 
             temp_biases = {}
             precip_biases = {}
+            dewpoint_biases = {}
             for m in models:
                 model_data = run_data.get(m, {})
                 fcst = model_data.get(station_id)
                 if not fcst:
                     temp_biases[m] = None
                     precip_biases[m] = None
+                    dewpoint_biases[m] = None
                     continue
 
                 fcst_temps = fcst.get("temps", [])
                 fcst_precips = fcst.get("precips", [])
+                fcst_dewpoints = fcst.get("dewpoints", [])
                 fcst_temp = fcst_temps[idx] if idx < len(fcst_temps) else None
                 fcst_precip = fcst_precips[idx] if idx < len(fcst_precips) else None
+                fcst_dewpoint = fcst_dewpoints[idx] if idx < len(fcst_dewpoints) else None
 
                 temp_biases[m] = (fcst_temp - obs_temp) if (fcst_temp is not None and obs_temp is not None) else None
                 precip_biases[m] = (fcst_precip - obs_precip) if (fcst_precip is not None and obs_precip is not None) else None
+                dewpoint_biases[m] = (fcst_dewpoint - obs_dewpoint) if (fcst_dewpoint is not None and obs_dewpoint is not None) else None
 
             # Keep timestamps where at least one variable/model bias is available.
             if (
-                obs_temp is None and obs_precip is None
+                obs_temp is None and obs_precip is None and obs_dewpoint is None
                 and all(v is None for v in temp_biases.values())
                 and all(v is None for v in precip_biases.values())
+                and all(v is None for v in dewpoint_biases.values())
             ):
                 continue
 
@@ -9068,8 +8395,10 @@ def api_asos_station_obs_timeseries():
                 valid_time.astimezone(timezone.utc).isoformat(),
                 obs_temp,
                 obs_precip,
+                obs_dewpoint,
                 temp_biases,
                 precip_biases,
+                dewpoint_biases,
             ))
 
         if not records:
@@ -9080,11 +8409,13 @@ def api_asos_station_obs_timeseries():
         times = [r[0] for r in records]
         obs_temps = [r[1] for r in records]
         obs_precips = [r[2] for r in records]
+        obs_dewpoints = [r[3] for r in records]
 
         model_biases = {
             m: {
-                "temp_bias": [r[3].get(m) for r in records],
-                "precip_bias": [r[4].get(m) for r in records],
+                "temp_bias": [r[4].get(m) for r in records],
+                "precip_bias": [r[5].get(m) for r in records],
+                "dewpoint_bias": [r[6].get(m) for r in records],
             }
             for m in models
         }
@@ -9098,8 +8429,10 @@ def api_asos_station_obs_timeseries():
             "times": list(times),
             "obs_temps": list(obs_temps),
             "obs_precips": list(obs_precips),
+            "obs_dewpoints": list(obs_dewpoints),
             "temp_bias": model_biases[model]["temp_bias"],
             "precip_bias": model_biases[model]["precip_bias"],
+            "dewpoint_bias": model_biases[model]["dewpoint_bias"],
             "model_biases": model_biases
         })
     except Exception as e:
@@ -9215,11 +8548,18 @@ def api_asos_verification_time_series():
     lead_time = int(request.args.get('lead_time', 24))
     days_back = int(request.args.get('days_back', 30))
 
+    cache_key = f"ts|{variable}|{lead_time}|{days_back}"
+    cache_ttl = 3600
+    if cache_key in _verification_cache:
+        if time.time() - _verification_cache_time.get(cache_key, 0) < cache_ttl:
+            return jsonify(_verification_cache[cache_key])
+
     try:
         gfs_data = asos.get_verification_time_series_from_cache('gfs', variable, lead_time, days_back)
         aifs_data = asos.get_verification_time_series_from_cache('aifs', variable, lead_time, days_back)
         ifs_data = asos.get_verification_time_series_from_cache('ifs', variable, lead_time, days_back)
-        nws_data = asos.get_verification_time_series_from_cache('nws', variable, lead_time, days_back)
+        include_nws = variable in ('temp', 'precip', 'dewpoint')
+        nws_data = asos.get_verification_time_series_from_cache('nws', variable, lead_time, days_back) if include_nws else None
 
         # Check for errors
         if "error" in gfs_data:
@@ -9227,18 +8567,25 @@ def api_asos_verification_time_series():
 
         # Calculate daily winners based on MAE
         winner_counts = {"GFS": 0, "AIFS": 0, "IFS": 0, "NWS": 0, "Tie": 0}
+        def _safe_get(arr, i):
+            return arr[i] if isinstance(arr, list) and i < len(arr) else None
 
         for i in range(len(gfs_data["mae"])):
             # Get MAE values for this date
             maes = []
-            if gfs_data["mae"][i] is not None:
-                maes.append(("GFS", gfs_data["mae"][i]))
-            if aifs_data["mae"][i] is not None:
-                maes.append(("AIFS", aifs_data["mae"][i]))
-            if ifs_data["mae"][i] is not None:
-                maes.append(("IFS", ifs_data["mae"][i]))
-            if nws_data["mae"][i] is not None:
-                maes.append(("NWS", nws_data["mae"][i]))
+            gfs_mae = _safe_get(gfs_data.get("mae"), i)
+            aifs_mae = _safe_get(aifs_data.get("mae"), i)
+            ifs_mae = _safe_get(ifs_data.get("mae"), i)
+            nws_mae = _safe_get(nws_data.get("mae"), i) if include_nws and nws_data else None
+
+            if gfs_mae is not None:
+                maes.append(("GFS", gfs_mae))
+            if aifs_mae is not None:
+                maes.append(("AIFS", aifs_mae))
+            if ifs_mae is not None:
+                maes.append(("IFS", ifs_mae))
+            if nws_mae is not None:
+                maes.append(("NWS", nws_mae))
 
             # Find winner (lowest MAE)
             if maes:
@@ -9250,7 +8597,7 @@ def api_asos_verification_time_series():
                     winner_counts["Tie"] += 1
 
         # Combine data (use GFS dates as the baseline)
-        return jsonify({
+        result = {
             "success": True,
             "dates": gfs_data["dates"],
             "gfs": {
@@ -9268,16 +8615,20 @@ def api_asos_verification_time_series():
                 "bias": ifs_data["bias"],
                 "counts": ifs_data["counts"]
             },
-            "nws": {
-                "mae": nws_data["mae"],
-                "bias": nws_data["bias"],
-                "counts": nws_data["counts"]
-            },
             "winner_counts": winner_counts,
             "variable": variable,
             "lead_time": lead_time,
             "days_back": days_back
-        })
+        }
+        if include_nws and nws_data:
+            result["nws"] = {
+                "mae": nws_data.get("mae", []),
+                "bias": nws_data.get("bias", []),
+                "counts": nws_data.get("counts", [])
+            }
+        _verification_cache[cache_key] = result
+        _verification_cache_time[cache_key] = time.time()
+        return jsonify(result)
 
     except Exception as e:
         logger.error(f"Error getting ASOS verification time series: {e}")
@@ -9294,6 +8645,12 @@ def api_asos_mean_verification():
         period = 'all'
     valid_hour_str = request.args.get('valid_hour', '').strip()
     valid_hour = int(valid_hour_str) if valid_hour_str else None
+
+    cache_key = f"mean_verif|{period}|{valid_hour}"
+    cache_ttl = 3600  # 1 hour
+    if cache_key in _verification_cache:
+        if time.time() - _verification_cache_time.get(cache_key, 0) < cache_ttl:
+            return jsonify(_verification_cache[cache_key])
 
     try:
         if period == 'monthly':
@@ -9371,6 +8728,14 @@ def api_asos_mean_verification():
             "ifs_precip_bias": filter_array(ifs_results["precip_bias"], filtered_indices),
             "nws_precip_mae": filter_array(nws_results["precip_mae"], filtered_indices),
             "nws_precip_bias": filter_array(nws_results["precip_bias"], filtered_indices),
+            "gfs_dewpoint_mae": filter_array(gfs_results["dewpoint_mae"], filtered_indices),
+            "gfs_dewpoint_bias": filter_array(gfs_results["dewpoint_bias"], filtered_indices),
+            "aifs_dewpoint_mae": filter_array(aifs_results["dewpoint_mae"], filtered_indices),
+            "aifs_dewpoint_bias": filter_array(aifs_results["dewpoint_bias"], filtered_indices),
+            "ifs_dewpoint_mae": filter_array(ifs_results["dewpoint_mae"], filtered_indices),
+            "ifs_dewpoint_bias": filter_array(ifs_results["dewpoint_bias"], filtered_indices),
+            "nws_dewpoint_mae": filter_array(nws_results["dewpoint_mae"], filtered_indices),
+            "nws_dewpoint_bias": filter_array(nws_results["dewpoint_bias"], filtered_indices),
         }
 
         # Get cache timestamp
@@ -9393,7 +8758,7 @@ def api_asos_mean_verification():
             cache = asos.load_verification_cache()
             cache_timestamp = cache.get("last_updated") if cache else None
 
-        return jsonify({
+        result = {
             "success": True,
             "verification": combined_verification,
             "cache_timestamp": cache_timestamp,
@@ -9401,7 +8766,10 @@ def api_asos_mean_verification():
             "monthly_active": period == 'monthly',
             "window_start": window_start,
             "window_end": window_end
-        })
+        }
+        _verification_cache[cache_key] = result
+        _verification_cache_time[cache_key] = time.time()
+        return jsonify(result)
 
     except Exception as e:
         logger.error(f"Error getting mean ASOS verification: {e}")
@@ -10052,6 +9420,20 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 broadcast_sync_log("Rebuilding ASOS verification cache...", 'info')
                 asos.precompute_verification_cache()
                 broadcast_sync_log("ASOS verification cache updated", 'success')
+
+                # Publish static GitHub Pages site after every verification rebuild
+                try:
+                    broadcast_sync_log("Publishing verification site to GitHub Pages...", 'info')
+                    import export_verification_site as evs
+                    evs.generate_site()
+                    pushed = evs.push_to_github_pages()
+                    if pushed:
+                        broadcast_sync_log("GitHub Pages site published", 'success')
+                    else:
+                        broadcast_sync_log("GitHub Pages: no changes (site already current)", 'info')
+                except Exception as _pages_exc:
+                    broadcast_sync_log(f"GitHub Pages publish failed (non-fatal): {_pages_exc}", 'warning')
+                    logger.warning(f"GitHub Pages publish failed: {_pages_exc}", exc_info=True)
             else:
                 broadcast_sync_log(f"Monthly ASOS cache is {_monthly_age_hours:.1f}h old, skipping rebuild", 'info')
 

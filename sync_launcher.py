@@ -100,28 +100,8 @@ with open(log_file, 'w') as f:
 
     try:
         from app import run_master_sync
-        import asos as asos_module
         results = run_master_sync()
         f.write(f"Master sync results:\\n{results}\\n")
-
-        # Sync 1-min pressure data and rebuild perturbation cache overnight only
-        if datetime.now().hour < 6:
-            f.write("Overnight run detected — syncing 1-min ASOS pressure data...\\n")
-            try:
-                one_min_result = asos_module.sync_asos_1min_pressure(lookback_hours=72)
-                f.write(f"1-min pressure sync: {one_min_result}\\n")
-            except Exception as _e:
-                f.write(f"1-min pressure sync failed: {_e}\\n")
-
-            f.write("Rebuilding pressure perturbation cache...\\n")
-            try:
-                from app import build_and_append_asos_pressure_perturbation_history
-                pp = build_and_append_asos_pressure_perturbation_history(
-                    hours=24, cadence_minutes=5, short_minutes=10, long_minutes=180
-                )
-                f.write(f"Perturbation cache rebuilt: {pp}\\n")
-            except Exception as _e:
-                f.write(f"Perturbation cache rebuild failed: {_e}\\n")
 
         warnings = _check_results(results)
         if warnings:

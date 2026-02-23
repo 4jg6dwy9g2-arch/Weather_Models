@@ -59,33 +59,41 @@ def fetch_all_data(rebuild_monthly: bool = True):
             lead_times = gfs.get('lead_times', [])
 
             verification = {
-                'lead_times':       lead_times,
-                'gfs_run_count':    [gfs_rc.get(int(lt), 0)  for lt in lead_times],
-                'aifs_run_count':   [aifs_rc.get(int(lt), 0) for lt in lead_times],
-                'ifs_run_count':    [ifs_rc.get(int(lt), 0)  for lt in lead_times],
-                'nws_run_count':    [nws_rc.get(int(lt), 0)  for lt in lead_times],
-                'gfs_temp_mae':     gfs.get('temp_mae', []),
-                'gfs_temp_bias':    gfs.get('temp_bias', []),
-                'aifs_temp_mae':    aifs.get('temp_mae', []),
-                'aifs_temp_bias':   aifs.get('temp_bias', []),
-                'ifs_temp_mae':     ifs.get('temp_mae', []),
-                'ifs_temp_bias':    ifs.get('temp_bias', []),
-                'nws_temp_mae':     nws.get('temp_mae', []),
-                'nws_temp_bias':    nws.get('temp_bias', []),
-                'gfs_mslp_mae':     gfs.get('mslp_mae', []),
-                'gfs_mslp_bias':    gfs.get('mslp_bias', []),
-                'aifs_mslp_mae':    aifs.get('mslp_mae', []),
-                'aifs_mslp_bias':   aifs.get('mslp_bias', []),
-                'ifs_mslp_mae':     ifs.get('mslp_mae', []),
-                'ifs_mslp_bias':    ifs.get('mslp_bias', []),
-                'gfs_precip_mae':   gfs.get('precip_mae', []),
-                'gfs_precip_bias':  gfs.get('precip_bias', []),
-                'aifs_precip_mae':  aifs.get('precip_mae', []),
-                'aifs_precip_bias': aifs.get('precip_bias', []),
-                'ifs_precip_mae':   ifs.get('precip_mae', []),
-                'ifs_precip_bias':  ifs.get('precip_bias', []),
-                'nws_precip_mae':   nws.get('precip_mae', []),
-                'nws_precip_bias':  nws.get('precip_bias', []),
+                'lead_times':           lead_times,
+                'gfs_run_count':        [gfs_rc.get(int(lt), 0)  for lt in lead_times],
+                'aifs_run_count':       [aifs_rc.get(int(lt), 0) for lt in lead_times],
+                'ifs_run_count':        [ifs_rc.get(int(lt), 0)  for lt in lead_times],
+                'nws_run_count':        [nws_rc.get(int(lt), 0)  for lt in lead_times],
+                'gfs_temp_mae':         gfs.get('temp_mae', []),
+                'gfs_temp_bias':        gfs.get('temp_bias', []),
+                'aifs_temp_mae':        aifs.get('temp_mae', []),
+                'aifs_temp_bias':       aifs.get('temp_bias', []),
+                'ifs_temp_mae':         ifs.get('temp_mae', []),
+                'ifs_temp_bias':        ifs.get('temp_bias', []),
+                'nws_temp_mae':         nws.get('temp_mae', []),
+                'nws_temp_bias':        nws.get('temp_bias', []),
+                'gfs_precip_mae':       gfs.get('precip_mae', []),
+                'gfs_precip_bias':      gfs.get('precip_bias', []),
+                'aifs_precip_mae':      aifs.get('precip_mae', []),
+                'aifs_precip_bias':     aifs.get('precip_bias', []),
+                'ifs_precip_mae':       ifs.get('precip_mae', []),
+                'ifs_precip_bias':      ifs.get('precip_bias', []),
+                'nws_precip_mae':       nws.get('precip_mae', []),
+                'nws_precip_bias':      nws.get('precip_bias', []),
+                'gfs_dewpoint_mae':     gfs.get('dewpoint_mae', []),
+                'gfs_dewpoint_bias':    gfs.get('dewpoint_bias', []),
+                'aifs_dewpoint_mae':    aifs.get('dewpoint_mae', []),
+                'aifs_dewpoint_bias':   aifs.get('dewpoint_bias', []),
+                'ifs_dewpoint_mae':     ifs.get('dewpoint_mae', []),
+                'ifs_dewpoint_bias':    ifs.get('dewpoint_bias', []),
+                'nws_dewpoint_mae':     nws.get('dewpoint_mae', []),
+                'nws_dewpoint_bias':    nws.get('dewpoint_bias', []),
+                'gfs_mslp_mae':         gfs.get('mslp_mae', []),
+                'gfs_mslp_bias':        gfs.get('mslp_bias', []),
+                'aifs_mslp_mae':        aifs.get('mslp_mae', []),
+                'aifs_mslp_bias':       aifs.get('mslp_bias', []),
+                'ifs_mslp_mae':         ifs.get('mslp_mae', []),
+                'ifs_mslp_bias':        ifs.get('mslp_bias', []),
             }
             data[key] = verification
 
@@ -147,36 +155,31 @@ def generate_html(data: dict, use_monthly: bool = False) -> str:
 <table class="table table-hover table-sm mb-0">
 <thead>
   <tr>
-    <th>Lead</th><th>Runs</th>
-    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Temp (°F)</th>
-    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Temp (°F)</th>
-    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Temp (°F)</th>
-    <th colspan="2" class="text-center bg-dark bg-opacity-10">NWS Temp (°F)</th>
-    <th>Win</th>
-    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Pres (mb)</th>
-    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Pres (mb)</th>
-    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Pres (mb)</th>
-    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Precip (in)</th>
-    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Precip (in)</th>
-    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Precip (in)</th>
-    <th colspan="2" class="text-center bg-dark bg-opacity-10">NWS Precip (in)</th>
-    <th>Win</th>
+    <th rowspan="2">Lead</th><th rowspan="2">Runs</th>
+    <th colspan="5" class="text-center border-start">Temp (°F)</th>
+    <th colspan="5" class="text-center border-start">Precip (in)</th>
+    <th colspan="5" class="text-center border-start">Dew Point (°F)</th>
+    <th colspan="3" class="text-center border-start">Pressure (mb)</th>
   </tr>
   <tr>
-    <th></th><th></th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th></th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th class="text-center">MAE</th><th class="text-center">Bias</th>
-    <th></th>
+    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+    <th class="text-center bg-success bg-opacity-10">IFS</th>
+    <th class="text-center bg-dark bg-opacity-10">NWS</th>
+    <th class="text-center">Win</th>
+    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+    <th class="text-center bg-success bg-opacity-10">IFS</th>
+    <th class="text-center bg-dark bg-opacity-10">NWS</th>
+    <th class="text-center">Win</th>
+    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+    <th class="text-center bg-success bg-opacity-10">IFS</th>
+    <th class="text-center bg-dark bg-opacity-10">NWS</th>
+    <th class="text-center">Win</th>
+    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+    <th class="text-center bg-success bg-opacity-10">IFS</th>
   </tr>
 </thead>
 <tbody id="tbody"></tbody>
@@ -199,109 +202,96 @@ function pctMae(cur, base) {{
   if (pct === 0) return '';
   return ` <span style="color:${{pct < 0 ? 'green' : 'red'}};font-size:0.7em">${{pct > 0 ? '+' : ''}}${{pct}}%</span>`;
 }}
-function pctBias(cur, base) {{
-  if (cur == null || base == null || base === 0) return '';
-  const pct = Math.round((Math.abs(cur) - Math.abs(base)) / Math.abs(base) * 100);
-  if (pct === 0) return '';
-  return ` <span style="color:${{pct < 0 ? 'green' : 'red'}};font-size:0.7em">${{pct > 0 ? '+' : ''}}${{pct}}%</span>`;
+
+function winner(models) {{
+  const valid = models.filter(m => m.mae != null);
+  if (!valid.length) return ['--', 'badge bg-secondary'];
+  const mn = Math.min(...valid.map(m => m.mae));
+  const ws = valid.filter(m => m.mae === mn);
+  return ws.length === 1 ? [ws[0].n, ws[0].cls] : ['Tie', 'badge bg-secondary'];
 }}
 
 function renderTable() {{
   const period = document.getElementById('periodToggle').checked ? 'monthly' : 'all';
   const vh = document.querySelector('input[name="validHour"]:checked').value;
+  const metric = document.querySelector('input[name="tableMetric"]:checked').value;
+  const isMae = metric === 'mae';
   const key = `${{period}}_${{vh === '' ? 'all' : vh}}`;
   const v = ALL_DATA[key];
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = '';
 
   if (!v || !v.lead_times || v.lead_times.length === 0) {{
-    tbody.innerHTML = '<tr><td colspan="27" class="text-center text-muted">No data</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="20" class="text-center text-muted">No data</td></tr>';
     return;
   }}
 
-  const vAll = ALL_DATA[`all_all`];
+  const vAll = ALL_DATA['all_all'];
   const a = (period === 'monthly' && MONTHLY_ACTIVE) ? vAll : null;
+
+  const f1 = (val, ref) => val != null ? val.toFixed(1) + (isMae && a ? pctMae(val, ref) : '') : '--';
+  const f2 = (val, ref) => val != null ? val.toFixed(2) + (isMae && a ? pctMae(val, ref) : '') : '--';
+  const sg = (val, dp=1) => val != null ? (val > 0 ? '+' : '') + val.toFixed(dp) : '--';
 
   for (let i = 0; i < v.lead_times.length; i++) {{
     const lt = v.lead_times[i];
     const runs = Math.max(v.gfs_run_count?.[i]??0, v.aifs_run_count?.[i]??0,
                           v.ifs_run_count?.[i]??0,  v.nws_run_count?.[i]??0);
 
-    const gTm = v.gfs_temp_mae[i],   gTb = v.gfs_temp_bias[i];
-    const aTm = v.aifs_temp_mae[i],  aTb = v.aifs_temp_bias[i];
-    const iTm = v.ifs_temp_mae?.[i], iTb = v.ifs_temp_bias?.[i];
-    const nTm = v.nws_temp_mae?.[i], nTb = v.nws_temp_bias?.[i];
-
-    const gPm = v.gfs_mslp_mae[i],   gPb = v.gfs_mslp_bias[i];
-    const aPm = v.aifs_mslp_mae[i],  aPb = v.aifs_mslp_bias[i];
-    const iPm = v.ifs_mslp_mae?.[i], iPb = v.ifs_mslp_bias?.[i];
+    const gTm = v.gfs_temp_mae?.[i],  gTb = v.gfs_temp_bias?.[i];
+    const aTm = v.aifs_temp_mae?.[i], aTb = v.aifs_temp_bias?.[i];
+    const iTm = v.ifs_temp_mae?.[i],  iTb = v.ifs_temp_bias?.[i];
+    const nTm = v.nws_temp_mae?.[i],  nTb = v.nws_temp_bias?.[i];
 
     const gRm = v.gfs_precip_mae?.[i],  gRb = v.gfs_precip_bias?.[i];
     const aRm = v.aifs_precip_mae?.[i], aRb = v.aifs_precip_bias?.[i];
     const iRm = v.ifs_precip_mae?.[i],  iRb = v.ifs_precip_bias?.[i];
     const nRm = v.nws_precip_mae?.[i],  nRb = v.nws_precip_bias?.[i];
 
-    const tempModels = [
-      {{n:'GFS',mae:gTm,cls:'badge bg-primary'}},
-      {{n:'AIFS',mae:aTm,cls:'badge bg-info text-dark'}},
-      {{n:'IFS',mae:iTm,cls:'badge bg-success'}},
-      {{n:'NWS',mae:nTm,cls:'badge bg-dark'}}
-    ].filter(m => m.mae != null);
-    let tWin = '--', tCls = 'badge bg-secondary';
-    if (tempModels.length) {{
-      const mn = Math.min(...tempModels.map(m=>m.mae));
-      const ws = tempModels.filter(m=>m.mae===mn);
-      tWin = ws.length===1 ? ws[0].n : 'Tie';
-      tCls = ws.length===1 ? ws[0].cls : 'badge bg-secondary';
-    }}
+    const gDm = v.gfs_dewpoint_mae?.[i],  gDb = v.gfs_dewpoint_bias?.[i];
+    const aDm = v.aifs_dewpoint_mae?.[i], aDb = v.aifs_dewpoint_bias?.[i];
+    const iDm = v.ifs_dewpoint_mae?.[i],  iDb = v.ifs_dewpoint_bias?.[i];
+    const nDm = v.nws_dewpoint_mae?.[i],  nDb = v.nws_dewpoint_bias?.[i];
 
-    const precipModels = [
-      {{n:'GFS',mae:gRm,cls:'badge bg-primary'}},
-      {{n:'AIFS',mae:aRm,cls:'badge bg-info text-dark'}},
-      {{n:'IFS',mae:iRm,cls:'badge bg-success'}},
-      {{n:'NWS',mae:nRm,cls:'badge bg-dark'}}
-    ].filter(m => m.mae != null);
-    let pWin = '--', pCls = 'badge bg-secondary';
-    if (precipModels.length) {{
-      const mn = Math.min(...precipModels.map(m=>m.mae));
-      const ws = precipModels.filter(m=>m.mae===mn);
-      pWin = ws.length===1 ? ws[0].n : 'Tie';
-      pCls = ws.length===1 ? ws[0].cls : 'badge bg-secondary';
-    }}
+    const gPm = v.gfs_mslp_mae?.[i],  gPb = v.gfs_mslp_bias?.[i];
+    const aPm = v.aifs_mslp_mae?.[i], aPb = v.aifs_mslp_bias?.[i];
+    const iPm = v.ifs_mslp_mae?.[i],  iPb = v.ifs_mslp_bias?.[i];
 
-    const f1 = (v,b,fn=1) => v!=null ? v.toFixed(fn)+(a?pctMae(v,b):'') : '--';
-    const fb = (v,b,fn=1) => v!=null ? (v>0?'+':'')+v.toFixed(fn) : '--';
-    const f2 = (v,b) => f1(v,b,2);
-    const fb2 = (v,b) => fb(v,b,2);
+    const [tWin, tCls] = winner([
+      {{n:'GFS',mae:gTm,cls:'badge bg-primary'}}, {{n:'AIFS',mae:aTm,cls:'badge bg-info text-dark'}},
+      {{n:'IFS',mae:iTm,cls:'badge bg-success'}},  {{n:'NWS',mae:nTm,cls:'badge bg-dark'}}
+    ]);
+    const [rWin, rCls] = winner([
+      {{n:'GFS',mae:gRm,cls:'badge bg-primary'}}, {{n:'AIFS',mae:aRm,cls:'badge bg-info text-dark'}},
+      {{n:'IFS',mae:iRm,cls:'badge bg-success'}},  {{n:'NWS',mae:nRm,cls:'badge bg-dark'}}
+    ]);
+    const [dWin, dCls] = winner([
+      {{n:'GFS',mae:gDm,cls:'badge bg-primary'}}, {{n:'AIFS',mae:aDm,cls:'badge bg-info text-dark'}},
+      {{n:'IFS',mae:iDm,cls:'badge bg-success'}},  {{n:'NWS',mae:nDm,cls:'badge bg-dark'}}
+    ]);
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td><strong>${{formatLeadTime(lt)}}</strong></td>
       <td class="text-center">${{runs}}</td>
-      <td class="text-center">${{f1(gTm,a?.gfs_temp_mae?.[i])}}</td>
-      <td class="text-center">${{fb(gTb,a?.gfs_temp_bias?.[i])}}</td>
-      <td class="text-center">${{f1(aTm,a?.aifs_temp_mae?.[i])}}</td>
-      <td class="text-center">${{fb(aTb,a?.aifs_temp_bias?.[i])}}</td>
-      <td class="text-center">${{f1(iTm,a?.ifs_temp_mae?.[i])}}</td>
-      <td class="text-center">${{fb(iTb,a?.ifs_temp_bias?.[i])}}</td>
-      <td class="text-center">${{f1(nTm,a?.nws_temp_mae?.[i])}}</td>
-      <td class="text-center">${{fb(nTb,a?.nws_temp_bias?.[i])}}</td>
+      <td class="text-center border-start">${{isMae ? f1(gTm,a?.gfs_temp_mae?.[i]) : sg(gTb)}}</td>
+      <td class="text-center">${{isMae ? f1(aTm,a?.aifs_temp_mae?.[i]) : sg(aTb)}}</td>
+      <td class="text-center">${{isMae ? f1(iTm,a?.ifs_temp_mae?.[i])  : sg(iTb)}}</td>
+      <td class="text-center">${{isMae ? f1(nTm,a?.nws_temp_mae?.[i])  : sg(nTb)}}</td>
       <td><span class="${{tCls}}">${{tWin}}</span></td>
-      <td class="text-center">${{f1(gPm,a?.gfs_mslp_mae?.[i])}}</td>
-      <td class="text-center">${{fb(gPb,a?.gfs_mslp_bias?.[i])}}</td>
-      <td class="text-center">${{f1(aPm,a?.aifs_mslp_mae?.[i])}}</td>
-      <td class="text-center">${{fb(aPb,a?.aifs_mslp_bias?.[i])}}</td>
-      <td class="text-center">${{f1(iPm,a?.ifs_mslp_mae?.[i])}}</td>
-      <td class="text-center">${{fb(iPb,a?.ifs_mslp_bias?.[i])}}</td>
-      <td class="text-center">${{f2(gRm,a?.gfs_precip_mae?.[i])}}</td>
-      <td class="text-center">${{fb2(gRb,a?.gfs_precip_bias?.[i])}}</td>
-      <td class="text-center">${{f2(aRm,a?.aifs_precip_mae?.[i])}}</td>
-      <td class="text-center">${{fb2(aRb,a?.aifs_precip_bias?.[i])}}</td>
-      <td class="text-center">${{f2(iRm,a?.ifs_precip_mae?.[i])}}</td>
-      <td class="text-center">${{fb2(iRb,a?.ifs_precip_bias?.[i])}}</td>
-      <td class="text-center">${{f2(nRm,a?.nws_precip_mae?.[i])}}</td>
-      <td class="text-center">${{fb2(nRb,a?.nws_precip_bias?.[i])}}</td>
-      <td><span class="${{pCls}}">${{pWin}}</span></td>
+      <td class="text-center border-start">${{isMae ? f2(gRm,a?.gfs_precip_mae?.[i]) : sg(gRb,2)}}</td>
+      <td class="text-center">${{isMae ? f2(aRm,a?.aifs_precip_mae?.[i]) : sg(aRb,2)}}</td>
+      <td class="text-center">${{isMae ? f2(iRm,a?.ifs_precip_mae?.[i])  : sg(iRb,2)}}</td>
+      <td class="text-center">${{isMae ? f2(nRm,a?.nws_precip_mae?.[i])  : sg(nRb,2)}}</td>
+      <td><span class="${{rCls}}">${{rWin}}</span></td>
+      <td class="text-center border-start">${{isMae ? f1(gDm,a?.gfs_dewpoint_mae?.[i]) : sg(gDb)}}</td>
+      <td class="text-center">${{isMae ? f1(aDm,a?.aifs_dewpoint_mae?.[i]) : sg(aDb)}}</td>
+      <td class="text-center">${{isMae ? f1(iDm,a?.ifs_dewpoint_mae?.[i])  : sg(iDb)}}</td>
+      <td class="text-center">${{isMae ? f1(nDm,a?.nws_dewpoint_mae?.[i])  : sg(nDb)}}</td>
+      <td><span class="${{dCls}}">${{dWin}}</span></td>
+      <td class="text-center border-start">${{isMae ? f1(gPm,a?.gfs_mslp_mae?.[i]) : sg(gPb)}}</td>
+      <td class="text-center">${{isMae ? f1(aPm,a?.aifs_mslp_mae?.[i]) : sg(aPb)}}</td>
+      <td class="text-center">${{isMae ? f1(iPm,a?.ifs_mslp_mae?.[i])  : sg(iPb)}}</td>
     `;
     tbody.appendChild(tr);
   }}
@@ -309,6 +299,7 @@ function renderTable() {{
 
 document.getElementById('periodToggle').addEventListener('change', renderTable);
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
+document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
 renderTable();
 </script>
 </body>
