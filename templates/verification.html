@@ -508,7 +508,7 @@ function initAsosMap() {
 function getMaeColor(value, minVal, maxVal, variable) {
     // Fixed scale: different ranges for precipitation vs temp/mslp
     const fixedMin = 0;
-    const fixedMax = (variable === 'precip') ? 1 : 10;
+    const fixedMax = (variable === 'precip') ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
     const ratio = Math.max(0, Math.min(1, (value - fixedMin) / (fixedMax - fixedMin)));
 
     // Green (#22c55e) -> Yellow (#eab308) -> Red (#ef4444)
@@ -532,7 +532,7 @@ function getMaeColor(value, minVal, maxVal, variable) {
 // Color interpolation for Bias with variable-specific color schemes
 function getBiasColor(value, minVal, maxVal, variable) {
     // Fixed scale: different ranges for precipitation vs temp/mslp
-    const fixedMax = (variable === 'precip') ? 1 : 10;
+    const fixedMax = (variable === 'precip') ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
     const fixedMin = -fixedMax;
     const clampedValue = Math.max(fixedMin, Math.min(fixedMax, value));
     const ratio = clampedValue / fixedMax;  // -1 to 1
@@ -1754,8 +1754,8 @@ async function loadAsosVerification() {
             const color = getMarkerColor(station.value, metric, data.min_value, data.max_value, variable);
 
             // Calculate radius proportional to value magnitude
-            // Different scales for precipitation (0-1) vs temp/mslp (0-10)
-            const maxScale = (variable === 'precip') ? 1 : 10;
+            // Different scales for precipitation (0-1) vs temp/dewpoint (0-20) vs mslp (0-10)
+            const maxScale = (variable === 'precip') ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
             let radius;
             if (metric === 'bias') {
                 const absValue = Math.abs(station.value);
