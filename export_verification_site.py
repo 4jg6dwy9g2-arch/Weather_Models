@@ -688,7 +688,7 @@ function initMap() {{
 }}
 
 function getMaeColor(value, variable) {{
-  const max = variable === VAR_PRECIP ? 1 : 10;
+  const max = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
   const r = Math.max(0, Math.min(1, value / max));
   if (r < 0.5) {{
     const t = r * 2;
@@ -699,7 +699,7 @@ function getMaeColor(value, variable) {{
   }}
 }}
 function getBiasColor(value, variable) {{
-  const max = variable === VAR_PRECIP ? 1 : 10;
+  const max = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
   const r = Math.max(-1, Math.min(1, value / max));
   if (variable === VAR_PRECIP) {{
     const g = (r+1)/2;
@@ -723,16 +723,17 @@ function updateColorScale(variable, metric) {{
   const mn  = document.getElementById('scaleMin');
   const mx  = document.getElementById('scaleMax');
   document.getElementById('scaleUnits').textContent = VAR_UNITS[variable] || '';
+  const isTD = variable === 'temp' || variable === 'dewpoint';
+  const scaleMax = isP ? '1.0' : isTD ? '20.0' : '10.0';
   if (metric === 'bias') {{
-    const lim = isP ? '±1.0' : '±10.0';
-    mn.textContent = '-' + (isP ? '1.0' : '10.0');
-    mx.textContent = isP ? '1.0' : '10.0';
+    mn.textContent = '-' + scaleMax;
+    mx.textContent = scaleMax;
     bar.style.background = isP
       ? 'linear-gradient(to right,rgb(139,69,19),white,rgb(34,139,34))'
       : 'linear-gradient(to right,#3b82f6,white 50%,#ef4444)';
   }} else {{
     mn.textContent = '0';
-    mx.textContent = isP ? '1.0' : '10.0';
+    mx.textContent = scaleMax;
     bar.style.background = 'linear-gradient(to right,#22c55e,#eab308 50%,#ef4444)';
   }}
 }}
@@ -755,7 +756,7 @@ function renderMap() {{
   markers.forEach(m => asosMap.removeLayer(m));
   markers = [];
 
-  const maxScale = variable === VAR_PRECIP ? 1 : 10;
+  const maxScale = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
 
   for (const [sid, st] of Object.entries(stationSet)) {{
     const entry = st.d?.[mi]?.[vi]?.[ltIdx];
