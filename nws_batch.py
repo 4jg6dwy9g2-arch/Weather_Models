@@ -140,8 +140,9 @@ async def fetch_hourly_forecast(session: aiohttp.ClientSession,
             data = await response.json()
             props = data["properties"]
 
-            # Extract temperature and QPF grids
+            # Extract temperature, dewpoint, and QPF grids
             temp_values = props.get("temperature", {}).get("values", [])
+            dewpoint_values = props.get("dewpoint", {}).get("values", [])
             qpf_values = props.get("quantitativePrecipitation", {}).get("values", [])
 
             # Build union of hourly timestamps from temp + QPF
@@ -169,6 +170,27 @@ async def fetch_hourly_forecast(session: aiohttp.ClientSession,
                 dur_hours = int(dur_match.group(1)) if dur_match else 1
                 for h_offset in range(dur_hours):
                     temp_by_time[start_time + timedelta(hours=h_offset)] = temp_c
+
+            # Build dewpoint_by_time (same structure as temp_by_time; NWS provides °C)
+            dewpoint_by_time = {}
+            for dp_entry in dewpoint_values:
+                valid_time_str = dp_entry.get("validTime")
+                if not valid_time_str:
+                    continue
+                if "/" in valid_time_str:
+                    start_str, dur_str = valid_time_str.split("/")
+                else:
+                    start_str = valid_time_str
+                    dur_str = "PT1H"
+                try:
+                    start_time = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                dp_c = dp_entry.get("value")
+                dur_match = re.search(r'PT(\d+)H', dur_str)
+                dur_hours = int(dur_match.group(1)) if dur_match else 1
+                for h_offset in range(dur_hours):
+                    dewpoint_by_time[start_time + timedelta(hours=h_offset)] = dp_c
 
             # Parse QPF windows
             qpf_windows = []
@@ -203,6 +225,9 @@ async def fetch_hourly_forecast(session: aiohttp.ClientSession,
                 temp_c = temp_by_time.get(start_time)
                 temp_f = (temp_c * 9/5) + 32 if temp_c is not None else None
 
+                dp_c = dewpoint_by_time.get(start_time)
+                dewpoint_f = (dp_c * 9/5) + 32 if dp_c is not None else None
+
                 # Use None when no QPF window covers this hour so that hours
                 # beyond the NWS QPF issuance window (typically ~3 days for some
                 # offices) render as gaps in the chart rather than false zeros.
@@ -215,6 +240,7 @@ async def fetch_hourly_forecast(session: aiohttp.ClientSession,
                 forecast.append({
                     "datetime": start_time.isoformat(),
                     "temperature": round(temp_f) if temp_f is not None else None,
+                    "dewpoint": round(dewpoint_f, 1) if dewpoint_f is not None else None,
                     "precipitation": precip_inches  # None = no QPF issued; 0.0 = QPF says dry
                 })
 
@@ -545,6 +571,7 @@ def transform_nws_to_asos_format(
         temps = [None] * len(forecast_hours)
         mslps = [None] * len(forecast_hours)  # NWS doesn't provide MSLP
         precips = [None] * len(forecast_hours)
+        dewpoints = [None] * len(forecast_hours)
 
         if forecast:
             # Create lookup by valid time and hour offset
@@ -566,7 +593,7 @@ def transform_nws_to_asos_format(
             for i, hour in enumerate(forecast_hours):
                 target_time = init_time + timedelta(hours=hour)
 
-                # Temperature: Find closest NWS forecast within 30 minutes
+                # Temperature/dewpoint: Find closest NWS forecast within 30 minutes
                 closest_period = None
                 min_delta = timedelta(hours=1)
 
@@ -579,6 +606,7 @@ def transform_nws_to_asos_format(
                 # Only use if within 30 minutes
                 if closest_period and min_delta < timedelta(minutes=30):
                     temps[i] = closest_period.get('temperature')
+                    dewpoints[i] = closest_period.get('dewpoint')
 
                 # Precipitation: Use WPC QPF when available (consistent 7-day national
                 # coverage), otherwise fall back to NWS QPF accumulation.
@@ -602,7 +630,8 @@ def transform_nws_to_asos_format(
         result[station_id] = {
             'temps': temps,
             'mslps': mslps,
-            'precips': precips
+            'precips': precips,
+            'dewpoints': dewpoints,
         }
 
     return result

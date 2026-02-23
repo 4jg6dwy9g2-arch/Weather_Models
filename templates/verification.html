@@ -99,6 +99,7 @@
                             <option value="temp">Temperature</option>
                             <option value="mslp">Pressure</option>
                             <option value="precip">Precipitation</option>
+                            <option value="dewpoint">Dew Point</option>
                         </select>
                         <select class="form-select form-select-sm" id="asosMetric" style="width: auto;">
                             <option value="mae">MAE</option>
@@ -170,6 +171,14 @@
                                     </div>
                                 </div>
                             </div>
+                            <div class="col-lg-6 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><i class="bi bi-droplet-half"></i> Dew Point Accuracy</div>
+                                    <div class="card-body chart-container chart-container-small">
+                                        <canvas id="asosDewpointVerificationChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
                             <div class="col-12 mb-3">
                                 <div class="d-flex align-items-center flex-wrap gap-2">
                                     <span class="small text-muted">Station Bias Lead Time:</span>
@@ -213,6 +222,19 @@
                                     </div>
                                 </div>
                             </div>
+                            <div class="col-lg-6 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><i class="bi bi-droplet-half"></i> Station Dew Point (Obs + Bias) <span class="text-muted" id="stationDewpointLeadLabel">(6h)</span></div>
+                                    <div class="card-body">
+                                        <div class="chart-container chart-container-small">
+                                            <canvas id="asosObsDewpointChart"></canvas>
+                                        </div>
+                                        <div class="chart-container mt-3" style="height: 300px;">
+                                            <canvas id="asosObsDewpointBiasChart"></canvas>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                     <!-- Mean Verification Table across all stations -->
@@ -221,6 +243,13 @@
                             <div class="card">
                                 <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
                                     <span><i class="bi bi-table"></i> Mean Verification by Lead Time (All Stations)</span>
+                                    <div class="d-flex gap-2 flex-wrap align-items-center">
+                                    <div class="btn-group btn-group-sm" role="group" id="tableMetricToggle">
+                                        <input type="radio" class="btn-check" name="tableMetric" id="tm-mae" value="mae" autocomplete="off" checked>
+                                        <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
+                                        <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
+                                        <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
+                                    </div>
                                     <div class="btn-group btn-group-sm" role="group" id="validHourFilter">
                                         <input type="radio" class="btn-check" name="validHour" id="vh-all" value="" autocomplete="off" checked>
                                         <label class="btn btn-outline-secondary" for="vh-all">All</label>
@@ -233,60 +262,44 @@
                                         <input type="radio" class="btn-check" name="validHour" id="vh-18" value="18" autocomplete="off">
                                         <label class="btn btn-outline-secondary" for="vh-18">18Z</label>
                                     </div>
+                                    </div>
                                 </div>
                                 <div class="card-body p-0">
                                     <div class="table-responsive">
                                         <table class="table table-hover table-sm mb-0">
                                             <thead>
                                                 <tr>
-                                                    <th>Lead</th>
-                                                    <th>Runs</th>
-                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Temp (°F)</th>
-                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Temp (°F)</th>
-                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Temp (°F)</th>
-                                                    <th colspan="2" class="text-center bg-dark bg-opacity-10">NWS Temp (°F)</th>
-                                                    <th>Win</th>
-                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Pres (mb)</th>
-                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Pres (mb)</th>
-                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Pres (mb)</th>
-                                                    <th colspan="2" class="text-center bg-primary bg-opacity-10">GFS Precip (in)</th>
-                                                    <th colspan="2" class="text-center bg-info bg-opacity-10 text-dark">AIFS Precip (in)</th>
-                                                    <th colspan="2" class="text-center bg-success bg-opacity-10">IFS Precip (in)</th>
-                                                    <th colspan="2" class="text-center bg-dark bg-opacity-10">NWS Precip (in)</th>
-                                                    <th>Win</th>
+                                                    <th rowspan="2">Lead</th>
+                                                    <th rowspan="2">Runs</th>
+                                                    <th colspan="5" class="text-center border-start">Temp (°F)</th>
+                                                    <th colspan="5" class="text-center border-start">Precip (in)</th>
+                                                    <th colspan="5" class="text-center border-start">Dew Point (°F)</th>
+                                                    <th colspan="3" class="text-center border-start">Pressure (mb)</th>
                                                 </tr>
                                                 <tr>
-                                                    <th></th>
-                                                    <th></th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th></th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th class="text-center">MAE</th>
-                                                    <th class="text-center">Bias</th>
-                                                    <th></th>
+                                                    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+                                                    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+                                                    <th class="text-center bg-success bg-opacity-10">IFS</th>
+                                                    <th class="text-center bg-dark bg-opacity-10">NWS</th>
+                                                    <th class="text-center">Win</th>
+                                                    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+                                                    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+                                                    <th class="text-center bg-success bg-opacity-10">IFS</th>
+                                                    <th class="text-center bg-dark bg-opacity-10">NWS</th>
+                                                    <th class="text-center">Win</th>
+                                                    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+                                                    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+                                                    <th class="text-center bg-success bg-opacity-10">IFS</th>
+                                                    <th class="text-center bg-dark bg-opacity-10">NWS</th>
+                                                    <th class="text-center">Win</th>
+                                                    <th class="text-center border-start bg-primary bg-opacity-10">GFS</th>
+                                                    <th class="text-center bg-info bg-opacity-10 text-dark">AIFS</th>
+                                                    <th class="text-center bg-success bg-opacity-10">IFS</th>
                                                 </tr>
                                             </thead>
                                             <tbody id="asosVerificationTableBody">
                                                 <tr>
-                                                    <td colspan="27" class="text-center text-muted">Loading...</td>
+                                                    <td colspan="20" class="text-center text-muted">Loading...</td>
                                                 </tr>
                                             </tbody>
                                         </table>
@@ -309,6 +322,7 @@
                                             <option value="temp">Temperature</option>
                                             <option value="mslp">Pressure</option>
                                             <option value="precip">Precipitation</option>
+                                            <option value="dewpoint">Dew Point</option>
                                         </select>
                                         <select class="form-select form-select-sm" id="tsMetric" style="width: auto;">
                                             <option value="mae">MAE</option>
@@ -379,6 +393,27 @@ let asosMarkers = [];
 
 let asosTempMaeChart, asosTempBiasChart, asosMslpMaeChart, asosMslpBiasChart;
 let timeSeriesChart = null;
+
+// Dedup cache for the all-time mean verification fetch (period=all, no valid_hour)
+let _allTimeVerifData = null;
+let _allTimeVerifPromise = null;
+
+async function getOrFetchAllTimeVerif() {
+    if (_allTimeVerifData !== null) return _allTimeVerifData;
+    if (_allTimeVerifPromise !== null) return _allTimeVerifPromise;
+    _allTimeVerifPromise = fetch('/api/asos/mean-verification?period=all')
+        .then(r => r.json())
+        .then(data => {
+            _allTimeVerifData = data;
+            _allTimeVerifPromise = null;
+            return data;
+        })
+        .catch(err => {
+            _allTimeVerifPromise = null;
+            throw err;
+        });
+    return _allTimeVerifPromise;
+}
 
 // Format lead time for display
 function formatLeadTime(hours) {
@@ -561,7 +596,8 @@ function updateColorScale(metric, minVal, maxVal, variable) {
     const units = {
         'temp': '°F',
         'mslp': 'mb',
-        'precip': 'in'
+        'precip': 'in',
+        'dewpoint': '°F'
     };
     unitsSpan.textContent = units[variable] || '';
 
@@ -600,10 +636,13 @@ function clearAsosMarkers() {
 
 let currentAsosTempChart = null;
 let currentAsosPrecipChart = null;
+let currentAsosDewpointChart = null;
 let currentAsosObsTempChart = null;
 let currentAsosObsTempBiasChart = null;
 let currentAsosObsPrecipChart = null;
 let currentAsosObsPrecipBiasChart = null;
+let currentAsosObsDewpointChart = null;
+let currentAsosObsDewpointBiasChart = null;
 let currentAsosStationId = null;
 let currentAsosStationName = null;
 let currentAsosStationLeadTime = '6';
@@ -620,8 +659,10 @@ function setStationLeadTimeControl(leadTime) {
     const label = `(${formatLeadTime(parseInt(currentAsosStationLeadTime, 10))})`;
     const tempLeadLabel = document.getElementById('stationTempLeadLabel');
     const precipLeadLabel = document.getElementById('stationPrecipLeadLabel');
+    const dewpointLeadLabel = document.getElementById('stationDewpointLeadLabel');
     if (tempLeadLabel) tempLeadLabel.textContent = label;
     if (precipLeadLabel) precipLeadLabel.textContent = label;
+    if (dewpointLeadLabel) dewpointLeadLabel.textContent = label;
 }
 
 function setStationModelControl(model) {
@@ -686,6 +727,8 @@ async function loadAsosStationObservations(stationId, period) {
             if (currentAsosObsTempBiasChart) currentAsosObsTempBiasChart.destroy();
             if (currentAsosObsPrecipChart) currentAsosObsPrecipChart.destroy();
             if (currentAsosObsPrecipBiasChart) currentAsosObsPrecipBiasChart.destroy();
+            if (currentAsosObsDewpointChart) currentAsosObsDewpointChart.destroy();
+            if (currentAsosObsDewpointBiasChart) currentAsosObsDewpointBiasChart.destroy();
             return;
         }
         renderAsosObsCharts(data);
@@ -695,6 +738,8 @@ async function loadAsosStationObservations(stationId, period) {
         if (currentAsosObsTempBiasChart) currentAsosObsTempBiasChart.destroy();
         if (currentAsosObsPrecipChart) currentAsosObsPrecipChart.destroy();
         if (currentAsosObsPrecipBiasChart) currentAsosObsPrecipBiasChart.destroy();
+        if (currentAsosObsDewpointChart) currentAsosObsDewpointChart.destroy();
+        if (currentAsosObsDewpointBiasChart) currentAsosObsDewpointBiasChart.destroy();
     }
 }
 
@@ -708,6 +753,7 @@ function renderAsosObsCharts(data) {
 
     const obsTemps = data.obs_temps || [];
     const obsPrecip = data.obs_precips || [];
+    const obsDewpoints = data.obs_dewpoints || [];
     const modelBiases = data.model_biases || {};
 
     const modelStyles = {
@@ -988,6 +1034,102 @@ function renderAsosObsCharts(data) {
         }
     });
 
+    // Dewpoint observations
+    if (currentAsosObsDewpointChart) currentAsosObsDewpointChart.destroy();
+    currentAsosObsDewpointChart = new Chart(document.getElementById('asosObsDewpointChart'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'Dew Point (°F)',
+                    data: obsDewpoints,
+                    borderColor: '#7c3aed',
+                    backgroundColor: 'rgba(124, 58, 237, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 5,
+                    yAxisID: 'y'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    position: 'left',
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Dew Point (°F)' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: { maxRotation: 45, minRotation: 45 }
+                }
+            }
+        }
+    });
+
+    // Dewpoint bias (model - obs)
+    if (currentAsosObsDewpointBiasChart) currentAsosObsDewpointBiasChart.destroy();
+    currentAsosObsDewpointBiasChart = new Chart(document.getElementById('asosObsDewpointBiasChart'), {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: buildBiasDatasets('dewpoint_bias', '°F')
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const ds = context.dataset;
+                            const modelKey = ds.modelByIndex ? ds.modelByIndex[context.dataIndex] : null;
+                            const modelName = modelKey && modelStyles[modelKey]
+                                ? modelStyles[modelKey].label
+                                : 'Model';
+                            const val = context.parsed.y;
+                            if (val === null || val === undefined) return `${modelName}: --`;
+                            const sign = val > 0 ? '+' : '';
+                            return `${modelName}: ${sign}${val.toFixed(2)} °F`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'Bias (°F)' }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: { maxRotation: 45, minRotation: 45 }
+                }
+            }
+        }
+    });
+
 }
 
 // Render detailed verification charts for a single ASOS station
@@ -999,8 +1141,12 @@ function renderAsosVerificationCharts(v, period = 'all') {
     const precipIndices = v.lead_times
         .map((_, i) => i)
         .filter(i => v.precip_mae && (v.precip_mae[i] !== null || v.precip_bias[i] !== null));
+    const dewpointIndices = v.lead_times
+        .map((_, i) => i)
+        .filter(i => v.dewpoint_mae && (v.dewpoint_mae[i] !== null || v.dewpoint_bias[i] !== null));
     const tempLabels = tempIndices.map(i => formatLeadTime(v.lead_times[i]));
     const precipLabels = precipIndices.map(i => formatLeadTime(v.lead_times[i]));
+    const dewpointLabels = dewpointIndices.map(i => formatLeadTime(v.lead_times[i]));
 
     // Temperature MAE and Bias Chart
     const tempDatasets = [
@@ -1187,6 +1333,99 @@ function renderAsosVerificationCharts(v, period = 'all') {
             }
         }
     });
+
+    // Dewpoint MAE and Bias Chart
+    const dewpointDatasets = [
+        {
+            label: `MAE (°F)${periodSuffix}`,
+            data: dewpointIndices.map(i => v.dewpoint_mae[i]),
+            borderColor: '#7c3aed',
+            backgroundColor: 'rgba(124, 58, 237, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            yAxisID: 'y'
+        },
+        {
+            label: `Bias (°F)${periodSuffix}`,
+            data: dewpointIndices.map(i => v.dewpoint_bias[i]),
+            borderColor: '#f59e0b',
+            backgroundColor: 'rgba(245, 158, 11, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5],
+            yAxisID: 'y1'
+        }
+    ];
+
+    if (currentAsosDewpointChart) currentAsosDewpointChart.destroy();
+    currentAsosDewpointChart = new Chart(document.getElementById('asosDewpointVerificationChart'), {
+        type: 'line',
+        data: { labels: dewpointLabels, datasets: dewpointDatasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: {
+                        usePointStyle: true,
+                        padding: 20
+                    }
+                },
+                tooltip: {
+                    callbacks: {
+                        footer: (items) => {
+                            const i = dewpointIndices[items[0].dataIndex];
+                            const count = v.dewpoint_count ? v.dewpoint_count[i] : null;
+                            return count != null ? `Samples: ${count}` : '';
+                        }
+                    }
+                },
+                annotation: {
+                    annotations: {
+                        zeroLine: {
+                            type: 'line',
+                            yMin: 0,
+                            yMax: 0,
+                            borderColor: '#999',
+                            borderWidth: 1,
+                            borderDash: [5, 5],
+                            yAxisID: 'y1'
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: { display: false },
+                    title: { display: true, text: 'Lead Time' }
+                },
+                y: {
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: 'MAE (°F)' },
+                    min: 0
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    grid: { drawOnChartArea: false },
+                    title: { display: true, text: 'Bias (°F)' }
+                }
+            }
+        }
+    });
 }
 
 // Load and display Mean ASOS Verification
@@ -1205,13 +1444,13 @@ async function loadMeanAsosVerification(period = 'all') {
         let vAll = null;
         if (data.monthly_active) {
             try {
-                const allResp = await fetch('/api/asos/mean-verification?period=all');
-                const allData = await allResp.json();
+                const allData = await getOrFetchAllTimeVerif();
                 if (allData.success) vAll = allData.verification;
             } catch (e) { /* no baseline available */ }
         }
 
-        renderAsosVerificationTable(data.verification, vAll);
+        const tableMetric = document.querySelector('input[name="tableMetric"]:checked')?.value ?? 'mae';
+        renderAsosVerificationTable(data.verification, vAll, tableMetric);
 
         // Update cache timestamp
         if (data.cache_timestamp) {
@@ -1266,12 +1505,12 @@ function _pctBias(cur, base) {
 }
 
 // Render ASOS verification table
-function renderAsosVerificationTable(v, vAll = null) {
+function renderAsosVerificationTable(v, vAll = null, metric = 'mae') {
     const tbody = document.getElementById('asosVerificationTableBody');
     tbody.innerHTML = '';
 
     if (!v.lead_times || v.lead_times.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="27" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="20" class="text-center text-muted">No verification data available yet. Sync ASOS forecasts and wait for observations.</td></tr>';
         return;
     }
 
@@ -1313,6 +1552,16 @@ function renderAsosVerificationTable(v, vAll = null) {
         const ifsPrecipBias = v.ifs_precip_bias ? v.ifs_precip_bias[i] : null;
         const nwsPrecipMae = v.nws_precip_mae ? v.nws_precip_mae[i] : null;
         const nwsPrecipBias = v.nws_precip_bias ? v.nws_precip_bias[i] : null;
+
+        // Dewpoint data
+        const gfsDewMae = v.gfs_dewpoint_mae ? v.gfs_dewpoint_mae[i] : null;
+        const gfsDewBias = v.gfs_dewpoint_bias ? v.gfs_dewpoint_bias[i] : null;
+        const aifsDewMae = v.aifs_dewpoint_mae ? v.aifs_dewpoint_mae[i] : null;
+        const aifsDewBias = v.aifs_dewpoint_bias ? v.aifs_dewpoint_bias[i] : null;
+        const ifsDewMae = v.ifs_dewpoint_mae ? v.ifs_dewpoint_mae[i] : null;
+        const ifsDewBias = v.ifs_dewpoint_bias ? v.ifs_dewpoint_bias[i] : null;
+        const nwsDewMae = v.nws_dewpoint_mae ? v.nws_dewpoint_mae[i] : null;
+        const nwsDewBias = v.nws_dewpoint_bias ? v.nws_dewpoint_bias[i] : null;
 
         // Determine temperature winner
         let tempWinner = '--';
@@ -1356,35 +1605,75 @@ function renderAsosVerificationTable(v, vAll = null) {
             }
         }
 
+        // Determine dewpoint winner
+        let dewWinner = '--';
+        let dewWinnerClass = 'badge bg-secondary';
+        const dewMaes = [
+            { name: 'GFS', mae: gfsDewMae, class: 'badge bg-primary' },
+            { name: 'AIFS', mae: aifsDewMae, class: 'badge bg-info text-dark' },
+            { name: 'IFS', mae: ifsDewMae, class: 'badge bg-success' },
+            { name: 'NWS', mae: nwsDewMae, class: 'badge bg-dark' }
+        ].filter(m => m.mae !== null && m.mae !== undefined);
+
+        if (dewMaes.length > 0) {
+            const minMae = Math.min(...dewMaes.map(m => m.mae));
+            const winners = dewMaes.filter(m => m.mae === minMae);
+            if (winners.length === 1) {
+                dewWinner = winners[0].name;
+                dewWinnerClass = winners[0].class;
+            } else {
+                dewWinner = 'Tie';
+            }
+        }
+
         const a = vAll;
+        const isMae = metric === 'mae';
+
+        // Helper: format a value, with % change annotation for MAE only
+        const fmt1 = (val, ref) => val != null ? val.toFixed(1) + (isMae ? _pctMae(val, ref) : '') : '--';
+        const fmt2 = (val, ref) => val != null ? val.toFixed(2) + (isMae ? _pctMae(val, ref) : '') : '--';
+        const sign = (val) => val != null ? (val > 0 ? '+' : '') + val.toFixed(1) : '--';
+        const sign2 = (val) => val != null ? (val > 0 ? '+' : '') + val.toFixed(2) : '--';
+
+        // Pick MAE or Bias for each model/variable
+        const gfsTempVal   = isMae ? gfsTempMae   : gfsTempBias;
+        const aifsTempVal  = isMae ? aifsTempMae  : aifsTempBias;
+        const ifsTempVal   = isMae ? ifsTempMae   : ifsTempBias;
+        const nwsTempVal   = isMae ? nwsTempMae   : nwsTempBias;
+        const gfsPrecipVal = isMae ? gfsPrecipMae : gfsPrecipBias;
+        const aifsPrecipVal= isMae ? aifsPrecipMae: aifsPrecipBias;
+        const ifsPrecipVal = isMae ? ifsPrecipMae : ifsPrecipBias;
+        const nwsPrecipVal = isMae ? nwsPrecipMae : nwsPrecipBias;
+        const gfsDewVal    = isMae ? gfsDewMae    : gfsDewBias;
+        const aifsDewVal   = isMae ? aifsDewMae   : aifsDewBias;
+        const ifsDewVal    = isMae ? ifsDewMae    : ifsDewBias;
+        const nwsDewVal    = isMae ? nwsDewMae    : nwsDewBias;
+        const gfsMslpVal   = isMae ? gfsMslpMae   : gfsMslpBias;
+        const aifsMslpVal  = isMae ? aifsMslpMae  : aifsMslpBias;
+        const ifsMslpVal   = isMae ? ifsMslpMae   : ifsMslpBias;
+
         const row = document.createElement('tr');
         row.innerHTML = `
             <td><strong>${formatLeadTime(lt)}</strong></td>
             <td class="text-center">${sampleText}</td>
-            <td class="text-center">${gfsTempMae !== null ? gfsTempMae.toFixed(1) + _pctMae(gfsTempMae, a?.gfs_temp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${gfsTempBias !== null ? (gfsTempBias > 0 ? '+' : '') + gfsTempBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${aifsTempMae !== null ? aifsTempMae.toFixed(1) + _pctMae(aifsTempMae, a?.aifs_temp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${aifsTempBias !== null ? (aifsTempBias > 0 ? '+' : '') + aifsTempBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${ifsTempMae != null ? ifsTempMae.toFixed(1) + _pctMae(ifsTempMae, a?.ifs_temp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${ifsTempBias != null ? (ifsTempBias > 0 ? '+' : '') + ifsTempBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${nwsTempMae != null ? nwsTempMae.toFixed(1) + _pctMae(nwsTempMae, a?.nws_temp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${nwsTempBias != null ? (nwsTempBias > 0 ? '+' : '') + nwsTempBias.toFixed(1) : '--'}</td>
+            <td class="text-center border-start">${isMae ? fmt1(gfsTempVal, a?.gfs_temp_mae?.[i]) : sign(gfsTempVal)}</td>
+            <td class="text-center">${isMae ? fmt1(aifsTempVal, a?.aifs_temp_mae?.[i]) : sign(aifsTempVal)}</td>
+            <td class="text-center">${isMae ? fmt1(ifsTempVal, a?.ifs_temp_mae?.[i]) : sign(ifsTempVal)}</td>
+            <td class="text-center">${isMae ? fmt1(nwsTempVal, a?.nws_temp_mae?.[i]) : sign(nwsTempVal)}</td>
             <td><span class="${tempWinnerClass}">${tempWinner}</span></td>
-            <td class="text-center">${gfsMslpMae !== null ? gfsMslpMae.toFixed(1) + _pctMae(gfsMslpMae, a?.gfs_mslp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${gfsMslpBias !== null ? (gfsMslpBias > 0 ? '+' : '') + gfsMslpBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${aifsMslpMae !== null ? aifsMslpMae.toFixed(1) + _pctMae(aifsMslpMae, a?.aifs_mslp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${aifsMslpBias !== null ? (aifsMslpBias > 0 ? '+' : '') + aifsMslpBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${ifsMslpMae != null ? ifsMslpMae.toFixed(1) + _pctMae(ifsMslpMae, a?.ifs_mslp_mae?.[i]) : '--'}</td>
-            <td class="text-center">${ifsMslpBias != null ? (ifsMslpBias > 0 ? '+' : '') + ifsMslpBias.toFixed(1) : '--'}</td>
-            <td class="text-center">${gfsPrecipMae != null ? gfsPrecipMae.toFixed(2) + _pctMae(gfsPrecipMae, a?.gfs_precip_mae?.[i]) : '--'}</td>
-            <td class="text-center">${gfsPrecipBias != null ? (gfsPrecipBias > 0 ? '+' : '') + gfsPrecipBias.toFixed(2) : '--'}</td>
-            <td class="text-center">${aifsPrecipMae != null ? aifsPrecipMae.toFixed(2) + _pctMae(aifsPrecipMae, a?.aifs_precip_mae?.[i]) : '--'}</td>
-            <td class="text-center">${aifsPrecipBias != null ? (aifsPrecipBias > 0 ? '+' : '') + aifsPrecipBias.toFixed(2) : '--'}</td>
-            <td class="text-center">${ifsPrecipMae != null ? ifsPrecipMae.toFixed(2) + _pctMae(ifsPrecipMae, a?.ifs_precip_mae?.[i]) : '--'}</td>
-            <td class="text-center">${ifsPrecipBias != null ? (ifsPrecipBias > 0 ? '+' : '') + ifsPrecipBias.toFixed(2) : '--'}</td>
-            <td class="text-center">${nwsPrecipMae != null ? nwsPrecipMae.toFixed(2) + _pctMae(nwsPrecipMae, a?.nws_precip_mae?.[i]) : '--'}</td>
-            <td class="text-center">${nwsPrecipBias != null ? (nwsPrecipBias > 0 ? '+' : '') + nwsPrecipBias.toFixed(2) : '--'}</td>
+            <td class="text-center border-start">${isMae ? fmt2(gfsPrecipVal, a?.gfs_precip_mae?.[i]) : sign2(gfsPrecipVal)}</td>
+            <td class="text-center">${isMae ? fmt2(aifsPrecipVal, a?.aifs_precip_mae?.[i]) : sign2(aifsPrecipVal)}</td>
+            <td class="text-center">${isMae ? fmt2(ifsPrecipVal, a?.ifs_precip_mae?.[i]) : sign2(ifsPrecipVal)}</td>
+            <td class="text-center">${isMae ? fmt2(nwsPrecipVal, a?.nws_precip_mae?.[i]) : sign2(nwsPrecipVal)}</td>
             <td><span class="${precipWinnerClass}">${precipWinner}</span></td>
+            <td class="text-center border-start">${isMae ? fmt1(gfsDewVal, a?.gfs_dewpoint_mae?.[i]) : sign(gfsDewVal)}</td>
+            <td class="text-center">${isMae ? fmt1(aifsDewVal, a?.aifs_dewpoint_mae?.[i]) : sign(aifsDewVal)}</td>
+            <td class="text-center">${isMae ? fmt1(ifsDewVal, a?.ifs_dewpoint_mae?.[i]) : sign(ifsDewVal)}</td>
+            <td class="text-center">${isMae ? fmt1(nwsDewVal, a?.nws_dewpoint_mae?.[i]) : sign(nwsDewVal)}</td>
+            <td><span class="${dewWinnerClass}">${dewWinner}</span></td>
+            <td class="text-center border-start">${isMae ? fmt1(gfsMslpVal, a?.gfs_mslp_mae?.[i]) : sign(gfsMslpVal)}</td>
+            <td class="text-center">${isMae ? fmt1(aifsMslpVal, a?.aifs_mslp_mae?.[i]) : sign(aifsMslpVal)}</td>
+            <td class="text-center">${isMae ? fmt1(ifsMslpVal, a?.ifs_mslp_mae?.[i]) : sign(ifsMslpVal)}</td>
         `;
         tbody.appendChild(row);
     }
@@ -1424,10 +1713,8 @@ async function loadAsosVerification() {
         const data = await response.json();
         console.log('[loadAsosVerification] Received data:', data);
 
-        // Hide loading and show content
+        // Hide map-level loading spinner; page-level content already visible
         document.getElementById('asosMapLoading').classList.add('d-none');
-        document.getElementById('loadingState').classList.add('d-none'); // Hide main loading spinner
-        document.getElementById('verificationContent').classList.remove('d-none');
         asosMap.invalidateSize(); // Invalidate map size after container is visible
 
 
@@ -1547,12 +1834,11 @@ async function loadTimeSeriesChart() {
     const timeFrame = document.getElementById('tsTimeFrame').value;
 
     try {
-        const [tsResponse, allTimeResponse] = await Promise.all([
-            fetch(`/api/asos/verification-time-series?variable=${variable}&lead_time=${leadTime}&days_back=${timeFrame}`),
-            fetch('/api/asos/mean-verification?period=all')
+        const [tsResponse, allTimeData] = await Promise.all([
+            fetch(`/api/asos/verification-time-series?variable=${variable}&lead_time=${leadTime}&days_back=${timeFrame}`).then(r => r.json()),
+            getOrFetchAllTimeVerif()
         ]);
-        const data = await tsResponse.json();
-        const allTimeData = await allTimeResponse.json();
+        const data = tsResponse;
 
         if (!data.success) {
             console.error('Error loading time series:', data.error);
@@ -1616,7 +1902,8 @@ function renderTimeSeriesChart(data, metric, allTimeAvgs = null) {
     const units = {
         'temp': '°F',
         'mslp': 'mb',
-        'precip': 'in'
+        'precip': 'in',
+        'dewpoint': '°F'
     };
     const unit = units[variable] || '';
     const metricLabel = metric.toUpperCase();
@@ -1778,6 +2065,12 @@ document.querySelectorAll('input[name="validHour"]').forEach(radio => {
         loadMeanAsosVerification(period);
     });
 });
+document.querySelectorAll('input[name="tableMetric"]').forEach(radio => {
+    radio.addEventListener('change', function() {
+        const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
+        loadMeanAsosVerification(period);
+    });
+});
 document.getElementById('asosPeriodToggle').addEventListener('change', function() {
     loadAsosVerification();
     loadMeanAsosVerification(this.checked ? 'monthly' : 'all');
@@ -1820,11 +2113,14 @@ document.getElementById('tsTimeFrame').addEventListener('change', loadTimeSeries
 document.addEventListener('DOMContentLoaded', function() {
     setStationModelControl(document.getElementById('asosModel')?.value || 'gfs');
     setStationLeadTimeControl(document.getElementById('asosLeadTime')?.value || '6');
+    // Show page immediately — map/table/charts each have their own loading states
+    document.getElementById('loadingState').classList.add('d-none');
+    document.getElementById('verificationContent').classList.remove('d-none');
     initAsosMap();
-    setTimeout(loadAsosVerification, 50); // Small delay
+    setTimeout(loadAsosVerification, 50);
     const period = document.getElementById('asosPeriodToggle')?.checked ? 'monthly' : 'all';
-    setTimeout(() => loadMeanAsosVerification(period), 250); // Small delay for mean verification after map
-    setTimeout(loadTimeSeriesChart, 300); // Load time series chart
+    loadMeanAsosVerification(period);
+    loadTimeSeriesChart();
 });
 
 

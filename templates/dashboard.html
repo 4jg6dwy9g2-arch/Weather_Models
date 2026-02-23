@@ -501,11 +501,10 @@ async function loadForecast() {
     document.getElementById('errorState').classList.add('d-none');
 
     try {
-        // Load from saved data, verification, and historical bias for both temp and MSLP
-        const verificationPeriod = document.getElementById('fairfaxPeriodToggle')?.checked ? 'monthly' : 'all';
-        const [forecastResponse, verificationResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse, precipDailyResponse, panguResponse, nwsResponse] = await Promise.all([
+        // Load from saved data and historical bias for both temp and MSLP
+        // (verification table is loaded independently by loadVerificationTable)
+        const [forecastResponse, tempBiasHistoryResponse, mslpBiasHistoryResponse, precipDailyResponse, panguResponse, nwsResponse] = await Promise.all([
             fetch(`/api/latest-forecast?location=${encodeURIComponent(location)}`),
-            fetch(`/api/verification-by-lead-time?location=${encodeURIComponent(location)}&period=${verificationPeriod}`),
             fetch(`/api/temp-bias-history?location=${encodeURIComponent(location)}&lead_time=${tempLeadTime}&days_back=${tempTimeFrame}`),
             fetch(`/api/mslp-bias-history?location=${encodeURIComponent(location)}&lead_time=${mslpLeadTime}&days_back=${mslpTimeFrame}`),
             fetch(`/api/precip-daily-history?location=${encodeURIComponent(location)}&days_back=${document.getElementById('precipDaysBack')?.value || tempTimeFrame}&future_days=15&lead_time=${document.getElementById('precipBiasLeadTime')?.value || 24}`),
@@ -514,7 +513,6 @@ async function loadForecast() {
         ]);
 
         const data = await forecastResponse.json();
-        const verificationData = await verificationResponse.json();
         const tempBiasHistoryData = await tempBiasHistoryResponse.json();
         const mslpBiasHistoryData = await mslpBiasHistoryResponse.json();
         const precipDailyData = await precipDailyResponse.json();
@@ -540,16 +538,6 @@ async function loadForecast() {
         updateInitTimes(data);
         updateFetchedTime(data);
         updateObservedLegend(data);
-
-        // Render verification table with accumulated data across all runs
-        if (verificationData.success && verificationData.verification.lead_times.length > 0) {
-            renderVerificationTable(verificationData.verification);
-            document.getElementById('verificationSection').style.display = '';
-        } else {
-            const tbody = document.getElementById('verificationTableBody');
-            tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">No verification data available yet. Sync forecasts and wait for observations.</td></tr>';
-            document.getElementById('verificationSection').style.display = '';
-        }
 
     } catch (error) {
         console.error('Error loading forecast:', error);

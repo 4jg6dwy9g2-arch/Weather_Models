@@ -243,6 +243,24 @@ AIFS_VARIABLES: Dict[str, Variable] = {
 
     ),
 
+    "d2m": Variable(
+
+        name="dewpoint",
+
+        display_name="2m Dew Point",
+
+        units="F",
+
+        herbie_search="2d",
+
+        category="surface",
+
+        colormap="BrBG",
+
+        contour_levels=list(range(-40, 80, 5))
+
+    ),
+
 }
 
 

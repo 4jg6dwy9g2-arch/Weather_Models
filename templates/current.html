@@ -750,10 +750,6 @@
                     style="border-radius:6px 6px 0 0;border:1px solid #dee2e6;border-bottom:none;background:#fff;font-size:0.82rem;">
                 5-min METAR <span class="badge bg-success ms-1" style="font-size:0.7rem;">Live</span>
             </button>
-            <button id="gravity-src-1min" class="btn btn-sm px-3 py-1 gravity-src-btn"
-                    style="border-radius:6px 6px 0 0;border:1px solid transparent;background:transparent;font-size:0.82rem;color:#6b7280;">
-                1-min Historical <span class="badge bg-secondary ms-1" style="font-size:0.7rem;">28-42h delay</span>
-            </button>
         </div>
         <div class="gravity-toolbar">
             <span id="gravity-status" class="gravity-status">Initializing...</span>
@@ -1921,7 +1917,7 @@ function renderGravityFrame(idx) {
 
 async function loadGravityWaves() {
     initGravityMap();
-    setGravityStatus(gravitySource === 'metar' ? 'Loading 5-min METAR pressure perturbations...' : 'Loading 1-min ASOS pressure perturbations...');
+    setGravityStatus('Loading 5-min METAR pressure perturbations...');
     clearGravityMarkers();
     stopGravityLoop();
     // Clear cached analysis — frame count may change on reload
@@ -2438,27 +2434,6 @@ document.getElementById('gravityTabBtn').addEventListener('shown.bs.tab', () => 
     setTimeout(() => gravityMap && gravityMap.invalidateSize(), 50);
 });
 
-// Gravity source subtab switching
-document.querySelectorAll('.gravity-src-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-        const newSource = btn.id === 'gravity-src-metar' ? 'metar' : '1min';
-        if (newSource === gravitySource) return;
-        gravitySource = newSource;
-
-        // Update active styling
-        document.querySelectorAll('.gravity-src-btn').forEach(b => {
-            const active = b.id === btn.id;
-            b.classList.toggle('active', active);
-            b.style.background     = active ? '#fff' : 'transparent';
-            b.style.border         = active ? '1px solid #dee2e6' : '1px solid transparent';
-            b.style.borderBottom   = active ? 'none' : '';
-            b.style.color          = active ? '' : '#6b7280';
-        });
-
-        gravityData = null;
-        loadGravityWaves();
-    });
-});
 
 document.getElementById('gravity-reload-btn').addEventListener('click', loadGravityWaves);
 document.getElementById('gravity-window').addEventListener('change', loadGravityWaves);
