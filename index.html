@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-23 15:10 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-23 15:23 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -180,6 +180,60 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
   </div>
 </div>
 
+<!-- SPOTLIGHT OBS DETAIL (IAD, FME only) -->
+<div id="obsDetail" class="card mb-3 d-none">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span><i class="bi bi-clock-history"></i> Observations &amp; Bias &mdash; <strong id="obsDetailName"></strong></span>
+    <div class="d-flex gap-2 align-items-center">
+      <label class="form-label small text-muted mb-0">Lead:</label>
+      <select class="form-select form-select-sm" id="obsLtSelect" style="width:auto">
+        <option value="24" selected>24h</option>
+        <option value="72">72h</option>
+        <option value="168">7d</option>
+      </select>
+    </div>
+  </div>
+  <div class="card-body">
+    <p class="small text-muted mb-2">Observed value (line) and model bias (bars, hover for details).
+      <span class="ms-2">
+        <span style="display:inline-block;width:10px;height:10px;background:#0d6efd;border-radius:2px"></span> GFS&nbsp;
+        <span style="display:inline-block;width:10px;height:10px;background:#0dcaf0;border-radius:2px"></span> AIFS&nbsp;
+        <span style="display:inline-block;width:10px;height:10px;background:#20c997;border-radius:2px"></span> IFS&nbsp;
+        <span style="display:inline-block;width:10px;height:10px;background:#6c757d;border-radius:2px"></span> NWS
+      </span>
+    </p>
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-thermometer-half"></i> Temperature</div>
+          <div class="card-body">
+            <div style="position:relative;height:180px"><canvas id="obsTempLineChart"></canvas></div>
+            <div style="position:relative;height:150px;margin-top:8px"><canvas id="obsTempBiasChart"></canvas></div>
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-droplet-half"></i> Dew Point</div>
+          <div class="card-body">
+            <div style="position:relative;height:180px"><canvas id="obsDewLineChart"></canvas></div>
+            <div style="position:relative;height:150px;margin-top:8px"><canvas id="obsDewBiasChart"></canvas></div>
+          </div>
+        </div>
+      </div>
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header"><i class="bi bi-cloud-rain"></i> Precipitation (6-hour)</div>
+          <div class="card-body">
+            <div style="position:relative;height:180px"><canvas id="obsPrecipLineChart"></canvas></div>
+            <div style="position:relative;height:150px;margin-top:8px"><canvas id="obsPrecipBiasChart"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- MEAN VERIFICATION TABLE -->
 <div class="card mb-3">
   <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
@@ -286,20 +340,25 @@ const MODEL_IDX = {gfs:0,aifs:1,ifs:2,nws:3};
 const VAR_IDX   = {temp:0,precip:1,dewpoint:2,mslp:3};
 const VAR_UNITS = {temp:'°F',precip:'in',dewpoint:'°F',mslp:'mb'};
 const VAR_PRECIP = 'precip';
+const SPOTLIGHT_STATIONS = new Set(['IAD','FME']);
 
 let MAP_DATA = null, TABLE_DATA = null, TS_DATA = null;
 let asosMap = null, markers = [];
 let dtCharts = {};
 let tsChart = null;
 let detailSt = null, detailIsMonthly = false;
+let OBS_DATA = null;
+let obsCharts = {};
+let obsSid = null;
 
 async function loadAll() {
-  const [m, t, ts] = await Promise.all([
+  const [m, t, ts, obs] = await Promise.all([
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
+    fetch('data/station_obs.json').then(r => r.json()).catch(() => null),
   ]);
-  MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts;
+  MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs;
 
   // Populate lead-time dropdown from published lead times
   const sel = document.getElementById('selLt');
@@ -452,6 +511,14 @@ function closeDetail() {
   Object.values(dtCharts).forEach(c => c?.destroy());
   dtCharts = {};
   detailSt = null;
+  closeObsDetail();
+}
+
+function closeObsDetail() {
+  document.getElementById('obsDetail').classList.add('d-none');
+  Object.values(obsCharts).forEach(c => c?.destroy());
+  obsCharts = {};
+  obsSid = null;
 }
 
 function buildVarChart(canvasId, varKey, unit, metric) {
@@ -511,6 +578,144 @@ function renderDetailCharts() {
   buildVarChart('dtMslpChart',  'mslp',    'mb',  metric);
 }
 
+function renderObsCharts(sid, lt) {
+  const records = OBS_DATA?.[sid]?.[String(lt)];
+  if (!records || !records.length) return;
+
+  const labels = records.map(r => {
+    const d = new Date(r.t);
+    const md = d.toLocaleDateString('en-US', {month:'numeric', day:'numeric'});
+    const hh = d.toLocaleTimeString('en-US', {hour:'2-digit', hour12:false});
+    return `${md} ${hh}Z`;
+  });
+
+  const mStyles = {
+    gfs:  {bg:'#0d6efd'},
+    aifs: {bg:'#0dcaf0'},
+    ifs:  {bg:'#20c997'},
+    nws:  {bg:'#6c757d'},
+  };
+  const mOrder = ['gfs','aifs','ifs','nws'];
+
+  function buildBiasSets(key) {
+    const rankData = mOrder.map(() => []);
+    const rankBg   = mOrder.map(() => []);
+    const rankModel = mOrder.map(() => []);
+    let hasAny = false;
+    for (let i = 0; i < records.length; i++) {
+      const entries = [];
+      for (const m of mOrder) {
+        const v = records[i][key]?.[m];
+        if (v !== null && v !== undefined) entries.push({m, v});
+      }
+      entries.sort((a,b) => Math.abs(a.v) - Math.abs(b.v));
+      for (let r = 0; r < mOrder.length; r++) {
+        const e = entries[r];
+        if (e) {
+          rankData[r].push(e.v);
+          rankBg[r].push(mStyles[e.m].bg);
+          rankModel[r].push(e.m);
+          hasAny = true;
+        } else {
+          rankData[r].push(null);
+          rankBg[r].push('rgba(0,0,0,0)');
+          rankModel[r].push(null);
+        }
+      }
+    }
+    if (!hasAny) return [];
+    return mOrder.map((_, r) => {
+      if (!rankData[r].some(v => v !== null)) return null;
+      return {
+        label: `Layer ${r+1}`,
+        data: rankData[r],
+        backgroundColor: rankBg[r],
+        borderColor: rankBg[r],
+        borderWidth: 1,
+        grouped: false,
+        barPercentage: 0.95,
+        categoryPercentage: 1.0,
+        modelByIndex: rankModel[r],
+      };
+    }).filter(Boolean);
+  }
+
+  function biasTooltip(unit) {
+    return {
+      callbacks: {
+        label: ctx => {
+          const m = ctx.dataset.modelByIndex?.[ctx.dataIndex];
+          const name = m ? m.toUpperCase() : 'Model';
+          const v = ctx.parsed.y;
+          if (v === null || v === undefined) return null;
+          const dp = unit === 'in' ? 3 : 2;
+          return `${name}: ${v > 0 ? '+' : ''}${v.toFixed(dp)} ${unit}`;
+        }
+      }
+    };
+  }
+
+  const xScale = {grid:{display:false}, ticks:{maxRotation:45, minRotation:45, font:{size:9}}};
+
+  function makeObs(id, type, datasets, yTitle, extraOpts) {
+    if (obsCharts[id]) obsCharts[id].destroy();
+    const opts = {
+      responsive: true, maintainAspectRatio: false,
+      interaction: {mode:'index', intersect:false},
+      plugins: {legend:{position:'top', labels:{usePointStyle:true, padding:10, font:{size:10}}}},
+      scales: {
+        y: {grid:{color:'#e8e8e8'}, title:{display:true, text:yTitle}},
+        x: xScale,
+      },
+      ...extraOpts,
+    };
+    obsCharts[id] = new Chart(document.getElementById(id), {type, data:{labels, datasets}, options:opts});
+  }
+
+  function makeBias(id, datasets, yTitle, unit) {
+    if (obsCharts[id]) obsCharts[id].destroy();
+    obsCharts[id] = new Chart(document.getElementById(id), {
+      type: 'bar',
+      data: {labels, datasets},
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: {mode:'index', intersect:false},
+        plugins: {legend:{display:false}, tooltip: biasTooltip(unit)},
+        scales: {
+          y: {grid:{color:'#e8e8e8'}, title:{display:true, text:yTitle}},
+          x: xScale,
+        },
+      },
+    });
+  }
+
+  // Temperature
+  makeObs('obsTempLineChart', 'line',
+    [{label:'Temp (°F)', data:records.map(r => r.ot),
+       borderColor:'#dc3545', backgroundColor:'rgba(220,53,69,.1)',
+       borderWidth:2, tension:0.3, pointRadius:2, pointHoverRadius:5}],
+    'Temperature (°F)');
+  makeBias('obsTempBiasChart', buildBiasSets('tb'), 'Bias (°F)', '°F');
+
+  // Dew point
+  makeObs('obsDewLineChart', 'line',
+    [{label:'Dew Point (°F)', data:records.map(r => r.od),
+       borderColor:'#7c3aed', backgroundColor:'rgba(124,58,237,.1)',
+       borderWidth:2, tension:0.3, pointRadius:2, pointHoverRadius:5}],
+    'Dew Point (°F)');
+  makeBias('obsDewBiasChart', buildBiasSets('db'), 'Bias (°F)', '°F');
+
+  // Precipitation
+  makeObs('obsPrecipLineChart', 'line',
+    [{label:'6-hr Precip (in)', data:records.map(r => r.op),
+       borderColor:'#20c997', backgroundColor:'rgba(32,201,151,.1)',
+       borderWidth:2, tension:0.3, pointRadius:2, pointHoverRadius:5}],
+    'Precip (in)',
+    {plugins:{legend:{position:'top', labels:{usePointStyle:true, padding:10, font:{size:10}}}},
+      scales:{y:{grid:{color:'#e8e8e8'}, title:{display:true,text:'Precip (in)'}, beginAtZero:true}, x:xScale}});
+  makeBias('obsPrecipBiasChart', buildBiasSets('pb'), 'Bias (in)', 'in');
+}
+
 function openDetail(sid, st, isMonthly) {
   detailSt = st;
   detailIsMonthly = isMonthly;
@@ -518,6 +723,14 @@ function openDetail(sid, st, isMonthly) {
   const periodLabel = isMonthly ? ' — last 20 days' : '';
   document.getElementById('detailName').textContent = st.name + ' (' + sid + ')' + periodLabel;
   renderDetailCharts();
+  if (SPOTLIGHT_STATIONS.has(sid) && OBS_DATA?.[sid]) {
+    obsSid = sid;
+    document.getElementById('obsDetailName').textContent = st.name + ' (' + sid + ')';
+    document.getElementById('obsDetail').classList.remove('d-none');
+    renderObsCharts(sid, parseInt(document.getElementById('obsLtSelect').value, 10));
+  } else {
+    closeObsDetail();
+  }
   document.getElementById('stationDetail').scrollIntoView({behavior:'smooth', block:'start'});
 }
 
@@ -689,6 +902,12 @@ document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventL
 
 ['tsVar','tsMetric','tsLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderTs));
+
+document.getElementById('obsLtSelect').addEventListener('change', () => {
+  if (obsSid && OBS_DATA?.[obsSid]) {
+    renderObsCharts(obsSid, parseInt(document.getElementById('obsLtSelect').value, 10));
+  }
+});
 
 // Fix two-row sticky thead: offset second row by first row's rendered height
 function fixStickyHeader() {
