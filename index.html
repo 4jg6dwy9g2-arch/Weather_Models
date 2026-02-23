@@ -6,6 +6,7 @@
 <title>ASOS Model Verification</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -30,7 +31,60 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-23 13:55 UTC &mdash; <span id="stationCount">loading...</span></small>
+    <small class="text-muted">Updated 2026-02-23 14:50 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+  </div>
+</div>
+
+<!-- Methodology modal -->
+<div class="modal fade" id="methodologyModal" tabindex="-1" aria-labelledby="methodologyModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="methodologyModalLabel"><i class="bi bi-info-circle"></i> Methodology</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <h6>Data Source</h6>
+        <p>Observations come from the <a href="https://mesonet.agron.iastate.edu/ASOS/" target="_blank">ASOS (Automated Surface Observing System)</a> network via Iowa Environmental Mesonet (IEM). Roughly 2,500 stations across the US report temperature, dew point, pressure, and precipitation.</p>
+
+        <h6>Models</h6>
+        <ul>
+          <li><strong>GFS</strong> &mdash; NOAA Global Forecast System, 0.25° resolution, out to 15 days (360h)</li>
+          <li><strong>AIFS</strong> &mdash; ECMWF AI Integrated Forecasting System, out to 15 days (360h)</li>
+          <li><strong>IFS</strong> &mdash; ECMWF Integrated Forecasting System (open data), out to 15 days (360h)</li>
+          <li><strong>NWS</strong> &mdash; National Weather Service point forecasts via the NWS API, limited to 7 days (168h)</li>
+        </ul>
+
+        <h6>Variables</h6>
+        <ul>
+          <li><strong>Temperature</strong> &mdash; 2-meter air temperature (°F). Matched to hourly METAR observations.</li>
+          <li><strong>Dew Point</strong> &mdash; 2-meter dew point temperature (°F). Matched to hourly METAR observations.</li>
+          <li><strong>Precipitation</strong> &mdash; 6-hour accumulated precipitation (in). Requires at least 4 of 6 hourly reports to be present; computed from the final per-hour METAR accumulation total.</li>
+          <li><strong>Pressure</strong> &mdash; Altimeter setting (mb). Matched to automated 5-minute ASOS pressure observations.</li>
+        </ul>
+
+        <h6>Observation Matching</h6>
+        <p>Each model grid point is bilinearly interpolated to the station location. For each forecast valid time, the nearest qualifying observation within a 30-minute window is used. Because ASOS stations report temperature and dew point at :56 past the hour (in METARs) and pressure every 5 minutes, a composite matching approach is used: the closest observation containing each variable is found independently, so no variable is penalized by the timing of another.</p>
+
+        <h6>Metrics</h6>
+        <ul>
+          <li><strong>MAE</strong> (Mean Absolute Error) &mdash; average of |forecast &minus; observed| across all matched cases. Lower is better; always &ge; 0.</li>
+          <li><strong>Bias</strong> &mdash; average of (forecast &minus; observed). Positive = model runs warm/wet/high; negative = model runs cold/dry/low.</li>
+        </ul>
+
+        <h6>Lead Times</h6>
+        <p>Verification is computed at every 6-hour forecast lead from 6h to 360h (15 days). The map and station charts show a subset of these leads.</p>
+
+        <h6>Averaging Periods</h6>
+        <ul>
+          <li><strong>All-time</strong> &mdash; all forecast runs stored in the database (typically 30+ days).</li>
+          <li><strong>Last 20 days</strong> &mdash; rolling window limited to the most recent 20 days of runs.</li>
+        </ul>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
   </div>
 </div>
 
