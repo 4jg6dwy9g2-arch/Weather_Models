@@ -30,7 +30,7 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-23 13:24 UTC &mdash; <span id="stationCount">loading...</span></small>
+    <small class="text-muted">Updated 2026-02-23 13:29 UTC &mdash; <span id="stationCount">loading...</span></small>
   </div>
 </div>
 
@@ -62,6 +62,10 @@ thead th { position: sticky; top: 0; background: white; z-index: 1; }
         <option value="nws">NWS</option>
       </select>
       <select class="form-select form-select-sm" id="selLt" style="width:auto"></select>
+      <div class="form-check form-switch align-self-center ms-1" id="mapPeriodWrap" style="display:none!important">
+        <input class="form-check-input" type="checkbox" id="mapPeriodToggle">
+        <label class="form-check-label small" for="mapPeriodToggle">Last 20 days</label>
+      </div>
     </div>
   </div>
   <div class="card-body p-0">
@@ -246,6 +250,11 @@ async function loadAll() {
     Object.keys(MAP_DATA.stations).length + ' stations';
   document.getElementById('loadingBanner').classList.add('d-none');
 
+  // Show map period toggle only if monthly data was published
+  if (MAP_DATA.monthly) {
+    document.getElementById('mapPeriodWrap').style.removeProperty('display');
+  }
+
   initMap();
   renderMap();
   renderTable();
@@ -318,6 +327,9 @@ function renderMap() {
   const metric   = document.getElementById('selMetric').value;
   const model    = document.getElementById('selModel').value;
   const lt       = parseInt(document.getElementById('selLt').value, 10);
+  const useMonthly = document.getElementById('mapPeriodToggle').checked && MAP_DATA.monthly;
+
+  const stationSet = useMonthly ? MAP_DATA.monthly : MAP_DATA.stations;
 
   const mi = MODEL_IDX[model] ?? 0;
   const vi = VAR_IDX[variable] ?? 0;
@@ -329,7 +341,7 @@ function renderMap() {
 
   const maxScale = variable === VAR_PRECIP ? 1 : 10;
 
-  for (const [sid, st] of Object.entries(MAP_DATA.stations)) {
+  for (const [sid, st] of Object.entries(stationSet)) {
     const entry = st.d?.[mi]?.[vi]?.[ltIdx];
     if (!entry) continue;
     const [mae, bias] = entry;
@@ -354,7 +366,7 @@ function renderMap() {
       `Bias: ${sign}${bias?.toFixed(2)} ${VAR_UNITS[variable]}`,
       {direction:'top', offset:[0,-5]}
     );
-    marker.on('click', () => openDetail(sid, st));
+    marker.on('click', () => openDetail(sid, st, useMonthly));
     marker.addTo(asosMap);
     markers.push(marker);
   }
@@ -369,9 +381,10 @@ function closeDetail() {
   dtCharts = {};
 }
 
-function openDetail(sid, st) {
+function openDetail(sid, st, isMonthly) {
   document.getElementById('stationDetail').classList.remove('d-none');
-  document.getElementById('detailName').textContent = st.name + ' (' + sid + ')';
+  const periodLabel = isMonthly ? ' — last 20 days' : '';
+  document.getElementById('detailName').textContent = st.name + ' (' + sid + ')' + periodLabel;
 
   const labels = MAP_DATA.lead_times.map(lt =>
     lt < 24 ? lt + 'h' : (lt % 24 === 0 ? (lt/24) + 'd' : lt + 'h'));
@@ -605,6 +618,7 @@ function renderTs() {
 // ============================================================
 ['selVar','selMetric','selModel','selLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderMap));
+document.getElementById('mapPeriodToggle').addEventListener('change', renderMap);
 
 document.getElementById('periodToggle').addEventListener('change', renderTable);
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
