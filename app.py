@@ -79,6 +79,9 @@ except Exception:  # pragma: no cover - optional dependency
     ZoneInfo = None
 from pangu_integration import pangu_bp, cleanup_database, load_runs_db
 import radar as _radar
+import drought_monitor as _drought_monitor
+import storm_reports as _storm_reports
+import drought_crops as _drought_crops
 
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = DATA_DIR / "forecasts.json"
@@ -6304,6 +6307,12 @@ def api_runs():
     })
 
 
+@app.route('/crops')
+def crops_page():
+    """US Crops page — USDA NASS Cropland Data Layer map."""
+    return render_template('crops.html')
+
+
 @app.route('/verification')
 def verification_page():
     """Model verification page with Fairfax + ASOS tabs."""
@@ -9451,6 +9460,16 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
             results['asos'] = {'status': 'error', 'error': str(e)}
             results['errors'].append(f"ASOS: {str(e)}")
 
+        # Sync storm reports (non-critical — runs every sync)
+        try:
+            sr = _storm_reports.sync_storm_reports()
+            results['storm_reports'] = sr
+            broadcast_sync_log(f"Storm reports: {sr.get('report_count', 0)} reports cached", 'info')
+        except Exception as e:
+            broadcast_sync_log(f"Warning: Storm reports sync failed: {e}", 'warning')
+            logger.warning("Storm reports sync failed: %s", e)
+            results['storm_reports'] = {'status': 'error', 'error': str(e)}
+
         # Check if any critical errors occurred
         if results['errors']:
             results['success'] = False
@@ -10707,6 +10726,51 @@ def export_radar_gif():
     filename = f"radar_{product_key}_{ts}.gif"
     return send_file(buf, mimetype="image/gif", as_attachment=True,
                      download_name=filename)
+
+
+@app.route('/api/storm-reports')
+def api_storm_reports():
+    """Return cached SPC storm reports as JSON, or 404 if not yet synced."""
+    data = _storm_reports.load_storm_reports()
+    if data is None:
+        return jsonify({"error": "Storm reports not available. Run a sync first."}), 404
+    return jsonify(data)
+
+
+@app.route('/api/drought-monitor')
+def api_drought_monitor():
+    """Return cached US Drought Monitor GeoJSON, or 404 if not yet synced."""
+    data = _drought_monitor.load_drought_data()
+    if data is None:
+        return jsonify({"error": "Drought monitor data not available. Run sync_drought.py first."}), 404
+    return jsonify(data)
+
+
+@app.route('/api/drought-monitor/sync', methods=['POST'])
+def api_drought_monitor_sync():
+    """Trigger a manual refresh of the US Drought Monitor cache."""
+    result = _drought_monitor.sync_drought_monitor()
+    status = 200 if result.get("success") else 500
+    return jsonify(result), status
+
+
+@app.route('/api/drought-crops/timeseries')
+def api_drought_crops_timeseries():
+    """Return precomputed drought-crop exposure time series, or 404 if cache missing."""
+    data = _drought_crops.load_timeseries()
+    if data is None:
+        return jsonify({"success": False, "error": "No timeseries cache. Run compute_drought_crops.py first."}), 404
+    return jsonify({"success": True, **data})
+
+
+@app.route('/api/drought-crops/rebuild', methods=['POST'])
+def api_drought_crops_rebuild():
+    """Kick off a background rebuild of the drought-crop timeseries cache."""
+    import threading
+    def _run():
+        _drought_crops.build_timeseries()
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"success": True, "message": "Rebuild started in background"})
 
 
 if __name__ == '__main__':

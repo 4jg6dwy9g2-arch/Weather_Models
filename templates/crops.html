@@ -1,0 +1,288 @@
+{% extends "base.html" %}
+
+{% block title %}US Crops — USDA Cropland Data Layer{% endblock %}
+
+{% block extra_css %}
+<style>
+#cropsMap {
+    height: calc(100vh - 220px);
+    min-height: 450px;
+    background: #dde8d0;  /* soft green — visible before tiles load */
+}
+
+.crop-legend {
+    font-size: 0.78rem;
+    line-height: 1.6;
+}
+
+.crop-legend .swatch {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border-radius: 2px;
+    vertical-align: middle;
+    margin-right: 5px;
+    border: 1px solid rgba(0,0,0,0.15);
+}
+
+#opacitySlider {
+    width: 120px;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+    <div>
+        <h5 class="mb-0"><i class="bi bi-tree"></i> US Cropland Data Layer — 2024</h5>
+        <small class="text-muted">
+            USDA NASS CDL &mdash; 10m resolution &mdash; released Feb 2025 &mdash;
+            <a href="https://www.nass.usda.gov/Research_and_Science/Cropland/" target="_blank">About CDL</a>
+        </small>
+    </div>
+    <div class="d-flex align-items-center gap-3 flex-wrap">
+        <!-- Storm report toggles -->
+        <div class="d-flex align-items-center gap-2 border-end pe-3">
+            <span class="small text-muted">Storm reports:</span>
+            <div class="form-check form-check-inline mb-0">
+                <input class="form-check-input" type="checkbox" id="showTorn" checked>
+                <label class="form-check-label small fw-semibold" for="showTorn" style="color:#b91c1c">&#x25CF; Tornado (<span id="tornCount">–</span>)</label>
+            </div>
+            <div class="form-check form-check-inline mb-0">
+                <input class="form-check-input" type="checkbox" id="showHail" checked>
+                <label class="form-check-label small fw-semibold" for="showHail" style="color:#15803d">&#x25CF; Hail (<span id="hailCount">–</span>)</label>
+            </div>
+            <div class="form-check form-check-inline mb-0">
+                <input class="form-check-input" type="checkbox" id="showWind" checked>
+                <label class="form-check-label small fw-semibold" for="showWind" style="color:#1d4ed8">&#x25CF; Wind (<span id="windCount">–</span>)</label>
+            </div>
+            <select class="form-select form-select-sm" id="reportHours" style="width:auto">
+                <option value="24">Last 24 h</option>
+                <option value="48" selected>Last 48 h</option>
+                <option value="72">Last 72 h</option>
+                <option value="0">All available</option>
+            </select>
+        </div>
+        <!-- CDL opacity -->
+        <label class="small text-muted mb-0">CDL opacity:</label>
+        <input type="range" class="form-range" id="opacitySlider" min="10" max="100" value="80">
+        <span id="opacityLabel" class="small text-muted" style="width:2.5rem">80%</span>
+    </div>
+</div>
+
+<div class="row g-3">
+    <!-- Map -->
+    <div class="col-lg-9">
+        <div class="card shadow-sm">
+            <div class="card-body p-0">
+                <div id="cropsMap"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Legend -->
+    <div class="col-lg-3">
+        <div class="card shadow-sm h-100">
+            <div class="card-header"><i class="bi bi-palette"></i> Crop Categories</div>
+            <div class="card-body crop-legend" style="overflow-y:auto; max-height: calc(100vh - 260px);">
+
+                <div class="fw-semibold text-muted small mb-1">GRAINS</div>
+                <div><span class="swatch" style="background:#FFD300"></span>Corn</div>
+                <div><span class="swatch" style="background:#267000"></span>Soybeans</div>
+                <div><span class="swatch" style="background:#A57000"></span>Winter Wheat</div>
+                <div><span class="swatch" style="background:#D69EBC"></span>Spring Wheat</div>
+                <div><span class="swatch" style="background:#A5E80A"></span>Durum Wheat</div>
+                <div><span class="swatch" style="background:#73B2FF"></span>Oats</div>
+                <div><span class="swatch" style="background:#E8BEFF"></span>Sorghum</div>
+                <div><span class="swatch" style="background:#896054"></span>Barley</div>
+                <div><span class="swatch" style="background:#D1FF73"></span>Rye</div>
+
+                <div class="fw-semibold text-muted small mt-2 mb-1">OTHER CROPS</div>
+                <div><span class="swatch" style="background:#FF2626"></span>Cotton</div>
+                <div><span class="swatch" style="background:#FF9E0A"></span>Rice</div>
+                <div><span class="swatch" style="background:#FFFF7C"></span>Sunflower</div>
+                <div><span class="swatch" style="background:#A800E8"></span>Alfalfa</div>
+                <div><span class="swatch" style="background:#00AF4C"></span>Tobacco</div>
+                <div><span class="swatch" style="background:#FFD37F"></span>Peanuts</div>
+                <div><span class="swatch" style="background:#E600A9"></span>Sugarbeets</div>
+                <div><span class="swatch" style="background:#F5F57A"></span>Sugarcane</div>
+                <div><span class="swatch" style="background:#93CC93"></span>Potatoes</div>
+
+                <div class="fw-semibold text-muted small mt-2 mb-1">VEGETABLES & FRUITS</div>
+                <div><span class="swatch" style="background:#93CC93"></span>Vegetables</div>
+                <div><span class="swatch" style="background:#BED2FF"></span>Fruits &amp; Orchards</div>
+                <div><span class="swatch" style="background:#70A800"></span>Grapes</div>
+
+                <div class="fw-semibold text-muted small mt-2 mb-1">LAND COVER</div>
+                <div><span class="swatch" style="background:#E8FFBF"></span>Pasture / Grass</div>
+                <div><span class="swatch" style="background:#CCBFA3"></span>Fallow / Idle</div>
+                <div><span class="swatch" style="background:#5C5C5C"></span>Developed</div>
+                <div><span class="swatch" style="background:#267300"></span>Forest</div>
+                <div><span class="swatch" style="background:#4870EB"></span>Open Water</div>
+                <div><span class="swatch" style="background:#7AF5CA"></span>Wetlands</div>
+                <div><span class="swatch" style="background:#B5B5B5"></span>Shrubland</div>
+
+                <div class="mt-3 text-muted" style="font-size:0.72rem">
+                    Source: <a href="https://www.nass.usda.gov/Research_and_Science/Cropland/" target="_blank">USDA NASS</a>
+                    via <a href="https://nassgeodata.gmu.edu/CropScape/" target="_blank">CropScape WMS</a>.<br>
+                    Colors are approximate — the CDL contains 100+ categories.
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// EPSG:4326 map — the NASS CDL WMS supports EPSG:4326 but not EPSG:3857
+const map = L.map('cropsMap', {
+    crs: L.CRS.EPSG4326,
+    center: [39.5, -98.5],
+    zoom: 4,
+    minZoom: 3,
+    maxZoom: 10
+});
+
+// USDA NASS Cropland Data Layer 2024 — WMS requests will use SRS=EPSG:4326
+const cdlLayer = L.tileLayer.wms('https://nassgeodata.gmu.edu/CropScapeService/wms_cdlall.cgi', {
+    layers: 'cdl_2024',
+    format: 'image/png',
+    transparent: true,
+    version: '1.1.1',
+    opacity: 0.85,
+    attribution: 'USDA NASS Cropland Data Layer 2024'
+}).addTo(map);
+
+// US state outlines for geographic context (replaces OSM, which doesn't serve EPSG:4326 tiles)
+fetch('https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json')
+    .then(r => r.json())
+    .then(data => {
+        L.geoJSON(data, {
+            style: { color: '#444', weight: 0.8, fillOpacity: 0 }
+        }).addTo(map);
+    });
+
+// CDL opacity slider
+const slider = document.getElementById('opacitySlider');
+const label  = document.getElementById('opacityLabel');
+slider.addEventListener('input', function() {
+    const v = parseInt(this.value);
+    label.textContent = v + '%';
+    cdlLayer.setOpacity(v / 100);
+});
+
+// ── Storm Reports ──────────────────────────────────────────────
+const STORM_COLORS = { torn: '#b91c1c', hail: '#15803d', wind: '#1d4ed8' };
+const STORM_FILL   = { torn: '#ef4444', hail: '#22c55e', wind: '#3b82f6' };
+
+let stormMarkers = { torn: [], hail: [], wind: [] };
+let stormData    = null;
+
+function tornRadius(mag) {
+    // EF0=5 EF1=6 EF2=7 EF3=9 EF4=11 EF5=13  unknown=5
+    const m = mag ? mag.replace(/[^0-9]/g, '') : '';
+    const n = parseInt(m);
+    if (isNaN(n)) return 5;
+    return [5, 6, 7, 9, 11, 13][Math.min(n, 5)];
+}
+function hailRadius(mag) {
+    // size in inches (may be decimal like "0.75")
+    const s = parseFloat(mag);
+    if (isNaN(s)) return 4;
+    if (s < 1.0) return 4;
+    if (s < 2.0) return 6;
+    return 8;
+}
+function windRadius(mag) {
+    const s = parseInt(mag);
+    if (isNaN(s)) return 4;
+    return s >= 75 ? 8 : 5;
+}
+
+function buildPopup(r) {
+    const typeLabel = { torn: 'Tornado', hail: 'Hail', wind: 'Wind' }[r.type];
+    const magLabel  = { torn: 'Rating', hail: 'Size (in)', wind: 'Speed (mph)' }[r.type];
+    return `<strong>${typeLabel}</strong><br>
+            ${r.time ? r.time.slice(0,2)+':'+r.time.slice(2)+' UTC' : ''} ${r.date}<br>
+            ${r.location}, ${r.county} Co., ${r.state}<br>
+            <em>${magLabel}:</em> ${r.magnitude || '–'}<br>
+            ${r.comments ? '<small>'+r.comments+'</small>' : ''}`;
+}
+
+function clearStormMarkers(type) {
+    stormMarkers[type].forEach(m => map.removeLayer(m));
+    stormMarkers[type] = [];
+}
+
+function renderStormReports() {
+    if (!stormData) return;
+
+    const hoursBack = parseInt(document.getElementById('reportHours').value);
+    const showTorn  = document.getElementById('showTorn').checked;
+    const showHail  = document.getElementById('showHail').checked;
+    const showWind  = document.getElementById('showWind').checked;
+    const show      = { torn: showTorn, hail: showHail, wind: showWind };
+
+    const cutoff = hoursBack > 0
+        ? new Date(Date.now() - hoursBack * 3600 * 1000)
+        : null;
+
+    const counts = { torn: 0, hail: 0, wind: 0 };
+
+    for (const type of ['torn', 'hail', 'wind']) {
+        clearStormMarkers(type);
+        if (!show[type]) continue;
+
+        const reports = stormData.reports.filter(r => {
+            if (r.type !== type) return false;
+            if (cutoff && r.iso_time) {
+                return new Date(r.iso_time) >= cutoff;
+            }
+            return true;
+        });
+
+        counts[type] = reports.length;
+
+        const radiusFn = type === 'torn' ? tornRadius : type === 'hail' ? hailRadius : windRadius;
+
+        for (const r of reports) {
+            const m = L.circleMarker([r.lat, r.lon], {
+                radius:      radiusFn(r.magnitude),
+                color:       STORM_COLORS[type],
+                weight:      1.5,
+                fillColor:   STORM_FILL[type],
+                fillOpacity: 0.75,
+            });
+            m.bindPopup(buildPopup(r));
+            m.addTo(map);
+            stormMarkers[type].push(m);
+        }
+    }
+
+    document.getElementById('tornCount').textContent = counts.torn;
+    document.getElementById('hailCount').textContent = counts.hail;
+    document.getElementById('windCount').textContent = counts.wind;
+}
+
+async function loadStormReports() {
+    try {
+        const resp = await fetch('/api/storm-reports');
+        if (!resp.ok) return;
+        stormData = await resp.json();
+        renderStormReports();
+    } catch (e) {
+        console.warn('[storm reports] fetch failed:', e);
+    }
+}
+
+document.getElementById('showTorn').addEventListener('change', renderStormReports);
+document.getElementById('showHail').addEventListener('change', renderStormReports);
+document.getElementById('showWind').addEventListener('change', renderStormReports);
+document.getElementById('reportHours').addEventListener('change', renderStormReports);
+
+loadStormReports();
+</script>
+{% endblock %}
