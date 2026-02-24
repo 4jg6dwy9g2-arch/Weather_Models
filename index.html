@@ -18,8 +18,8 @@ body { font-size: 0.875rem; }
 .chart-wrap { position: relative; height: 260px; }
 .chart-wrap-sm { position: relative; height: 200px; }
 th, td { white-space: nowrap; font-size: 0.78rem; padding: 0.25rem 0.4rem !important; }
-thead tr:first-child th { position: sticky; top: 0; background: white; z-index: 2; }
-thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index: 1; }
+thead tr:first-child th { background: white; }
+thead tr:nth-child(2) th { background: white; }
 .color-scale-bar { width: 200px; height: 12px; border-radius: 4px; }
 .card-header { font-size: 0.85rem; }
 .form-select-sm { font-size: 0.8rem; }
@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-24 13:43 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-24 13:44 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -370,7 +370,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-02-24_13:43_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-02-24_13:44_UTC').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs;
 
@@ -960,18 +960,8 @@ document.getElementById('obsLtSelect').addEventListener('change', () => {
   }
 });
 
-// Fix two-row sticky thead: offset second row by first row's rendered height
-function fixStickyHeader() {
-  const row1 = document.querySelector('thead tr:first-child');
-  if (!row1) return;
-  const h = row1.getBoundingClientRect().height;
-  document.querySelectorAll('thead tr:nth-child(2) th').forEach(th => {
-    th.style.top = h + 'px';
-  });
-}
-
 // Boot
-loadAll().then(fixStickyHeader);
+loadAll();
 </script>
 </body>
 </html>
