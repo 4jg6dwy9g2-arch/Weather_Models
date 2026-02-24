@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-24 13:53 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-24 18:04 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -135,6 +135,15 @@ thead tr:nth-child(2) th { background: white; }
       <div id="scaleBar" class="color-scale-bar"></div>
       <span id="scaleMax" class="text-muted small">10</span>
       <span id="scaleUnits" class="text-muted small ms-1"></span>
+    </div>
+    <!-- Drought Monitor Legend (shown only for dewpoint/precip + last-20-days) -->
+    <div id="droughtLegend" class="mt-2 gap-3 justify-content-center flex-wrap pb-2" style="display:none; font-size:0.75rem">
+      <strong>Drought <span id="droughtDate" class="fw-normal text-muted"></span>:</strong>
+      <span><span style="background:#FFFF00;padding:0 6px">&nbsp;</span> D0 Abnormally Dry</span>
+      <span><span style="background:#FCD37F;padding:0 6px">&nbsp;</span> D1 Moderate</span>
+      <span><span style="background:#FFAA00;padding:0 6px">&nbsp;</span> D2 Severe</span>
+      <span><span style="background:#E60000;padding:0 6px">&nbsp;</span> D3 Extreme</span>
+      <span><span style="background:#730000;color:#fff;padding:0 6px">&nbsp;</span> D4 Exceptional</span>
     </div>
   </div>
 </div>
@@ -358,6 +367,7 @@ const SPOTLIGHT_STATIONS = new Set(['IAD','BWI']);
 
 let MAP_DATA = null, TABLE_DATA = null, TS_DATA = null;
 let asosMap = null, markers = [];
+let droughtLayer = null;
 let dtCharts = {};
 let tsChart = null;
 let detailSt = null, detailIsMonthly = false;
@@ -365,12 +375,45 @@ let OBS_DATA = null;
 let obsCharts = {};
 let obsSid = null;
 
+const DROUGHT_COLORS = {0:'#FFFF00',1:'#FCD37F',2:'#FFAA00',3:'#E60000',4:'#730000'};
+
+async function loadDroughtOverlay() {
+  const variable = document.getElementById('selVar').value;
+  const periodToggle = document.getElementById('periodToggle').checked;
+  const showDrought = (variable === 'dewpoint' || variable === 'precip') && periodToggle;
+
+  if (droughtLayer) { asosMap.removeLayer(droughtLayer); droughtLayer = null; }
+  document.getElementById('droughtLegend').style.display = 'none';
+  if (!showDrought) return;
+
+  try {
+    const resp = await fetch('data/drought.json');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    droughtLayer = L.geoJSON(data.geojson, {
+      style: function(feature) {
+        const color = DROUGHT_COLORS[feature.properties.DM] || '#FFFFFF';
+        return {fillColor:color, fillOpacity:0.35, color:color, weight:0.5, opacity:1};
+      },
+      onEachFeature: function(feature, layer) {
+        const labels = ['D0 – Abnormally Dry','D1 – Moderate','D2 – Severe','D3 – Extreme','D4 – Exceptional'];
+        layer.bindTooltip(labels[feature.properties.DM] || 'DM ' + feature.properties.DM, {sticky:true});
+      }
+    }).addTo(asosMap);
+    droughtLayer.bringToBack();
+    if (data.synced_at) document.getElementById('droughtDate').textContent = '(' + data.synced_at + ')';
+    document.getElementById('droughtLegend').style.display = 'flex';
+  } catch(e) {
+    console.warn('[loadDroughtOverlay] Failed:', e);
+  }
+}
+
 async function loadAll() {
   const [m, t, ts, obs] = await Promise.all([
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-02-24_13:53_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-02-24_18:04_UTC').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs;
 
@@ -427,9 +470,9 @@ function getBiasColor(value, variable) {
     }
   } else if (variable === 'dewpoint') {
     if (r < 0) {
-      const t=1+r; return `rgb(${Math.round(249+t*6)},${Math.round(115+t*140)},${Math.round(22+t*233)})`;
+      const t=1+r; return `rgb(${Math.round(139+t*116)},${Math.round(69+t*186)},${Math.round(19+t*236)})`;
     } else {
-      const t=r; return `rgb(${Math.round(255-t*116)},${Math.round(255-t*163)},${Math.round(255-t*9)})`;
+      const t=r; return `rgb(${Math.round(255-t*221)},${Math.round(255-t*58)},${Math.round(255-t*161)})`;
     }
   } else {
     if (r < 0) {
@@ -454,7 +497,7 @@ function updateColorScale(variable, metric) {
     bar.style.background = isP
       ? 'linear-gradient(to right,rgb(139,69,19),white,rgb(34,139,34))'
       : variable === 'dewpoint'
-        ? 'linear-gradient(to right,#f97316,white 50%,#8b5cf6)'
+        ? 'linear-gradient(to right,#8b4513,white 50%,#22c55e)'
         : 'linear-gradient(to right,#3b82f6,white 50%,#ef4444)';
   } else {
     mn.textContent = '0';
@@ -478,6 +521,7 @@ function renderMap() {
   const ltIdx = MAP_DATA.lead_times.indexOf(lt);
 
   updateColorScale(variable, metric);
+  loadDroughtOverlay();
   markers.forEach(m => asosMap.removeLayer(m));
   markers = [];
 
