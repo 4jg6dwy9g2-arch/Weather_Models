@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-24 02:38 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-24 13:37 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -304,7 +304,7 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
 <!-- TIME SERIES CHART -->
 <div class="card mb-3">
   <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span><i class="bi bi-graph-up"></i> Verification Trends (Last 30 Days)</span>
+    <span><i class="bi bi-graph-up"></i> Verification Trends</span>
     <div class="d-flex gap-2 flex-wrap">
       <select class="form-select form-select-sm" id="tsVar" style="width:auto">
         <option value="temp">Temperature</option>
@@ -322,9 +322,23 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
         <option value="72">72h</option>
         <option value="168">7d</option>
       </select>
+      <select class="form-select form-select-sm" id="tsSpan" style="width:auto">
+        <option value="30" selected>1 month</option>
+        <option value="90">3 months</option>
+        <option value="180">6 months</option>
+        <option value="365">1 year</option>
+      </select>
     </div>
   </div>
   <div class="card-body">
+    <div id="tsWinnerTally" class="alert alert-light mb-2 d-none">
+      <strong><i class="bi bi-trophy"></i> Daily Winners (Lowest MAE):</strong>
+      <span class="ms-3"><span class="badge bg-primary">GFS</span> <span id="tsGfsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-info text-dark">AIFS</span> <span id="tsAifsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-success">IFS</span> <span id="tsIfsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-dark">NWS</span> <span id="tsNwsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-secondary">Tie</span> <span id="tsTieWins">0</span> days</span>
+    </div>
     <div style="position:relative;height:350px"><canvas id="tsChart"></canvas></div>
   </div>
 </div>
@@ -356,7 +370,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-02-24_02:38_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-02-24_13:37_UTC').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs;
 
@@ -839,13 +853,22 @@ function renderTs() {
   const variable = document.getElementById('tsVar').value;
   const metric   = document.getElementById('tsMetric').value;
   const lt       = document.getElementById('tsLt').value;
+  const span     = parseInt(document.getElementById('tsSpan').value, 10);
   const combo    = TS_DATA?.[variable]?.[lt];
   const ctx      = document.getElementById('tsChart');
 
   if (tsChart) { tsChart.destroy(); tsChart = null; }
   if (!combo) return;
 
-  const labels = combo.dates.map(d => {
+  // Filter to the last `span` days
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - span);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  const sliceIdx = combo.dates.findIndex(d => d >= cutoffStr);
+  const startIdx = sliceIdx === -1 ? 0 : sliceIdx;
+  const dates = combo.dates.slice(startIdx);
+
+  const labels = dates.map(d => {
     const dt = new Date(d);
     return dt.toLocaleDateString('en-US', {month:'short', day:'numeric'});
   });
@@ -861,7 +884,7 @@ function renderTs() {
     .filter(m => combo[m])
     .map(m => ({
       label: m.toUpperCase(),
-      data: combo[m][metric],
+      data: combo[m][metric].slice(startIdx),
       borderColor: mColors[m].border,
       backgroundColor: mColors[m].bg,
       borderWidth: 2,
@@ -869,6 +892,34 @@ function renderTs() {
       pointRadius: 1,
       pointHoverRadius: 4,
     }));
+
+  // Daily winners tally (MAE only)
+  const tallyEl = document.getElementById('tsWinnerTally');
+  if (metric === 'mae') {
+    const wins = {gfs:0, aifs:0, ifs:0, nws:0, tie:0};
+    for (let i = 0; i < dates.length; i++) {
+      const idx = startIdx + i;
+      const candidates = [];
+      for (const m of ['gfs','aifs','ifs','nws']) {
+        if (!combo[m]) continue;
+        const v = combo[m].mae[idx];
+        if (v != null) candidates.push({key: m, val: v});
+      }
+      if (!candidates.length) continue;
+      const minVal = Math.min(...candidates.map(c => c.val));
+      const winners = candidates.filter(c => c.val === minVal);
+      if (winners.length === 1) wins[winners[0].key]++;
+      else wins.tie++;
+    }
+    document.getElementById('tsGfsWins').textContent  = wins.gfs;
+    document.getElementById('tsAifsWins').textContent = wins.aifs;
+    document.getElementById('tsIfsWins').textContent  = wins.ifs;
+    document.getElementById('tsNwsWins').textContent  = wins.nws;
+    document.getElementById('tsTieWins').textContent  = wins.tie;
+    tallyEl.classList.remove('d-none');
+  } else {
+    tallyEl.classList.add('d-none');
+  }
 
   tsChart = new Chart(ctx, {
     type: 'line',
@@ -907,7 +958,7 @@ document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventLi
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventListener('change', renderDetailCharts));
 
-['tsVar','tsMetric','tsLt'].forEach(id =>
+['tsVar','tsMetric','tsLt','tsSpan'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderTs));
 
 document.getElementById('obsLtSelect').addEventListener('change', () => {
