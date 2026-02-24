@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-24 13:37 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-24 13:43 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -95,6 +95,14 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
   Loading verification data&hellip;
 </div>
 
+<!-- PERIOD TOGGLE (controls both map and table) -->
+<div class="d-flex align-items-center mb-2">
+  <div class="form-check form-switch mb-0">
+    <input class="form-check-input" type="checkbox" id="periodToggle">
+    <label class="form-check-label small text-muted" for="periodToggle">Last 20 days (map &amp; table)</label>
+  </div>
+</div>
+
 <!-- MAP CARD -->
 <div class="card mb-3">
   <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
@@ -117,10 +125,6 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
         <option value="nws">NWS</option>
       </select>
       <select class="form-select form-select-sm" id="selLt" style="width:auto"></select>
-      <div class="form-check form-switch align-self-center ms-1" id="mapPeriodWrap" style="display:none!important">
-        <input class="form-check-input" type="checkbox" id="mapPeriodToggle">
-        <label class="form-check-label small" for="mapPeriodToggle">Last 20 days</label>
-      </div>
     </div>
   </div>
   <div class="card-body p-0">
@@ -239,10 +243,6 @@ thead tr:nth-child(2) th { position: sticky; top: 0; background: white; z-index:
   <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
     <span><i class="bi bi-table"></i> Mean Verification — All Stations</span>
     <div class="d-flex gap-2 flex-wrap align-items-center">
-      <div class="form-check form-switch mb-0 me-1">
-        <input class="form-check-input" type="checkbox" id="periodToggle">
-        <label class="form-check-label small" for="periodToggle">Last 20 days</label>
-      </div>
       <div class="btn-group btn-group-sm">
         <input type="radio" class="btn-check" name="tableMetric" id="tm-mae" value="mae" autocomplete="off" checked>
         <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
@@ -370,7 +370,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-02-24_13:37_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-02-24_13:43_UTC').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs;
 
@@ -387,11 +387,6 @@ async function loadAll() {
   document.getElementById('stationCount').textContent =
     Object.keys(MAP_DATA.stations).length + ' stations';
   document.getElementById('loadingBanner').classList.add('d-none');
-
-  // Show map period toggle only if monthly data was published
-  if (MAP_DATA.monthly) {
-    document.getElementById('mapPeriodWrap').style.removeProperty('display');
-  }
 
   initMap();
   renderMap();
@@ -466,7 +461,7 @@ function renderMap() {
   const metric   = document.getElementById('selMetric').value;
   const model    = document.getElementById('selModel').value;
   const lt       = parseInt(document.getElementById('selLt').value, 10);
-  const useMonthly = document.getElementById('mapPeriodToggle').checked && MAP_DATA.monthly;
+  const useMonthly = document.getElementById('periodToggle').checked && MAP_DATA.monthly;
 
   const stationSet = useMonthly ? MAP_DATA.monthly : MAP_DATA.stations;
 
@@ -951,9 +946,7 @@ function renderTs() {
 // ============================================================
 ['selVar','selMetric','selModel','selLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderMap));
-document.getElementById('mapPeriodToggle').addEventListener('change', renderMap);
-
-document.getElementById('periodToggle').addEventListener('change', renderTable);
+document.getElementById('periodToggle').addEventListener('change', () => { renderTable(); renderMap(); });
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventListener('change', renderDetailCharts));
