@@ -34,7 +34,7 @@ import bisect
 logger = logging.getLogger(__name__)
 
 # Stations known to report cumulative or unreliable precip that breaks 6-hr totals
-PRECIP_EXCLUDE_STATIONS = {"SMD", "ADF"}  # ADF gauge stuck at 2.56/5.12" (tipping bucket overflow)
+PRECIP_EXCLUDE_STATIONS = {"SMD", "ADF", "PVW"}  # ADF gauge stuck at 2.56/5.12" (tipping bucket overflow); PVW unreliable precip
 PRESSURE_EXCLUDE_STATIONS = {"TAH", "PVW", "TCM"}  # Persistent unrealistic altimeter/MSLP readings
 
 # Stations that report p01i in millimeters instead of the standard inches.
@@ -71,6 +71,36 @@ def _is_implausible_precip_value(station_id: str, v: float) -> bool:
         return True
     max_allowed = _MAX_REASONABLE_P01I_MM if station_id in PRECIP_MM_STATIONS else _MAX_REASONABLE_P01I_IN
     return v > max_allowed
+
+
+# Physically plausible range for MSLP (sea-level pressure in millibars).
+# World record low: ~870 mb (Typhoon Tip, 1979); world record high: ~1084 mb (Siberia, 2001).
+# Values outside this range are sensor errors, unit mismatches, or default/uninitialized readings.
+_MSLP_MIN_MB = 870.0
+_MSLP_MAX_MB = 1090.0
+
+# Physically plausible range for temperature and dewpoint (°F).
+# Temp: world record low ~-129°F (Vostok), high ~130°F (Death Valley).
+# Dewpoint: bounded above by ~95°F (highest ever recorded globally).
+_TEMP_MIN_F = -130.0
+_TEMP_MAX_F = 135.0
+_DEWPOINT_MIN_F = -130.0
+_DEWPOINT_MAX_F = 100.0
+
+
+def _is_implausible_pressure_value(val_mb: float) -> bool:
+    """Return True if a pressure reading (in mb/hPa) is physically implausible."""
+    return not math.isfinite(val_mb) or val_mb < _MSLP_MIN_MB or val_mb > _MSLP_MAX_MB
+
+
+def _is_implausible_temp_value(val_f: float) -> bool:
+    """Return True if a temperature reading (in °F) is physically implausible."""
+    return not math.isfinite(val_f) or val_f < _TEMP_MIN_F or val_f > _TEMP_MAX_F
+
+
+def _is_implausible_dewpoint_value(val_f: float) -> bool:
+    """Return True if a dewpoint reading (in °F) is physically implausible."""
+    return not math.isfinite(val_f) or val_f < _DEWPOINT_MIN_F or val_f > _DEWPOINT_MAX_F
 
 
 def should_include_precip(fcst_val, obs_val) -> bool:
@@ -401,12 +431,20 @@ def fetch_observations(
                 # Parse temperature (°F)
                 if col_tmpf >= 0 and col_tmpf < len(fields):
                     val = fields[col_tmpf].strip()
-                    obs['temp'] = float(val) if val not in ['M', 'T', ''] else None
+                    if val not in ['M', 'T', '']:
+                        temp_val = float(val)
+                        obs['temp'] = None if _is_implausible_temp_value(temp_val) else temp_val
+                    else:
+                        obs['temp'] = None
 
                 # Parse dewpoint (°F)
                 if col_dwpf >= 0 and col_dwpf < len(fields):
                     val = fields[col_dwpf].strip()
-                    obs['dewpoint'] = float(val) if val not in ['M', 'T', ''] else None
+                    if val not in ['M', 'T', '']:
+                        dew_val = float(val)
+                        obs['dewpoint'] = None if _is_implausible_dewpoint_value(dew_val) else dew_val
+                    else:
+                        obs['dewpoint'] = None
 
                 # Parse altimeter setting (inches Hg) and convert to mb/hPa
                 # Note: Altimeter setting differs slightly from true MSLP (models provide MSLP),
@@ -419,7 +457,8 @@ def fetch_observations(
                         obs['mslp'] = None
                     elif val not in ['M', 'T', '']:
                         # Convert inches of mercury to millibars (1 inHg = 33.8639 mb)
-                        obs['mslp'] = round(float(val) * 33.8639, 1)
+                        mslp_val = round(float(val) * 33.8639, 1)
+                        obs['mslp'] = None if _is_implausible_pressure_value(mslp_val) else mslp_val
                     else:
                         obs['mslp'] = None
 
@@ -2288,11 +2327,15 @@ def precompute_verification_cache() -> dict:
             delta = abs(sorted_ts[idx] - target_ts)
 
             v = obs_data.get('temp')
+            if v is not None and _is_implausible_temp_value(v):
+                v = None
             if v is not None and delta < best_temp_delta:
                 best_temp_val = v
                 best_temp_delta = delta
 
             v = None if station_id in PRESSURE_EXCLUDE_STATIONS else obs_data.get('mslp')
+            if v is not None and _is_implausible_pressure_value(v):
+                v = None
             if v is not None and delta < best_mslp_delta:
                 best_mslp_val = v
                 best_mslp_delta = delta
@@ -2303,6 +2346,8 @@ def precompute_verification_cache() -> dict:
                 best_precip_delta = delta
 
             v = obs_data.get('dewpoint')
+            if v is not None and _is_implausible_dewpoint_value(v):
+                v = None
             if v is not None and delta < best_dewpoint_delta:
                 best_dewpoint_val = v
                 best_dewpoint_delta = delta

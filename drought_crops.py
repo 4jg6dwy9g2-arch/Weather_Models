@@ -1,12 +1,11 @@
 """Drought-Crop Exposure Time Series.
 
 Intersects USDM weekly drought polygons (D1–D4) with the 2024 USDA CDL
-10m raster to compute acreage of each major crop type exposed to drought.
+10m raster to compute acres of every CDL land-cover category exposed to drought.
 
 Cache file: /Volumes/T7/Weather_Models/data/drought_crop_timeseries.json
 
 USDM polygons are cumulative: DM=1 covers all D1+ area, DM=2 covers D2+ area, etc.
-So the "D1+" chart series comes directly from the DM=1 polygon.
 """
 
 import json
@@ -26,36 +25,144 @@ CDL_PATH   = Path("/Volumes/T7/Weather_Models/data/cdl_2024_10m/2024_10m_cdls.ti
 # Full 10m raster is 13 GB; overview is ~130 MB and processes in ~1 s per date.
 # 320m × 320m pixel = 102,400 m²; 1 acre = 4,047 m²
 CDL_OVERVIEW_LEVEL = 4
-CDL_PIXEL_SIZE_M   = 320.0          # approximate (actual: 319.999…)
+CDL_PIXEL_SIZE_M   = 320.0
 PIXEL_ACRES        = CDL_PIXEL_SIZE_M ** 2 / 4047.0   # ≈ 25.3 acres/pixel
 
-CDL_CROP_GROUPS = {
-    "Corn":        [1],
-    "Soybeans":    [5],
-    "Wheat":       [22, 23, 24, 26, 27],        # durum, spring, winter, rye, millet
-    "Oats":        [28],
-    "Cotton":      [2],
-    "Sorghum":     [4],
-    "Hay/Alfalfa": [36, 37],
-    "Peas":        [53],              # dry peas (CDL 53); chickpeas=51, lentils=52 stay in Other
-    "Dry Beans":   [42],              # dry beans incl. fava, kidney, navy, pinto (no fava-specific code)
-    "Other Crops": [
-        3, 6, 10, 11, 12, 13, 14, 21, 25, 29, 30, 31, 32, 33, 34, 35,
-        41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 55,
-        56, 57, 58, 59, 60, 61, 66, 67, 68, 69, 70, 71, 72, 74, 75, 76, 77,
-        *range(204, 255),
-    ],
-    "Pasture":     [176],             # CDL 176 = Grassland/Pasture (not counted in cropland total)
+# CDL code → (display name, dropdown group, counts_as_cropland)
+CDL_CATEGORIES: dict[int, tuple[str, str, bool]] = {
+    # ── Major Field Crops ────────────────────────────────────────────────────
+    1:   ("Corn",                    "Major Field Crops", True),
+    5:   ("Soybeans",                "Major Field Crops", True),
+    2:   ("Cotton",                  "Major Field Crops", True),
+    4:   ("Sorghum",                 "Major Field Crops", True),
+    3:   ("Rice",                    "Major Field Crops", True),
+    6:   ("Sunflower",               "Major Field Crops", True),
+    10:  ("Peanuts",                 "Major Field Crops", True),
+    11:  ("Tobacco",                 "Major Field Crops", True),
+    12:  ("Sweet Corn",              "Major Field Crops", True),
+    # ── Small Grains ────────────────────────────────────────────────────────
+    24:  ("Winter Wheat",            "Small Grains",      True),
+    23:  ("Spring Wheat",            "Small Grains",      True),
+    22:  ("Durum Wheat",             "Small Grains",      True),
+    21:  ("Barley",                  "Small Grains",      True),
+    28:  ("Oats",                    "Small Grains",      True),
+    27:  ("Rye",                     "Small Grains",      True),
+    29:  ("Millet",                  "Small Grains",      True),
+    31:  ("Canola",                  "Small Grains",      True),
+    205: ("Triticale",               "Small Grains",      True),
+    25:  ("Other Small Grains",      "Small Grains",      True),
+    # ── Hay & Forage ────────────────────────────────────────────────────────
+    36:  ("Alfalfa",                 "Hay & Forage",      True),
+    37:  ("Other Hay/Non Alfalfa",   "Hay & Forage",      True),
+    58:  ("Clover/Wildflowers",      "Hay & Forage",      True),
+    59:  ("Sod/Grass Seed",          "Hay & Forage",      True),
+    60:  ("Switchgrass",             "Hay & Forage",      True),
+    # ── Legumes ─────────────────────────────────────────────────────────────
+    42:  ("Dry Beans",               "Legumes",           True),
+    53:  ("Peas",                    "Legumes",           True),
+    51:  ("Chick Peas",              "Legumes",           True),
+    52:  ("Lentils",                 "Legumes",           True),
+    # ── Fruits & Nuts ───────────────────────────────────────────────────────
+    75:  ("Almonds",                 "Fruits & Nuts",     True),
+    69:  ("Grapes",                  "Fruits & Nuts",     True),
+    76:  ("Walnuts",                 "Fruits & Nuts",     True),
+    68:  ("Apples",                  "Fruits & Nuts",     True),
+    74:  ("Pecans",                  "Fruits & Nuts",     True),
+    72:  ("Citrus",                  "Fruits & Nuts",     True),
+    66:  ("Cherries",                "Fruits & Nuts",     True),
+    67:  ("Peaches",                 "Fruits & Nuts",     True),
+    77:  ("Pears",                   "Fruits & Nuts",     True),
+    204: ("Pistachios",              "Fruits & Nuts",     True),
+    212: ("Oranges",                 "Fruits & Nuts",     True),
+    215: ("Avocados",                "Fruits & Nuts",     True),
+    242: ("Blueberries",             "Fruits & Nuts",     True),
+    250: ("Cranberries",             "Fruits & Nuts",     True),
+    221: ("Strawberries",            "Fruits & Nuts",     True),
+    210: ("Prunes",                  "Fruits & Nuts",     True),
+    211: ("Olives",                  "Fruits & Nuts",     True),
+    217: ("Pomegranates",            "Fruits & Nuts",     True),
+    218: ("Nectarines",              "Fruits & Nuts",     True),
+    220: ("Plums",                   "Fruits & Nuts",     True),
+    223: ("Apricots",                "Fruits & Nuts",     True),
+    # ── Vegetables & Root Crops ─────────────────────────────────────────────
+    43:  ("Potatoes",                "Vegetables",        True),
+    45:  ("Sugarcane",               "Vegetables",        True),
+    41:  ("Sugarbeets",              "Vegetables",        True),
+    46:  ("Sweet Potatoes",          "Vegetables",        True),
+    54:  ("Tomatoes",                "Vegetables",        True),
+    49:  ("Onions",                  "Vegetables",        True),
+    50:  ("Cucumbers",               "Vegetables",        True),
+    48:  ("Watermelons",             "Vegetables",        True),
+    47:  ("Misc Vegs & Fruits",      "Vegetables",        True),
+    209: ("Cantaloupes",             "Vegetables",        True),
+    213: ("Honeydew Melons",         "Vegetables",        True),
+    214: ("Broccoli",                "Vegetables",        True),
+    216: ("Peppers",                 "Vegetables",        True),
+    219: ("Greens",                  "Vegetables",        True),
+    222: ("Squash",                  "Vegetables",        True),
+    227: ("Lettuce",                 "Vegetables",        True),
+    229: ("Pumpkins",                "Vegetables",        True),
+    206: ("Carrots",                 "Vegetables",        True),
+    207: ("Asparagus",               "Vegetables",        True),
+    208: ("Garlic",                  "Vegetables",        True),
+    243: ("Cabbage",                 "Vegetables",        True),
+    244: ("Cauliflower",             "Vegetables",        True),
+    245: ("Celery",                  "Vegetables",        True),
+    246: ("Radishes",                "Vegetables",        True),
+    247: ("Turnips",                 "Vegetables",        True),
+    248: ("Eggplant",                "Vegetables",        True),
+    249: ("Gourds",                  "Vegetables",        True),
+    # ── Other Agricultural ───────────────────────────────────────────────────
+    61:  ("Fallow/Idle Cropland",    "Other Agricultural", True),
+    44:  ("Other Crops",             "Other Agricultural", True),
+    55:  ("Caneberries",             "Other Agricultural", True),
+    56:  ("Hops",                    "Other Agricultural", True),
+    57:  ("Herbs",                   "Other Agricultural", True),
+    70:  ("Christmas Trees",         "Other Agricultural", True),
+    71:  ("Other Tree Crops",        "Other Agricultural", True),
+    30:  ("Speltz",                  "Other Agricultural", True),
+    32:  ("Flaxseed",                "Other Agricultural", True),
+    33:  ("Safflower",               "Other Agricultural", True),
+    34:  ("Rape Seed",               "Other Agricultural", True),
+    35:  ("Mustard",                 "Other Agricultural", True),
+    38:  ("Camelina",                "Other Agricultural", True),
+    39:  ("Buckwheat",               "Other Agricultural", True),
+    224: ("Vetch",                   "Other Agricultural", True),
+    26:  ("Dbl WinWht/Soybeans",     "Other Agricultural", True),
+    225: ("Dbl WinWht/Corn",         "Other Agricultural", True),
+    226: ("Dbl Oats/Corn",           "Other Agricultural", True),
+    228: ("Dbl Triticale/Corn",      "Other Agricultural", True),
+    236: ("Dbl WinWht/Sorghum",      "Other Agricultural", True),
+    237: ("Dbl Barley/Corn",         "Other Agricultural", True),
+    238: ("Dbl WinWht/Cotton",       "Other Agricultural", True),
+    239: ("Dbl Soybeans/Cotton",     "Other Agricultural", True),
+    240: ("Dbl Soybeans/Oats",       "Other Agricultural", True),
+    241: ("Dbl Corn/Soybeans",       "Other Agricultural", True),
+    254: ("Dbl WinWht/Sunflower",    "Other Agricultural", True),
+    13:  ("Pop/Orn Corn",            "Other Agricultural", True),
+    14:  ("Mint",                    "Other Agricultural", True),
+    # ── Land Cover ───────────────────────────────────────────────────────────
+    176: ("Grassland/Pasture",       "Land Cover",        False),
+    152: ("Shrubland",               "Land Cover",        False),
+    141: ("Deciduous Forest",        "Land Cover",        False),
+    142: ("Evergreen Forest",        "Land Cover",        False),
+    143: ("Mixed Forest",            "Land Cover",        False),
+    131: ("Barren",                  "Land Cover",        False),
+    190: ("Herbaceous Wetlands",     "Land Cover",        False),
+    195: ("Woody Wetlands",          "Land Cover",        False),
+    111: ("Open Water",              "Land Cover",        False),
+    121: ("Developed/Open Space",    "Developed",         False),
+    122: ("Developed/Low Intensity", "Developed",         False),
+    123: ("Developed/Med Intensity", "Developed",         False),
+    124: ("Developed/High Intensity","Developed",         False),
+    92:  ("Aquaculture",             "Other",             False),
 }
 
-# Groups that count toward the "Total Cropland" figure (excludes Pasture)
-CROPLAND_GROUPS = {k for k in CDL_CROP_GROUPS if k != "Pasture"}
+# Codes that count toward "Total Cropland"
+CROPLAND_CODES: set[int] = {c for c, (_, _, is_crop) in CDL_CATEGORIES.items() if is_crop}
 
-# Build reverse lookup: CDL pixel code → group name
-_CODE_TO_GROUP: dict[int, str] = {}
-for _grp, _codes in CDL_CROP_GROUPS.items():
-    for _c in _codes:
-        _CODE_TO_GROUP[_c] = _grp
+# Fast lookup: CDL pixel value → is it a tracked code?
+_TRACKED_CODES: set[int] = set(CDL_CATEGORIES.keys())
 
 
 def get_usdm_tuesdays(start_date: str = "2024-01-02") -> list[str]:
@@ -70,10 +177,7 @@ def get_usdm_tuesdays(start_date: str = "2024-01-02") -> list[str]:
 
 
 def fetch_usdm_for_date(date_str: str) -> dict | None:
-    """Fetch USDM GeoJSON for a given YYYYMMDD string.
-
-    Returns GeoJSON FeatureCollection or None on error.
-    """
+    """Fetch USDM GeoJSON for a given YYYYMMDD string."""
     url = f"https://droughtmonitor.unl.edu/data/json/usdm_{date_str}.json"
     try:
         resp = requests.get(url, timeout=30)
@@ -85,16 +189,16 @@ def fetch_usdm_for_date(date_str: str) -> dict | None:
 
 
 def compute_exposure_for_date(date_str: str, geojson: dict, cdl_path: Path) -> dict:
-    """Compute crop acres exposed to each drought level for one USDM snapshot.
+    """Compute per-CDL-code acres exposed to each drought level for one USDM snapshot.
 
-    USDM polygons are cumulative: DM=1 covers all D1+ area.
-    Returns {"D1": {"Corn": acres, ..., "Total": acres}, "D2": {...}, "D3": {...}, "D4": {...}}
+    Returns {"D1": {"1": acres, "5": acres, ..., "Total": cropland_acres},
+             "D2": {...}, "D3": {...}, "D4": {...}}
+    Keys for individual codes are stringified ints (JSON-safe).
     """
     import rasterio
     from rasterio.mask import mask as rio_mask
     from rasterio.warp import transform_geom
 
-    # Build per-DM-level geometry dict (DM property: 1=D1, 2=D2, 3=D3, 4=D4)
     features_by_dm: dict[int, dict] = {}
     for feat in geojson.get("features", []):
         dm = feat.get("properties", {}).get("DM")
@@ -108,15 +212,12 @@ def compute_exposure_for_date(date_str: str, geojson: dict, cdl_path: Path) -> d
 
         for dm_int in [1, 2, 3, 4]:
             level = f"D{dm_int}"
-            empty = {k: 0 for k in CDL_CROP_GROUPS}
-            empty["Total"] = 0
-
+            empty: dict = {"Total": 0}
             geom = features_by_dm.get(dm_int)
             if geom is None:
                 result[level] = empty
                 continue
 
-            # Reproject geometry from WGS84 → CDL CRS (EPSG:5070)
             try:
                 geom_proj = transform_geom("EPSG:4326", src_crs, geom)
             except Exception as e:
@@ -134,36 +235,47 @@ def compute_exposure_for_date(date_str: str, geojson: dict, cdl_path: Path) -> d
                 continue
 
             pixels = out_image[0].ravel()
-            # Exclude background (0) and nodata pixels
             pixels = pixels[pixels > 0]
-
             if pixels.size == 0:
                 result[level] = empty
                 continue
 
-            # Count pixels per CDL code, then group into named categories
             codes, counts = np.unique(pixels, return_counts=True)
-            group_acres: dict[str, float] = {k: 0.0 for k in CDL_CROP_GROUPS}
+            level_data: dict = {}
+            cropland_total = 0.0
             for code, count in zip(codes.tolist(), counts.tolist()):
-                grp = _CODE_TO_GROUP.get(code)
-                if grp:
-                    group_acres[grp] += count * PIXEL_ACRES
+                if code not in _TRACKED_CODES:
+                    continue
+                acres = count * PIXEL_ACRES
+                level_data[str(code)] = round(acres)
+                if code in CROPLAND_CODES:
+                    cropland_total += acres
 
-            cropland_total = sum(group_acres[k] for k in CROPLAND_GROUPS)
-            result[level] = {k: round(v) for k, v in group_acres.items()}
-            result[level]["Total"] = round(cropland_total)
+            level_data["Total"] = round(cropland_total)
+            result[level] = level_data
 
     return result
 
 
-def compute_total_cropland_acres(cdl_path: Path = CDL_PATH) -> int:
-    """Count total US cropland acres (excludes Pasture) using the overview raster."""
+def compute_code_acres(cdl_path: Path = CDL_PATH) -> dict[str, int]:
+    """Return total US acres per tracked CDL code (stringified keys) from overview raster."""
     import rasterio
-    cropland_codes = [c for grp, codes in CDL_CROP_GROUPS.items()
-                      if grp in CROPLAND_GROUPS for c in codes]
     with rasterio.open(cdl_path, overview_level=CDL_OVERVIEW_LEVEL) as src:
         data = src.read(1).ravel()
-    crop_pixels = int(np.isin(data, cropland_codes).sum())
+    codes, counts = np.unique(data, return_counts=True)
+    return {
+        str(int(c)): round(int(n) * PIXEL_ACRES)
+        for c, n in zip(codes, counts)
+        if int(c) in _TRACKED_CODES
+    }
+
+
+def compute_total_cropland_acres(cdl_path: Path = CDL_PATH) -> int:
+    """Count total US cropland acres (excludes non-cropland categories)."""
+    import rasterio
+    with rasterio.open(cdl_path, overview_level=CDL_OVERVIEW_LEVEL) as src:
+        data = src.read(1).ravel()
+    crop_pixels = int(np.isin(data, list(CROPLAND_CODES)).sum())
     return round(crop_pixels * PIXEL_ACRES)
 
 
@@ -178,10 +290,20 @@ def build_timeseries(
     """
     data = load_timeseries() or {"dates": [], "by_date": {}}
 
-    # Compute total cropland once if not already stored
-    if "total_cropland_acres" not in data:
+    # Rebuild code_info whenever the category list may have changed
+    if "code_info" not in data:
         if progress_cb:
-            progress_cb("Computing total US cropland acres from CDL...")
+            progress_cb("Computing per-code US acreage from CDL (one-time)...")
+        code_acres = compute_code_acres(cdl_path)
+        data["code_info"] = {
+            str(code): {
+                "name":        info[0],
+                "group":       info[1],
+                "is_cropland": info[2],
+                "total_acres": code_acres.get(str(code), 0),
+            }
+            for code, info in CDL_CATEGORIES.items()
+        }
         data["total_cropland_acres"] = compute_total_cropland_acres(cdl_path)
         if progress_cb:
             progress_cb(f"  Total cropland: {data['total_cropland_acres']/1e6:.0f}M acres")
@@ -212,7 +334,7 @@ def build_timeseries(
             continue
 
         if progress_cb:
-            progress_cb(f"  Computing crop exposure...")
+            progress_cb(f"  Computing exposure...")
 
         try:
             exposure = compute_exposure_for_date(date_str, geojson, cdl_path)
@@ -226,14 +348,13 @@ def build_timeseries(
         if iso_date not in data["dates"]:
             data["dates"].append(iso_date)
 
-        # Save incrementally after each date
         data["dates"] = sorted(data["dates"])
         data["computed_at"] = datetime.now(timezone.utc).isoformat()
         save_timeseries(data)
 
         if progress_cb:
             d1_total = exposure.get("D1", {}).get("Total", 0)
-            progress_cb(f"  Done: D1+ Total = {d1_total/1e6:.1f}M acres")
+            progress_cb(f"  Done: D1+ cropland total = {d1_total/1e6:.1f}M acres")
 
     return data
 

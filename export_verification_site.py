@@ -20,6 +20,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import asos
 import export_verification_table as evt
+import drought_monitor as _drought_monitor
 
 PAGES_WORKTREE = Path('/Users/kennypratt/weather-pages')
 
@@ -168,11 +169,11 @@ def extract_timeseries_data() -> dict:
         ts[var] = {}
         for lt in TS_LEAD_TIMES:
             try:
-                gfs = asos.get_verification_time_series_from_cache('gfs', var, lt, days_back=30)
-                aifs_d = asos.get_verification_time_series_from_cache('aifs', var, lt, days_back=30)
-                ifs_d = asos.get_verification_time_series_from_cache('ifs', var, lt, days_back=30)
+                gfs = asos.get_verification_time_series_from_cache('gfs', var, lt, days_back=365)
+                aifs_d = asos.get_verification_time_series_from_cache('aifs', var, lt, days_back=365)
+                ifs_d = asos.get_verification_time_series_from_cache('ifs', var, lt, days_back=365)
                 include_nws = var in ('temp', 'precip', 'dewpoint')
-                nws_d = asos.get_verification_time_series_from_cache('nws', var, lt, days_back=30) if include_nws else {}
+                nws_d = asos.get_verification_time_series_from_cache('nws', var, lt, days_back=365) if include_nws else {}
 
                 if 'error' in gfs:
                     continue
@@ -310,8 +311,8 @@ body {{ font-size: 0.875rem; }}
 .chart-wrap {{ position: relative; height: 260px; }}
 .chart-wrap-sm {{ position: relative; height: 200px; }}
 th, td {{ white-space: nowrap; font-size: 0.78rem; padding: 0.25rem 0.4rem !important; }}
-thead tr:first-child th {{ position: sticky; top: 0; background: white; z-index: 2; }}
-thead tr:nth-child(2) th {{ position: sticky; top: 0; background: white; z-index: 1; }}
+thead tr:first-child th {{ background: white; }}
+thead tr:nth-child(2) th {{ background: white; }}
 .color-scale-bar {{ width: 200px; height: 12px; border-radius: 4px; }}
 .card-header {{ font-size: 0.85rem; }}
 .form-select-sm {{ font-size: 0.8rem; }}
@@ -387,6 +388,14 @@ thead tr:nth-child(2) th {{ position: sticky; top: 0; background: white; z-index
   Loading verification data&hellip;
 </div>
 
+<!-- PERIOD TOGGLE (controls both map and table) -->
+<div class="d-flex align-items-center mb-2">
+  <div class="form-check form-switch mb-0">
+    <input class="form-check-input" type="checkbox" id="periodToggle">
+    <label class="form-check-label small text-muted" for="periodToggle">Last 20 days (map &amp; table)</label>
+  </div>
+</div>
+
 <!-- MAP CARD -->
 <div class="card mb-3">
   <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
@@ -409,10 +418,6 @@ thead tr:nth-child(2) th {{ position: sticky; top: 0; background: white; z-index
         <option value="nws">NWS</option>
       </select>
       <select class="form-select form-select-sm" id="selLt" style="width:auto"></select>
-      <div class="form-check form-switch align-self-center ms-1" id="mapPeriodWrap" style="display:none!important">
-        <input class="form-check-input" type="checkbox" id="mapPeriodToggle">
-        <label class="form-check-label small" for="mapPeriodToggle">Last 20 days</label>
-      </div>
     </div>
   </div>
   <div class="card-body p-0">
@@ -423,6 +428,15 @@ thead tr:nth-child(2) th {{ position: sticky; top: 0; background: white; z-index
       <div id="scaleBar" class="color-scale-bar"></div>
       <span id="scaleMax" class="text-muted small">10</span>
       <span id="scaleUnits" class="text-muted small ms-1"></span>
+    </div>
+    <!-- Drought Monitor Legend (shown only for dewpoint/precip + last-20-days) -->
+    <div id="droughtLegend" class="mt-2 gap-3 justify-content-center flex-wrap pb-2" style="display:none; font-size:0.75rem">
+      <strong>Drought <span id="droughtDate" class="fw-normal text-muted"></span>:</strong>
+      <span><span style="background:#FFFF00;padding:0 6px">&nbsp;</span> D0 Abnormally Dry</span>
+      <span><span style="background:#FCD37F;padding:0 6px">&nbsp;</span> D1 Moderate</span>
+      <span><span style="background:#FFAA00;padding:0 6px">&nbsp;</span> D2 Severe</span>
+      <span><span style="background:#E60000;padding:0 6px">&nbsp;</span> D3 Extreme</span>
+      <span><span style="background:#730000;color:#fff;padding:0 6px">&nbsp;</span> D4 Exceptional</span>
     </div>
   </div>
 </div>
@@ -531,10 +545,6 @@ thead tr:nth-child(2) th {{ position: sticky; top: 0; background: white; z-index
   <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
     <span><i class="bi bi-table"></i> Mean Verification — All Stations</span>
     <div class="d-flex gap-2 flex-wrap align-items-center">
-      <div class="form-check form-switch mb-0 me-1">
-        <input class="form-check-input" type="checkbox" id="periodToggle">
-        <label class="form-check-label small" for="periodToggle">Last 20 days</label>
-      </div>
       <div class="btn-group btn-group-sm">
         <input type="radio" class="btn-check" name="tableMetric" id="tm-mae" value="mae" autocomplete="off" checked>
         <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
@@ -596,7 +606,7 @@ thead tr:nth-child(2) th {{ position: sticky; top: 0; background: white; z-index
 <!-- TIME SERIES CHART -->
 <div class="card mb-3">
   <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span><i class="bi bi-graph-up"></i> Verification Trends (Last 30 Days)</span>
+    <span><i class="bi bi-graph-up"></i> Verification Trends</span>
     <div class="d-flex gap-2 flex-wrap">
       <select class="form-select form-select-sm" id="tsVar" style="width:auto">
         <option value="temp">Temperature</option>
@@ -614,9 +624,23 @@ thead tr:nth-child(2) th {{ position: sticky; top: 0; background: white; z-index
         <option value="72">72h</option>
         <option value="168">7d</option>
       </select>
+      <select class="form-select form-select-sm" id="tsSpan" style="width:auto">
+        <option value="30" selected>1 month</option>
+        <option value="90">3 months</option>
+        <option value="180">6 months</option>
+        <option value="365">1 year</option>
+      </select>
     </div>
   </div>
   <div class="card-body">
+    <div id="tsWinnerTally" class="alert alert-light mb-2 d-none">
+      <strong><i class="bi bi-trophy"></i> Daily Winners (Lowest MAE):</strong>
+      <span class="ms-3"><span class="badge bg-primary">GFS</span> <span id="tsGfsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-info text-dark">AIFS</span> <span id="tsAifsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-success">IFS</span> <span id="tsIfsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-dark">NWS</span> <span id="tsNwsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge bg-secondary">Tie</span> <span id="tsTieWins">0</span> days</span>
+    </div>
     <div style="position:relative;height:350px"><canvas id="tsChart"></canvas></div>
   </div>
 </div>
@@ -636,12 +660,46 @@ const SPOTLIGHT_STATIONS = new Set(['IAD','BWI']);
 
 let MAP_DATA = null, TABLE_DATA = null, TS_DATA = null;
 let asosMap = null, markers = [];
+let droughtLayer = null;
 let dtCharts = {{}};
 let tsChart = null;
 let detailSt = null, detailIsMonthly = false;
 let OBS_DATA = null;
 let obsCharts = {{}};
 let obsSid = null;
+
+const DROUGHT_COLORS = {{0:'#FFFF00',1:'#FCD37F',2:'#FFAA00',3:'#E60000',4:'#730000'}};
+
+async function loadDroughtOverlay() {{
+  const variable = document.getElementById('selVar').value;
+  const periodToggle = document.getElementById('periodToggle').checked;
+  const showDrought = (variable === 'dewpoint' || variable === 'precip') && periodToggle;
+
+  if (droughtLayer) {{ asosMap.removeLayer(droughtLayer); droughtLayer = null; }}
+  document.getElementById('droughtLegend').style.display = 'none';
+  if (!showDrought) return;
+
+  try {{
+    const resp = await fetch('data/drought.json');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    droughtLayer = L.geoJSON(data.geojson, {{
+      style: function(feature) {{
+        const color = DROUGHT_COLORS[feature.properties.DM] || '#FFFFFF';
+        return {{fillColor:color, fillOpacity:0.35, color:color, weight:0.5, opacity:1}};
+      }},
+      onEachFeature: function(feature, layer) {{
+        const labels = ['D0 \u2013 Abnormally Dry','D1 \u2013 Moderate','D2 \u2013 Severe','D3 \u2013 Extreme','D4 \u2013 Exceptional'];
+        layer.bindTooltip(labels[feature.properties.DM] || 'DM ' + feature.properties.DM, {{sticky:true}});
+      }}
+    }}).addTo(asosMap);
+    droughtLayer.bringToBack();
+    if (data.synced_at) document.getElementById('droughtDate').textContent = '(' + data.synced_at + ')';
+    document.getElementById('droughtLegend').style.display = 'flex';
+  }} catch(e) {{
+    console.warn('[loadDroughtOverlay] Failed:', e);
+  }}
+}}
 
 async function loadAll() {{
   const [m, t, ts, obs] = await Promise.all([
@@ -665,11 +723,6 @@ async function loadAll() {{
   document.getElementById('stationCount').textContent =
     Object.keys(MAP_DATA.stations).length + ' stations';
   document.getElementById('loadingBanner').classList.add('d-none');
-
-  // Show map period toggle only if monthly data was published
-  if (MAP_DATA.monthly) {{
-    document.getElementById('mapPeriodWrap').style.removeProperty('display');
-  }}
 
   initMap();
   renderMap();
@@ -708,6 +761,12 @@ function getBiasColor(value, variable) {{
     }} else {{
       const t=(g-0.5)*2; return `rgb(${{Math.round(255-t*221)}},${{Math.round(255-t*116)}},${{Math.round(255-t*221)}})`;
     }}
+  }} else if (variable === 'dewpoint') {{
+    if (r < 0) {{
+      const t=1+r; return `rgb(${{Math.round(139+t*116)}},${{Math.round(69+t*186)}},${{Math.round(19+t*236)}})`;
+    }} else {{
+      const t=r; return `rgb(${{Math.round(255-t*221)}},${{Math.round(255-t*58)}},${{Math.round(255-t*161)}})`;
+    }}
   }} else {{
     if (r < 0) {{
       const t=1+r; return `rgb(${{Math.round(59+t*196)}},${{Math.round(130+t*125)}},${{Math.round(246+t*9)}})`;
@@ -730,7 +789,9 @@ function updateColorScale(variable, metric) {{
     mx.textContent = scaleMax;
     bar.style.background = isP
       ? 'linear-gradient(to right,rgb(139,69,19),white,rgb(34,139,34))'
-      : 'linear-gradient(to right,#3b82f6,white 50%,#ef4444)';
+      : variable === 'dewpoint'
+        ? 'linear-gradient(to right,#8b4513,white 50%,#22c55e)'
+        : 'linear-gradient(to right,#3b82f6,white 50%,#ef4444)';
   }} else {{
     mn.textContent = '0';
     mx.textContent = scaleMax;
@@ -744,7 +805,7 @@ function renderMap() {{
   const metric   = document.getElementById('selMetric').value;
   const model    = document.getElementById('selModel').value;
   const lt       = parseInt(document.getElementById('selLt').value, 10);
-  const useMonthly = document.getElementById('mapPeriodToggle').checked && MAP_DATA.monthly;
+  const useMonthly = document.getElementById('periodToggle').checked && MAP_DATA.monthly;
 
   const stationSet = useMonthly ? MAP_DATA.monthly : MAP_DATA.stations;
 
@@ -753,6 +814,7 @@ function renderMap() {{
   const ltIdx = MAP_DATA.lead_times.indexOf(lt);
 
   updateColorScale(variable, metric);
+  loadDroughtOverlay();
   markers.forEach(m => asosMap.removeLayer(m));
   markers = [];
 
@@ -1131,13 +1193,22 @@ function renderTs() {{
   const variable = document.getElementById('tsVar').value;
   const metric   = document.getElementById('tsMetric').value;
   const lt       = document.getElementById('tsLt').value;
+  const span     = parseInt(document.getElementById('tsSpan').value, 10);
   const combo    = TS_DATA?.[variable]?.[lt];
   const ctx      = document.getElementById('tsChart');
 
   if (tsChart) {{ tsChart.destroy(); tsChart = null; }}
   if (!combo) return;
 
-  const labels = combo.dates.map(d => {{
+  // Filter to the last `span` days
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - span);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  const sliceIdx = combo.dates.findIndex(d => d >= cutoffStr);
+  const startIdx = sliceIdx === -1 ? 0 : sliceIdx;
+  const dates = combo.dates.slice(startIdx);
+
+  const labels = dates.map(d => {{
     const dt = new Date(d);
     return dt.toLocaleDateString('en-US', {{month:'short', day:'numeric'}});
   }});
@@ -1153,7 +1224,7 @@ function renderTs() {{
     .filter(m => combo[m])
     .map(m => ({{
       label: m.toUpperCase(),
-      data: combo[m][metric],
+      data: combo[m][metric].slice(startIdx),
       borderColor: mColors[m].border,
       backgroundColor: mColors[m].bg,
       borderWidth: 2,
@@ -1161,6 +1232,34 @@ function renderTs() {{
       pointRadius: 1,
       pointHoverRadius: 4,
     }}));
+
+  // Daily winners tally (MAE only)
+  const tallyEl = document.getElementById('tsWinnerTally');
+  if (metric === 'mae') {{
+    const wins = {{gfs:0, aifs:0, ifs:0, nws:0, tie:0}};
+    for (let i = 0; i < dates.length; i++) {{
+      const idx = startIdx + i;
+      const candidates = [];
+      for (const m of ['gfs','aifs','ifs','nws']) {{
+        if (!combo[m]) continue;
+        const v = combo[m].mae[idx];
+        if (v != null) candidates.push({{key: m, val: v}});
+      }}
+      if (!candidates.length) continue;
+      const minVal = Math.min(...candidates.map(c => c.val));
+      const winners = candidates.filter(c => c.val === minVal);
+      if (winners.length === 1) wins[winners[0].key]++;
+      else wins.tie++;
+    }}
+    document.getElementById('tsGfsWins').textContent  = wins.gfs;
+    document.getElementById('tsAifsWins').textContent = wins.aifs;
+    document.getElementById('tsIfsWins').textContent  = wins.ifs;
+    document.getElementById('tsNwsWins').textContent  = wins.nws;
+    document.getElementById('tsTieWins').textContent  = wins.tie;
+    tallyEl.classList.remove('d-none');
+  }} else {{
+    tallyEl.classList.add('d-none');
+  }}
 
   tsChart = new Chart(ctx, {{
     type: 'line',
@@ -1192,14 +1291,12 @@ function renderTs() {{
 // ============================================================
 ['selVar','selMetric','selModel','selLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderMap));
-document.getElementById('mapPeriodToggle').addEventListener('change', renderMap);
-
-document.getElementById('periodToggle').addEventListener('change', renderTable);
+document.getElementById('periodToggle').addEventListener('change', () => {{ renderTable(); renderMap(); }});
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventListener('change', renderDetailCharts));
 
-['tsVar','tsMetric','tsLt'].forEach(id =>
+['tsVar','tsMetric','tsLt','tsSpan'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderTs));
 
 document.getElementById('obsLtSelect').addEventListener('change', () => {{
@@ -1208,18 +1305,8 @@ document.getElementById('obsLtSelect').addEventListener('change', () => {{
   }}
 }});
 
-// Fix two-row sticky thead: offset second row by first row's rendered height
-function fixStickyHeader() {{
-  const row1 = document.querySelector('thead tr:first-child');
-  if (!row1) return;
-  const h = row1.getBoundingClientRect().height;
-  document.querySelectorAll('thead tr:nth-child(2) th').forEach(th => {{
-    th.style.top = h + 'px';
-  }});
-}}
-
 // Boot
-loadAll().then(fixStickyHeader);
+loadAll();
 </script>
 </body>
 </html>"""
@@ -1269,6 +1356,14 @@ def generate_site(output_dir: Path = PAGES_WORKTREE) -> None:
     spotlight_data = extract_spotlight_obs(SPOTLIGHT_STATIONS, SPOTLIGHT_LEAD_TIMES)
     with open(data_dir / 'station_obs.json', 'w') as f:
         json.dump(spotlight_data, f, separators=sep)
+
+    print("Exporting drought monitor data...")
+    dm_data = _drought_monitor.load_drought_data()
+    if dm_data:
+        with open(data_dir / 'drought.json', 'w') as f:
+            json.dump(dm_data, f, separators=sep)
+    else:
+        print("  drought monitor data not available — run sync_drought.py first")
 
     # Write HTML
     with open(output_dir / 'index.html', 'w') as f:

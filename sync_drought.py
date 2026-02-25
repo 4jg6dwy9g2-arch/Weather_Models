@@ -8,6 +8,7 @@ Run via LaunchAgent every Friday at midnight:
 import sys
 import drought_monitor
 import drought_crops
+import livestock_drought
 
 # 1. Refresh the USDM GeoJSON cache
 result = drought_monitor.sync_drought_monitor()
@@ -20,5 +21,11 @@ crop_result = drought_crops.build_timeseries(
     progress_cb=lambda msg: print(msg, flush=True)
 )
 print(f"Drought-crop cache: {len(crop_result['dates'])} weeks total.")
+
+# 3. Append the latest Tuesday to the livestock-drought time series.
+live_result = livestock_drought.build_timeseries(
+    progress_cb=lambda msg: print(msg, flush=True)
+)
+print(f"Livestock drought cache: {len(live_result['dates'])} weeks total.")
 
 sys.exit(0 if result.get("success") else 1)
