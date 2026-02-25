@@ -1,0 +1,590 @@
+{% extends "base.html" %}
+
+{% block title %}Agriculture - Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .agri-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 10px 16px;
+        background: #f8fafc;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px 12px 0 0;
+        border-bottom: 0;
+        flex-wrap: wrap;
+    }
+    #stormMap {
+        height: 560px;
+        background: #dde8d0;
+        border: 1px solid #e5e7eb;
+        border-top: 0;
+        border-radius: 0 0 12px 12px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
+    <h4 class="mb-0"><i class="bi bi-tree"></i> Agriculture</h4>
+    <span class="text-muted small">USDA CDL 2024 + NWS Storm Reports</span>
+</div>
+
+<div class="agri-toolbar">
+    <span class="small text-muted">Reports:</span>
+    <div class="form-check form-check-inline mb-0">
+        <input class="form-check-input" type="checkbox" id="sr-showTorn" checked>
+        <label class="form-check-label small fw-semibold" for="sr-showTorn" style="color:#ef4444">&#x25CF; Tornado (<span id="sr-tornCount">–</span>)</label>
+    </div>
+    <div class="form-check form-check-inline mb-0">
+        <input class="form-check-input" type="checkbox" id="sr-showHail" checked>
+        <label class="form-check-label small fw-semibold" for="sr-showHail" style="color:#22c55e">&#x25CF; Hail (<span id="sr-hailCount">–</span>)</label>
+    </div>
+    <div class="form-check form-check-inline mb-0">
+        <input class="form-check-input" type="checkbox" id="sr-showWind" checked>
+        <label class="form-check-label small fw-semibold" for="sr-showWind" style="color:#60a5fa">&#x25CF; Wind (<span id="sr-windCount">–</span>)</label>
+    </div>
+    <select class="form-select form-select-sm" id="sr-hours" style="width:auto;background:#1e293b;color:#e2e8f0;border-color:#334155;">
+        <option value="24">Last 24 h</option>
+        <option value="48" selected>Last 48 h</option>
+        <option value="72">Last 72 h</option>
+        <option value="0">All available</option>
+    </select>
+    <div class="form-check form-check-inline mb-0 ms-2">
+        <input class="form-check-input" type="checkbox" id="showDroughtOverlay" checked>
+        <label class="form-check-label small fw-semibold" for="showDroughtOverlay">Drought Overlay</label>
+    </div>
+    <span class="small text-muted" id="droughtOverlayUpdated"></span>
+    <label class="small text-muted mb-0 ms-auto">CDL:</label>
+    <input type="range" id="sr-opacity" min="10" max="100" value="80" style="width:80px;">
+</div>
+
+<div style="position:relative">
+    <div id="stormMap"></div>
+    <div id="cdlHoverBox" style="position:absolute;bottom:10px;left:10px;z-index:1000;background:rgba(15,15,15,0.78);color:#f1f5f9;padding:4px 10px;border-radius:4px;font-size:0.76rem;pointer-events:none;display:none;backdrop-filter:blur(2px);max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></div>
+</div>
+
+<div class="d-flex align-items-center justify-content-center gap-4 py-2 border-bottom bg-light flex-wrap" style="font-size:0.75rem;">
+    <span class="text-muted">Crop types (CDL 2024):</span>
+    <span><span style="background:#FFD300;padding:0 6px;border:1px solid #ccc">&nbsp;</span> Corn</span>
+    <span><span style="background:#267000;padding:0 6px;border:1px solid #ccc">&nbsp;</span> Soybeans</span>
+    <span><span style="background:#A57000;padding:0 6px;border:1px solid #ccc">&nbsp;</span> Winter Wheat</span>
+    <span><span style="background:#FF2626;padding:0 6px;border:1px solid #ccc">&nbsp;</span> Cotton</span>
+    <span><span style="background:#E8FFBF;padding:0 6px;border:1px solid #ccc">&nbsp;</span> Pasture</span>
+</div>
+
+<div class="card mt-3 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span><i class="bi bi-bar-chart-line"></i> Land Exposed to Drought <span class="text-muted fw-normal small" id="droughtChartTotalLabel"></span></span>
+        <div class="d-flex gap-2 align-items-center flex-wrap">
+            <input type="search" id="droughtCategorySearch" class="form-control form-control-sm" placeholder="Filter categories..." style="width:160px" autocomplete="off">
+            <select class="form-select form-select-sm" id="droughtCategorySelect" style="width:220px">
+                <option value="Total">— Total Cropland —</option>
+            </select>
+            <select class="form-select form-select-sm" id="droughtChartLevel" style="width:auto">
+                <option value="D1">D1+ (Moderate+)</option>
+                <option value="D2" selected>D2+ (Severe+)</option>
+                <option value="D3">D3+ (Extreme+)</option>
+                <option value="D4">D4 (Exceptional)</option>
+            </select>
+            <span class="text-muted small" id="droughtChartUpdated"></span>
+        </div>
+    </div>
+    <div class="card-body">
+        <div id="droughtChartPlaceholder" class="text-center text-muted py-4 small">Loading drought exposure data...</div>
+        <div id="droughtChartWrap" style="display:none">
+            <p class="text-muted small mb-1" id="droughtChartSubtitle"></p>
+            <div style="height:300px;position:relative">
+                <canvas id="droughtCropChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    let srMap = null, cdlLayer = null, srData = null;
+    let srMarkers = { torn: [], hail: [], wind: [] };
+    let livestockLayer = null, countyGeoJSON = null, countyLivestockData = null;
+    let droughtLayer = null, droughtGeoJSON = null;
+    let livestockForceReloadTried = false;
+
+    const STORM_COLOR = { torn: '#b91c1c', hail: '#15803d', wind: '#1d4ed8' };
+    const STORM_FILL  = { torn: '#ef4444', hail: '#22c55e', wind: '#3b82f6' };
+    const LIVESTOCK_COLORS = {
+        'Cattle': '#92400e', 'Dairy Cows': '#0369a1', 'Hogs': '#be185d',
+        'Chickens, Layers': '#b45309', 'Chickens, Broilers': '#7c3aed',
+    };
+    const LIVESTOCK_ALIASES = {
+        'Broiler Chickens': 'Chickens, Broilers',
+        'Broilers': 'Chickens, Broilers',
+        'Layer Chickens': 'Chickens, Layers',
+        'Layers': 'Chickens, Layers',
+    };
+
+    function tornRadius(m) { const n = parseInt((m || '').replace(/\D/g, '')); return isNaN(n) ? 5 : [5,6,7,9,11,13][Math.min(n,5)]; }
+    function hailRadius(m) { const s = parseFloat(m); return isNaN(s) ? 4 : s < 1 ? 4 : s < 2 ? 6 : 8; }
+    function windRadius(m) { const s = parseInt(m); return isNaN(s) ? 4 : s >= 75 ? 8 : 5; }
+    function clearMarkers(type) { srMarkers[type].forEach(m => srMap.removeLayer(m)); srMarkers[type] = []; }
+    function lerpColor(t, hex) {
+        const r2 = parseInt(hex.slice(1,3),16), g2 = parseInt(hex.slice(3,5),16), b2 = parseInt(hex.slice(5,7),16);
+        return `rgb(${Math.round(255+t*(r2-255))},${Math.round(255+t*(g2-255))},${Math.round(255+t*(b2-255))})`;
+    }
+    function countyRecord(byCounty, featureId) {
+        const raw = featureId == null ? '' : String(featureId);
+        const candidates = [raw, raw.padStart(5, '0')];
+        // Handle GEOID-like values (e.g., "0500000US01001")
+        const geoid = raw.match(/(\d{5})$/);
+        if (geoid) candidates.push(geoid[1]);
+        for (const k of candidates) {
+            if (k && byCounty[k]) return byCounty[k];
+        }
+        return null;
+    }
+    function normalizeLivestockSpecies(species, byCounty) {
+        if (!species) return species;
+        const canonical = LIVESTOCK_ALIASES[species] || species;
+        const values = Object.values(byCounty || {});
+        const keySet = new Set();
+        // Build key universe from all counties, not just the first one.
+        for (const rec of values) {
+            if (!rec || typeof rec !== 'object') continue;
+            Object.keys(rec).forEach(k => keySet.add(k));
+        }
+        const keys = Array.from(keySet);
+        if (keys.includes(canonical)) return canonical;
+
+        const normalize = (s) => String(s || '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, '');
+
+        const nCanon = normalize(canonical);
+        const byNorm = new Map(keys.map(k => [normalize(k), k]));
+        if (byNorm.has(nCanon)) return byNorm.get(nCanon);
+
+        // Substring fallback for display-name drift.
+        const lower = canonical.toLowerCase();
+        if (lower.includes('broiler')) {
+            const broiler = keys.find(k => k.toLowerCase().includes('broiler'));
+            if (broiler) return broiler;
+        }
+        if (lower.includes('layer')) {
+            const layer = keys.find(k => k.toLowerCase().includes('layer'));
+            if (layer) return layer;
+        }
+
+        return canonical;
+    }
+
+    function toNumeric(v) {
+        if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;
+        if (typeof v === 'string') {
+            const cleaned = v.replace(/,/g, '').trim();
+            if (!cleaned) return NaN;
+            const n = Number(cleaned);
+            return Number.isFinite(n) ? n : NaN;
+        }
+        return NaN;
+    }
+
+    function normKey(s) {
+        return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
+
+    function getSpeciesValue(rec, preferredKey, requestedSpecies) {
+        if (!rec || typeof rec !== 'object') return NaN;
+        // Fast path
+        if (preferredKey in rec) return toNumeric(rec[preferredKey]);
+
+        const keys = Object.keys(rec);
+        const wanted = normKey(preferredKey);
+        for (const k of keys) {
+            if (normKey(k) === wanted) return toNumeric(rec[k]);
+        }
+
+        // Keyword fallback for broilers/layers across variant labels.
+        const lowerReq = String(requestedSpecies || preferredKey).toLowerCase();
+        if (lowerReq.includes('broiler')) {
+            const k = keys.find(x => x.toLowerCase().includes('broiler'));
+            if (k) return toNumeric(rec[k]);
+        }
+        if (lowerReq.includes('layer')) {
+            const k = keys.find(x => x.toLowerCase().includes('layer'));
+            if (k) return toNumeric(rec[k]);
+        }
+        return NaN;
+    }
+
+    async function showLivestockChoropleth(species) {
+        const hoverBox = document.getElementById('cdlHoverBox');
+        if (hoverBox) { hoverBox.textContent = 'Loading county data...'; hoverBox.style.display = 'block'; }
+        try {
+            if (!countyGeoJSON) {
+                const r = await fetch('/api/counties-geojson');
+                if (!r.ok) throw new Error(`county geojson HTTP ${r.status}`);
+                countyGeoJSON = await r.json();
+            }
+            const hasCachedSpecies = countyLivestockData &&
+                Object.values(countyLivestockData.by_county || {}).some(d => species in d);
+            if (!hasCachedSpecies) {
+                const r = await fetch('/api/livestock/county-data');
+                if (r.ok) countyLivestockData = await r.json();
+            }
+            if (!countyGeoJSON || !countyLivestockData) {
+                if (hoverBox) {
+                    hoverBox.textContent = 'County data unavailable';
+                    hoverBox.style.display = 'block';
+                }
+                return;
+            }
+            if (hoverBox) hoverBox.style.display = 'none';
+        } catch (e) {
+            console.error('Livestock choropleth load failed', e);
+            if (hoverBox) {
+                hoverBox.textContent = 'County geometry load failed';
+                hoverBox.style.display = 'block';
+            }
+            return;
+        }
+
+        const byCounty = countyLivestockData.by_county;
+        const speciesKey = normalizeLivestockSpecies(species, byCounty);
+        let resolvedKey = speciesKey;
+        const valsFor = (k) => Object.values(byCounty)
+            .map(d => getSpeciesValue(d, k, species))
+            .filter(v => Number.isFinite(v) && v > 0)
+            .sort((a, b) => a - b);
+        let vals = valsFor(resolvedKey);
+        // Final guard: if selected key has no data, try broiler/layer keyword keys.
+        if (vals.length === 0) {
+            const allKeys = new Set();
+            Object.values(byCounty).forEach(rec => Object.keys(rec || {}).forEach(k => allKeys.add(k)));
+            const lower = String(species).toLowerCase();
+            let fallbackKey = null;
+            if (lower.includes('broiler')) {
+                fallbackKey = Array.from(allKeys).find(k => k.toLowerCase().includes('broiler')) || null;
+            } else if (lower.includes('layer')) {
+                fallbackKey = Array.from(allKeys).find(k => k.toLowerCase().includes('layer')) || null;
+            }
+            if (fallbackKey) {
+                vals = valsFor(fallbackKey);
+                if (vals.length > 0) {
+                    resolvedKey = fallbackKey;
+                    console.info(`Using fallback livestock key '${fallbackKey}' for '${species}'`);
+                }
+            }
+        }
+        const baseColor = LIVESTOCK_COLORS[resolvedKey] || LIVESTOCK_COLORS[speciesKey] || '#555555';
+        const p95 = vals[Math.floor(vals.length * 0.95)] || 1;
+        if (vals.length === 0) {
+            if (!livestockForceReloadTried) {
+                livestockForceReloadTried = true;
+                try {
+                    const r = await fetch('/api/livestock/county-data?force=true');
+                    if (r.ok) {
+                        countyLivestockData = await r.json();
+                        return showLivestockChoropleth(species);
+                    }
+                } catch (e) {
+                    console.warn('Forced county-data reload failed', e);
+                }
+            }
+            if (hoverBox) {
+                hoverBox.textContent = `${species}: no county values`;
+                hoverBox.style.display = 'block';
+            }
+            return;
+        }
+
+        if (livestockLayer) { srMap.removeLayer(livestockLayer); livestockLayer = null; }
+        cdlLayer.setOpacity(0);
+        livestockLayer = L.geoJSON(countyGeoJSON, {
+            pane: 'choroplethPane',
+            style: function(feature) {
+                const rec = countyRecord(byCounty, feature.id);
+                const val = getSpeciesValue(rec, resolvedKey, species);
+                if (!Number.isFinite(val) || val <= 0) return { fillOpacity: 0, weight: 0, opacity: 0 };
+                // Log scaling keeps low-but-real counties visible for heavily skewed species (broilers).
+                const capped = Math.min(val, p95);
+                const tRaw = Math.log10(1 + capped) / Math.log10(1 + p95);
+                const t = Math.max(0.18, Math.pow(tRaw, 0.85));
+                return { fillColor: lerpColor(t, baseColor), fillOpacity: 0.78, weight: 0.3, color: '#666', opacity: 0.4 };
+            }
+        }).addTo(srMap);
+    }
+
+    function hideLivestockChoropleth() {
+        if (livestockLayer) { srMap.removeLayer(livestockLayer); livestockLayer = null; }
+        const hoverBox = document.getElementById('cdlHoverBox');
+        if (hoverBox) hoverBox.style.display = 'none';
+        cdlLayer.setOpacity(parseInt(document.getElementById('sr-opacity').value, 10) / 100);
+    }
+
+    function renderSR() {
+        if (!srData || !srMap) return;
+        const hoursBack = parseInt(document.getElementById('sr-hours').value, 10);
+        const show = {
+            torn: document.getElementById('sr-showTorn').checked,
+            hail: document.getElementById('sr-showHail').checked,
+            wind: document.getElementById('sr-showWind').checked,
+        };
+        const cutoff = hoursBack > 0 ? new Date(Date.now() - hoursBack * 3600000) : null;
+        const counts = { torn: 0, hail: 0, wind: 0 };
+        const radiusFn = { torn: tornRadius, hail: hailRadius, wind: windRadius };
+        const typeLabel = { torn: 'Tornado', hail: 'Hail', wind: 'Wind' };
+        const magLabel  = { torn: 'Rating', hail: 'Size (in)', wind: 'Speed (mph)' };
+        for (const type of ['torn', 'hail', 'wind']) {
+            clearMarkers(type);
+            if (!show[type]) continue;
+            const reports = srData.reports.filter(r => {
+                if (r.type !== type) return false;
+                if (cutoff && r.iso_time) return new Date(r.iso_time) >= cutoff;
+                return true;
+            });
+            counts[type] = reports.length;
+            for (const r of reports) {
+                const timeStr = r.time ? r.time.slice(0,2)+':'+r.time.slice(2)+' UTC' : '';
+                const popup = `<strong>${typeLabel[type]}</strong><br>${timeStr} ${r.date}<br>${r.location}, ${r.county} Co., ${r.state}<br><em>${magLabel[type]}:</em> ${r.magnitude || '–'}<br>${r.comments ? '<small>'+r.comments+'</small>' : ''}`;
+                const m = L.circleMarker([r.lat, r.lon], {
+                    radius: radiusFn[type](r.magnitude), color: STORM_COLOR[type], weight: 1.5,
+                    fillColor: STORM_FILL[type], fillOpacity: 0.8,
+                }).bindPopup(popup).addTo(srMap);
+                srMarkers[type].push(m);
+            }
+        }
+        document.getElementById('sr-tornCount').textContent = counts.torn;
+        document.getElementById('sr-hailCount').textContent = counts.hail;
+        document.getElementById('sr-windCount').textContent = counts.wind;
+    }
+
+    function droughtStyle(feature) {
+        const dm = Number(feature?.properties?.DM);
+        const colors = {
+            0: '#fde68a', // D0
+            1: '#facc15', // D1
+            2: '#f59e0b', // D2
+            3: '#f97316', // D3
+            4: '#dc2626', // D4
+        };
+        const fill = colors[dm];
+        if (!fill) return { fillOpacity: 0, opacity: 0, weight: 0 };
+        return {
+            fillColor: fill,
+            fillOpacity: 0.18,
+            color: '#7c2d12',
+            opacity: 0.35,
+            weight: 0.4,
+        };
+    }
+
+    function applyDroughtOverlayVisibility() {
+        const show = document.getElementById('showDroughtOverlay')?.checked;
+        if (!srMap || !droughtLayer) return;
+        if (show) {
+            if (!srMap.hasLayer(droughtLayer)) droughtLayer.addTo(srMap);
+        } else if (srMap.hasLayer(droughtLayer)) {
+            srMap.removeLayer(droughtLayer);
+        }
+    }
+
+    async function initDroughtOverlay() {
+        try {
+            const r = await fetch('/api/drought-monitor');
+            if (!r.ok) return;
+            const payload = await r.json();
+            droughtGeoJSON = payload?.geojson;
+            const synced = payload?.synced_at;
+            const updatedEl = document.getElementById('droughtOverlayUpdated');
+            if (updatedEl && synced) updatedEl.textContent = `USDM ${synced}`;
+            if (!droughtGeoJSON || !Array.isArray(droughtGeoJSON.features)) return;
+
+            if (droughtLayer) {
+                srMap.removeLayer(droughtLayer);
+                droughtLayer = null;
+            }
+            droughtLayer = L.geoJSON(droughtGeoJSON, {
+                pane: 'droughtPane',
+                style: droughtStyle,
+            });
+            applyDroughtOverlayVisibility();
+        } catch (e) {
+            console.warn('Drought overlay load failed', e);
+        }
+    }
+
+    async function initStormMap() {
+        srMap = L.map('stormMap', { center: [39.5, -98.5], zoom: 4, minZoom: 2, maxZoom: 12 });
+        srMap.createPane('choroplethPane');
+        srMap.getPane('choroplethPane').style.zIndex = 350;
+        srMap.createPane('droughtPane');
+        srMap.getPane('droughtPane').style.zIndex = 360;
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap contributors', opacity: 0.4 }).addTo(srMap);
+        cdlLayer = L.tileLayer('/api/cdl/tile/{z}/{x}/{y}.png?code=all', { opacity: 0.80, attribution: 'USDA NASS CDL 2024', maxZoom: 12 }).addTo(srMap);
+        document.getElementById('sr-opacity').addEventListener('input', function() { cdlLayer.setOpacity(parseInt(this.value, 10) / 100); });
+        document.getElementById('showDroughtOverlay').addEventListener('change', applyDroughtOverlayVisibility);
+        ['sr-showTorn','sr-showHail','sr-showWind','sr-hours'].forEach(id => document.getElementById(id).addEventListener('change', renderSR));
+
+        try {
+            const resp = await fetch('/api/storm-reports');
+            if (resp.ok) { srData = await resp.json(); renderSR(); }
+        } catch(e) { console.warn('[agriculture] storm report fetch failed:', e); }
+        await initDroughtOverlay();
+
+        const hoverBox = document.getElementById('cdlHoverBox');
+        let hoverTimer = null, lastLatLng = null;
+        srMap.on('mousemove', function(e) {
+            lastLatLng = e.latlng;
+            clearTimeout(hoverTimer);
+            hoverTimer = setTimeout(async function() {
+                if (!lastLatLng || livestockLayer) return;
+                const { lat, lng } = lastLatLng;
+                try {
+                    const r = await fetch(`/api/cdl/pixel?lat=${lat.toFixed(5)}&lng=${lng.toFixed(5)}`);
+                    if (!r.ok) return;
+                    const d = await r.json();
+                    if (d.name) { hoverBox.textContent = d.name; hoverBox.style.display = 'block'; }
+                    else { hoverBox.style.display = 'none'; }
+                } catch(_) {}
+            }, 80);
+        });
+        srMap.on('mouseout', function() { clearTimeout(hoverTimer); hoverBox.style.display = 'none'; });
+    }
+
+    let droughtCropChart = null, droughtCropData = null, droughtLiveData = null;
+    function buildCropDropdown(codeInfo) {
+        const sel = document.getElementById('droughtCategorySelect');
+        const groups = {};
+        for (const [code, info] of Object.entries(codeInfo)) {
+            if (!groups[info.group]) groups[info.group] = [];
+            groups[info.group].push({ code, ...info });
+        }
+        const GROUP_ORDER = ['Major Field Crops','Small Grains','Hay & Forage','Legumes','Fruits & Nuts','Vegetables','Other Agricultural','Land Cover','Developed','Other'];
+        for (const groupName of GROUP_ORDER) {
+            const items = groups[groupName];
+            if (!items || items.length === 0) continue;
+            const og = document.createElement('optgroup');
+            og.label = groupName;
+            items.sort((a, b) => b.total_acres - a.total_acres).forEach(item => {
+                const opt = document.createElement('option');
+                opt.value = item.code;
+                const acresStr = item.total_acres >= 1e6 ? `${(item.total_acres/1e6).toFixed(1)}M ac` : `${Math.round(item.total_acres/1e3)}k ac`;
+                opt.textContent = `${item.name} (${acresStr})`;
+                og.appendChild(opt);
+            });
+            sel.appendChild(og);
+        }
+    }
+    function buildLivestockDropdown(liveData) {
+        const sel = document.getElementById('droughtCategorySelect');
+        const og  = document.createElement('optgroup');
+        og.label  = 'Livestock (head)';
+        for (const species of (liveData.species ?? [])) {
+            const opt = document.createElement('option');
+            opt.value = '__live__' + species;
+            const total = liveData.species_totals?.[species] ?? 0;
+            const label = total >= 1e6 ? `${(total/1e6).toFixed(0)}M head` : `${Math.round(total/1e3)}k head`;
+            opt.textContent = `${species} (${label})`;
+            og.appendChild(opt);
+        }
+        sel.appendChild(og);
+    }
+    function applyDropdownFilter() {
+        const q = document.getElementById('droughtCategorySearch').value.toLowerCase().trim();
+        const sel = document.getElementById('droughtCategorySelect');
+        for (const og of sel.querySelectorAll('optgroup')) {
+            let visible = false;
+            for (const opt of og.querySelectorAll('option')) {
+                const match = !q || opt.textContent.toLowerCase().includes(q);
+                opt.style.display = match ? '' : 'none';
+                if (match) visible = true;
+            }
+            og.style.display = visible ? '' : 'none';
+        }
+    }
+    function renderDroughtCropChart() {
+        if (!droughtCropData) return;
+        const level = document.getElementById('droughtChartLevel').value;
+        const selCode = document.getElementById('droughtCategorySelect').value;
+        const codeInfo = droughtCropData.code_info ?? {};
+        const isLive = selCode.startsWith('__live__');
+        const liveSpec = isLive ? selCode.slice(8) : null;
+        const dates = (isLive && droughtLiveData) ? droughtLiveData.dates : droughtCropData.dates;
+        const byDate = (isLive && droughtLiveData) ? droughtLiveData.by_date : droughtCropData.by_date;
+        if (!dates || dates.length === 0) return;
+
+        document.getElementById('droughtChartPlaceholder').style.display = 'none';
+        document.getElementById('droughtChartWrap').style.display = 'block';
+
+        const subtitle = document.getElementById('droughtChartSubtitle');
+        if (selCode === 'Total') subtitle.textContent = `Total US cropland: ${(droughtCropData.total_cropland_acres / 1e6).toFixed(0)}M acres`;
+        else if (isLive && droughtLiveData) subtitle.textContent = `Total US ${liveSpec}: ${((droughtLiveData.species_totals?.[liveSpec] ?? 0) / 1e6).toFixed(0)}M head (NASS 2022 Census)`;
+        else subtitle.textContent = codeInfo[selCode] ? `Total US ${codeInfo[selCode].name}: ${codeInfo[selCode].total_acres >= 1e6 ? (codeInfo[selCode].total_acres/1e6).toFixed(1)+'M' : Math.round(codeInfo[selCode].total_acres/1e3)+'k'} acres` : '';
+
+        const values = dates.map(d => {
+            if (selCode === 'Total') return (byDate[d]?.[level]?.Total ?? 0) / 1e6;
+            if (isLive) return (byDate[d]?.[level]?.[liveSpec] ?? 0) / 1e6;
+            return (byDate[d]?.[level]?.[selCode] ?? 0) / 1e6;
+        });
+        const yLabel = isLive ? 'Million Head' : 'Million Acres';
+        const unitWord = isLive ? 'head' : 'acres';
+        const seriesLabel = isLive ? liveSpec : (selCode === 'Total' ? 'Total Cropland' : (codeInfo[selCode]?.name ?? selCode));
+        const color = isLive ? '#92400e' : '#2563eb';
+
+        const ctx = document.getElementById('droughtCropChart').getContext('2d');
+        if (droughtCropChart) droughtCropChart.destroy();
+        droughtCropChart = new Chart(ctx, {
+            type: 'line',
+            data: { labels: dates, datasets: [{ label: seriesLabel, data: values, borderColor: color, backgroundColor: color + '22', borderWidth: 2, fill: true, pointRadius: 2, tension: 0.3 }] },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)}M ${unitWord}` } } }, scales: { x: { type: 'time', time: { unit: 'month' } }, y: { title: { display: true, text: yLabel }, min: 0 } } }
+        });
+    }
+    async function loadDroughtCropData() {
+        if (droughtCropData) { renderDroughtCropChart(); return; }
+        try {
+            const r = await fetch('/api/drought-crops/timeseries');
+            if (!r.ok) { document.getElementById('droughtChartPlaceholder').textContent = 'Drought exposure data not yet computed.'; return; }
+            droughtCropData = await r.json();
+            if (droughtCropData.computed_at) document.getElementById('droughtChartUpdated').textContent = 'Updated ' + droughtCropData.computed_at.slice(0, 10);
+            if (droughtCropData.total_cropland_acres) document.getElementById('droughtChartTotalLabel').textContent = `(${(droughtCropData.total_cropland_acres / 1e6).toFixed(0)}M cropland acres tracked)`;
+            if (droughtCropData.code_info) buildCropDropdown(droughtCropData.code_info);
+            renderDroughtCropChart();
+        } catch(_) {
+            document.getElementById('droughtChartPlaceholder').textContent = 'Failed to load drought exposure data.';
+        }
+        try {
+            const r = await fetch('/api/drought-livestock/timeseries');
+            if (r.ok) { droughtLiveData = await r.json(); buildLivestockDropdown(droughtLiveData); }
+        } catch(_) {}
+        // Ensure map and chart state match current selector (handles restored selections)
+        syncMapToSelection();
+    }
+
+    function syncMapToSelection() {
+        const sel = document.getElementById('droughtCategorySelect');
+        if (!sel) return;
+        const code = sel.value;
+        if (code && code.startsWith('__live__')) {
+            showLivestockChoropleth(code.slice(8));
+        } else {
+            hideLivestockChoropleth();
+            if (cdlLayer) cdlLayer.setUrl('/api/cdl/tile/{z}/{x}/{y}.png?code=' + (code || 'all'));
+        }
+    }
+
+    document.getElementById('droughtChartLevel').addEventListener('change', renderDroughtCropChart);
+    document.getElementById('droughtCategorySelect').addEventListener('change', function() {
+        renderDroughtCropChart();
+        syncMapToSelection();
+    });
+    document.getElementById('droughtCategorySearch').addEventListener('input', function() { applyDropdownFilter(); renderDroughtCropChart(); });
+
+    document.addEventListener('DOMContentLoaded', async function() {
+        await initStormMap();
+        await loadDroughtCropData();
+    });
+})();
+</script>
+{% endblock %}

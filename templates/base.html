@@ -285,13 +285,18 @@
                         </a>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link {% if request.path == '/sync' %}active{% endif %}" href="/sync">
-                            <i class="bi bi-cloud-download"></i> Sync
+                        <a class="nav-link {% if request.path == '/agriculture' %}active{% endif %}" href="/agriculture">
+                            <i class="bi bi-tree"></i> Agriculture
                         </a>
                     </li>
                     <li class="nav-item">
                         <a class="nav-link {% if request.path.startswith('/pangu') %}active{% endif %}" href="/pangu">
                             <i class="bi bi-cpu"></i> Pangu AI Modeling
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.path == '/sync' %}active{% endif %}" href="/sync">
+                            <i class="bi bi-cloud-download"></i> Sync
                         </a>
                     </li>
                 </ul>

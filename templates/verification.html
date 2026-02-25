@@ -372,6 +372,15 @@
                         <span id="asosColorMax" class="text-muted small">10</span>
                         <span id="asosUnits" class="text-muted small ms-2"></span>
                     </div>
+                    <!-- Drought Monitor Legend (shown only for dewpoint/precip + last-20-days) -->
+                    <div id="droughtLegend" class="mt-2 gap-3 justify-content-center flex-wrap pb-2" style="display:none; font-size:0.75rem">
+                        <strong>Drought <span id="droughtDate" class="fw-normal text-muted"></span>:</strong>
+                        <span><span style="background:#FFFF00;padding:0 6px">&nbsp;</span> D0 Abnormally Dry</span>
+                        <span><span style="background:#FCD37F;padding:0 6px">&nbsp;</span> D1 Moderate</span>
+                        <span><span style="background:#FFAA00;padding:0 6px">&nbsp;</span> D2 Severe</span>
+                        <span><span style="background:#E60000;padding:0 6px">&nbsp;</span> D3 Extreme</span>
+                        <span><span style="background:#730000;color:#fff;padding:0 6px">&nbsp;</span> D4 Exceptional</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -390,6 +399,7 @@ let tempMaeChart, tempBiasChart, mslpMaeChart, mslpBiasChart;
 
 let asosMap = null;
 let asosMarkers = [];
+let droughtLayer = null;
 
 let asosTempMaeChart, asosTempBiasChart, asosMslpMaeChart, asosMslpBiasChart;
 let timeSeriesChart = null;
@@ -556,6 +566,23 @@ function getBiasColor(value, minVal, maxVal, variable) {
             const b = Math.round(255 - t * (255 - 34));   // 255 to 34
             return `rgb(${r}, ${g}, ${b})`;
         }
+    } else if (variable === 'dewpoint') {
+        // Dewpoint: Brown (dry/low) -> White -> Green (moist/high)
+        if (ratio < 0) {
+            // Brown to White
+            const t = 1 + ratio;  // 0 to 1
+            const r = Math.round(139 + t * (255 - 139));
+            const g = Math.round(69  + t * (255 - 69));
+            const b = Math.round(19  + t * (255 - 19));
+            return `rgb(${r}, ${g}, ${b})`;
+        } else {
+            // White to Green
+            const t = ratio;  // 0 to 1
+            const r = Math.round(255 + t * (34  - 255));
+            const g = Math.round(255 + t * (197 - 255));
+            const b = Math.round(255 + t * (94  - 255));
+            return `rgb(${r}, ${g}, ${b})`;
+        }
     } else {
         // Temperature/Pressure: Blue -> White -> Red
         if (ratio < 0) {
@@ -608,6 +635,11 @@ function updateColorScale(metric, minVal, maxVal, variable) {
             maxSpan.textContent = '1.0';
             // Brown -> White -> Green gradient for precipitation
             scale.style.background = 'linear-gradient(to right, rgb(139, 69, 19), rgb(255, 255, 255), rgb(34, 139, 34))';
+        } else if (variable === 'dewpoint') {
+            minSpan.textContent = '-20.0';
+            maxSpan.textContent = '20.0';
+            // Brown -> White -> Green gradient for dewpoint
+            scale.style.background = 'linear-gradient(to right, #8b4513, #ffffff 50%, #22c55e)';
         } else {
             minSpan.textContent = '-10.0';
             maxSpan.textContent = '10.0';
@@ -1680,6 +1712,66 @@ function renderAsosVerificationTable(v, vAll = null, metric = 'mae') {
 }
 
 
+// Drought Monitor category colors (official USDM palette)
+const DROUGHT_COLORS = {
+    0: '#FFFF00',
+    1: '#FCD37F',
+    2: '#FFAA00',
+    3: '#E60000',
+    4: '#730000'
+};
+
+async function loadDroughtOverlay() {
+    const variable = document.getElementById('asosVariable').value;
+    const periodToggle = document.getElementById('asosPeriodToggle').checked;
+    const showDrought = (variable === 'dewpoint' || variable === 'precip') && periodToggle;
+
+    // Remove existing layer and hide legend
+    if (droughtLayer) {
+        asosMap.removeLayer(droughtLayer);
+        droughtLayer = null;
+    }
+    document.getElementById('droughtLegend').style.display = 'none';
+
+    if (!showDrought) return;
+
+    try {
+        const resp = await fetch('/api/drought-monitor');
+        if (!resp.ok) return;  // Data not yet synced — silently skip
+        const data = await resp.json();
+
+        droughtLayer = L.geoJSON(data.geojson, {
+            style: function(feature) {
+                const dm = feature.properties.DM;
+                const color = DROUGHT_COLORS[dm] || '#FFFFFF';
+                return {
+                    fillColor: color,
+                    fillOpacity: 0.35,
+                    color: color,
+                    weight: 0.5,
+                    opacity: 1
+                };
+            },
+            onEachFeature: function(feature, layer) {
+                const dm = feature.properties.DM;
+                const labels = ['D0 – Abnormally Dry', 'D1 – Moderate', 'D2 – Severe', 'D3 – Extreme', 'D4 – Exceptional'];
+                layer.bindTooltip(labels[dm] || `DM ${dm}`, { sticky: true });
+            }
+        }).addTo(asosMap);
+
+        // Push drought polygons behind station markers
+        droughtLayer.bringToBack();
+
+        // Show date label (file mtime = last sync date, which reflects the Thursday release)
+        if (data.synced_at) {
+            document.getElementById('droughtDate').textContent = `(${data.synced_at})`;
+        }
+        document.getElementById('droughtLegend').style.display = 'flex';
+    } catch (e) {
+        console.warn('[loadDroughtOverlay] Failed to load drought data:', e);
+    }
+}
+
 // Load and display ASOS verification data
 async function loadAsosVerification() {
     if (!asosMap) {
@@ -1687,6 +1779,9 @@ async function loadAsosVerification() {
     }
     // Hide station charts when map is reloaded
     document.getElementById('asosStationCharts').classList.add('d-none');
+
+    // Load drought overlay (shown only for dewpoint/precip + last-20-days)
+    loadDroughtOverlay();
 
     const variable = document.getElementById('asosVariable').value;
     const metric = document.getElementById('asosMetric').value;

@@ -55,6 +55,7 @@ VERIF_TS_CACHE_PATH = DATA_DIR / "verification_time_series_cache.json"
 VERIF_LEAD_CACHE_PATH = DATA_DIR / "verification_lead_time_cache.json"
 COCORAHs_CACHE_PATH = DATA_DIR / "cocorahs_daily_cache.json"
 BIAS_HISTORY_CACHE_PATH = DATA_DIR / "bias_history_cache.json"
+COUNTIES_GEOJSON_CACHE_PATH = DATA_DIR / "counties_geojson_cache.json"
 import asos
 import gravity_wave_detection as _gwd
 import nws_batch
@@ -82,6 +83,8 @@ import radar as _radar
 import drought_monitor as _drought_monitor
 import storm_reports as _storm_reports
 import drought_crops as _drought_crops
+import cdl_tiles as _cdl_tiles
+import livestock_drought as _livestock_drought
 
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = DATA_DIR / "forecasts.json"
@@ -2941,6 +2944,12 @@ def sync():
 def current_conditions():
     """Current weather conditions page."""
     return render_template('current.html')
+
+
+@app.route('/agriculture')
+def agriculture_page():
+    """Agriculture page (US Storm Reports + drought/crop overlays)."""
+    return render_template('agriculture.html')
 
 
 @app.route('/forecast')
@@ -10771,6 +10780,130 @@ def api_drought_crops_rebuild():
         _drought_crops.build_timeseries()
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"success": True, "message": "Rebuild started in background"})
+
+
+@app.route('/api/livestock/county-data')
+def api_livestock_county_data():
+    """Return NASS county-level livestock head counts, keyed by 5-digit FIPS."""
+    force = request.args.get('force', 'false').lower() == 'true'
+    data = _livestock_drought.fetch_nass_livestock_county(force=force)
+
+    # Defensive refresh: if broilers are missing in the cache payload, try one forced rebuild.
+    try:
+        by_county = data.get("by_county", {})
+        has_broilers = any("Chickens, Broilers" in (rec or {}) for rec in by_county.values())
+        if not has_broilers and not force:
+            logger.warning("County livestock payload missing broilers; retrying with force refresh")
+            data = _livestock_drought.fetch_nass_livestock_county(force=True)
+    except Exception as e:
+        logger.warning(f"Failed broiler presence check: {e}")
+
+    resp = jsonify(data)
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
+
+
+@app.route('/api/counties-geojson')
+def api_counties_geojson():
+    """Return US counties GeoJSON (cached locally, refreshed from Plotly source if needed)."""
+    cache_max_age_sec = 86400 * 30
+    now_ts = time.time()
+    try:
+        if COUNTIES_GEOJSON_CACHE_PATH.exists():
+            age = now_ts - COUNTIES_GEOJSON_CACHE_PATH.stat().st_mtime
+            if age < cache_max_age_sec:
+                with open(COUNTIES_GEOJSON_CACHE_PATH, 'r') as f:
+                    data = json.load(f)
+                resp = jsonify(data)
+                resp.headers['Cache-Control'] = 'public, max-age=86400'
+                return resp
+    except Exception as e:
+        logger.warning(f"Failed reading counties geojson cache: {e}")
+
+    source_url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
+    try:
+        r = requests.get(source_url, timeout=25)
+        r.raise_for_status()
+        data = r.json()
+
+        try:
+            COUNTIES_GEOJSON_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(COUNTIES_GEOJSON_CACHE_PATH, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning(f"Failed writing counties geojson cache: {e}")
+
+        resp = jsonify(data)
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        return resp
+    except Exception as e:
+        logger.error(f"Failed fetching counties geojson from source: {e}")
+        if COUNTIES_GEOJSON_CACHE_PATH.exists():
+            try:
+                with open(COUNTIES_GEOJSON_CACHE_PATH, 'r') as f:
+                    data = json.load(f)
+                resp = jsonify(data)
+                resp.headers['Cache-Control'] = 'public, max-age=3600'
+                return resp
+            except Exception:
+                pass
+        return jsonify({"success": False, "error": "Counties GeoJSON unavailable"}), 503
+
+
+@app.route('/api/drought-livestock/timeseries')
+def api_drought_livestock_timeseries():
+    """Return precomputed livestock drought exposure time series."""
+    data = _livestock_drought.load_timeseries()
+    if data is None:
+        return jsonify({"success": False, "error": "No livestock cache. Run livestock_drought.build_timeseries() first."}), 404
+    return jsonify({"success": True, **data})
+
+
+@app.route('/api/drought-livestock/rebuild', methods=['POST'])
+def api_drought_livestock_rebuild():
+    """Kick off a background rebuild of the livestock drought timeseries."""
+    import threading
+    threading.Thread(target=_livestock_drought.build_timeseries, daemon=True).start()
+    return jsonify({"success": True, "message": "Rebuild started in background"})
+
+
+@app.route('/api/cdl/pixel')
+def api_cdl_pixel():
+    """Return CDL code and name for a WGS84 lat/lng point."""
+    try:
+        lat = float(request.args['lat'])
+        lng = float(request.args['lng'])
+    except (KeyError, ValueError):
+        return jsonify({"error": "lat and lng required"}), 400
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return jsonify({"code": None, "name": None})
+    result = _cdl_tiles.sample_pixel(lat, lng)
+    resp = jsonify(result)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+@app.route('/api/cdl/tile/<int:z>/<int:x>/<int:y>.png')
+def api_cdl_tile(z, x, y):
+    """Serve a single CDL tile in EPSG:3857 / Web Mercator for Leaflet."""
+    code = request.args.get('code', 'all')
+    # Validate code parameter
+    if code not in ('all', 'Total'):
+        try:
+            int(code)
+        except ValueError:
+            return '', 400
+    # Reasonable zoom range
+    if not (2 <= z <= 14):
+        return '', 400
+    try:
+        png = _cdl_tiles.render_tile(z, x, y, code)
+    except Exception as exc:
+        logger.error("CDL tile error z=%d x=%d y=%d: %s", z, x, y, exc)
+        return '', 500
+    resp = Response(png, mimetype='image/png')
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
 
 
 if __name__ == '__main__':
