@@ -82,9 +82,12 @@ from pangu_integration import pangu_bp, cleanup_database, load_runs_db
 import radar as _radar
 import drought_monitor as _drought_monitor
 import storm_reports as _storm_reports
+import fire_reports as _fire_reports
+import storm_crop_timeseries as _storm_crop_ts
 import drought_crops as _drought_crops
 import cdl_tiles as _cdl_tiles
 import livestock_drought as _livestock_drought
+import polymarket as _polymarket
 
 # Single JSON file for storing all forecast data
 FORECASTS_FILE = DATA_DIR / "forecasts.json"
@@ -145,6 +148,7 @@ DEFAULT_LON = -77.3091
 
 # Forecast retention window (days)
 FORECAST_RETENTION_DAYS = 20
+ASOS_MONTHLY_WINDOW_DAYS = 20
 
 # EPA AQI color scale
 AQI_COLORS = {
@@ -3141,7 +3145,7 @@ def api_verification_by_lead_time():
                 })
 
         if period == 'monthly':
-            result = calculate_lead_time_verification(location_name, days_back=30, use_cumulative=False)
+            result = calculate_lead_time_verification(location_name, days_back=ASOS_MONTHLY_WINDOW_DAYS, use_cumulative=False)
         else:
             result = calculate_lead_time_verification(location_name, use_cumulative=True)
 
@@ -6345,6 +6349,23 @@ def rossby_page():
     return render_template('rossby.html')
 
 
+@app.route('/polymarket')
+def polymarket_page():
+    """Polymarket NYC daily high temperature prediction market tracker."""
+    return render_template('polymarket.html')
+
+
+@app.route('/api/polymarket/nyc')
+def api_polymarket_nyc():
+    """Return cached Polymarket NYC temperature market data."""
+    try:
+        data = _polymarket.load_polymarket_cache()
+        return jsonify(data)
+    except Exception as e:
+        logger.error("Failed to load polymarket cache: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/single-run-bias')
 def single_run_bias_page():
     """Single run bias map page - shows model bias for a specific forecast run."""
@@ -6523,6 +6544,27 @@ def api_current_weather():
     except Exception as e:
         logger.error(f"Error fetching current weather: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/weather-history')
+def api_weather_history():
+    """Return recent history for a Davis station variable from WeatherLink CSV."""
+    variable = request.args.get('variable', 'temp')
+    days = min(int(request.args.get('days', 14)), 30)  # cap at 30 days
+
+    if variable not in weatherlink.HISTORY_VARIABLE_COLS:
+        return jsonify({'success': False, 'error': f'Unknown variable: {variable}'}), 400
+
+    now_eastern = weatherlink.utc_to_eastern(datetime.utcnow())
+    end_date = now_eastern
+    start_date = end_date - timedelta(days=days)
+
+    try:
+        data = weatherlink.read_csv_data_full(start_date, end_date, variable)
+        return jsonify({'success': True, 'data': data, 'variable': variable, 'days': days})
+    except Exception as e:
+        logger.error(f"Error reading weather history for {variable}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/historical')
@@ -8191,7 +8233,7 @@ def api_asos_station_verification():
     try:
         if period == 'monthly':
             # get_station_detail_monthly returns a flat structure with pre-computed arrays
-            raw_result = asos.get_station_detail_monthly(station_id, model, days_back=30)
+            raw_result = asos.get_station_detail_monthly(station_id, model, days_back=ASOS_MONTHLY_WINDOW_DAYS)
             if "error" in raw_result:
                 return jsonify({"success": False, "error": raw_result["error"]}), 404
 
@@ -8269,7 +8311,7 @@ def api_asos_station_observations():
         now = datetime.now(timezone.utc)
         cutoff = None
         if period == "monthly":
-            cutoff = now - timedelta(days=30)
+            cutoff = now - timedelta(days=ASOS_MONTHLY_WINDOW_DAYS)
 
         times = []
         temps = []
@@ -8326,7 +8368,7 @@ def api_asos_station_obs_timeseries():
             return jsonify({"success": False, "error": "No ASOS forecast runs available"}), 404
 
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=30) if period == "monthly" else None
+        cutoff = now - timedelta(days=ASOS_MONTHLY_WINDOW_DAYS) if period == "monthly" else None
 
         models = ["gfs", "aifs", "ifs", "nws"]
         if model not in models:
@@ -8766,7 +8808,7 @@ def api_asos_mean_verification():
                     end_dt = datetime.fromisoformat(cache_timestamp)
                     if end_dt.tzinfo is None:
                         end_dt = end_dt.replace(tzinfo=timezone.utc)
-                    start_dt = end_dt - timedelta(days=30)
+                    start_dt = end_dt - timedelta(days=ASOS_MONTHLY_WINDOW_DAYS)
                     window_start = start_dt.isoformat()
                     window_end = end_dt.isoformat()
                 except Exception:
@@ -9240,7 +9282,7 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
 
             for period in ["all", "monthly"]:
                 if period == "monthly":
-                    result = calculate_lead_time_verification("Fairfax, VA", days_back=30, use_cumulative=False)
+                    result = calculate_lead_time_verification("Fairfax, VA", days_back=ASOS_MONTHLY_WINDOW_DAYS, use_cumulative=False)
                 else:
                     result = calculate_lead_time_verification("Fairfax, VA", use_cumulative=True)
                 if "error" in result:
@@ -9420,40 +9462,12 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 logger.warning(f"Trend data storage failed: {e}")
                 asos_results['trends'] = {'status': 'error', 'error': str(e)}
 
-            _monthly_cache = asos.load_monthly_stats_cache()
-            _monthly_generated_at = _monthly_cache.get("monthly_generated_at")
-            _monthly_age_hours = None
-            if _monthly_generated_at:
-                try:
-                    _gen_dt = datetime.fromisoformat(_monthly_generated_at)
-                    if _gen_dt.tzinfo is None:
-                        _gen_dt = _gen_dt.replace(tzinfo=timezone.utc)
-                    _monthly_age_hours = (datetime.now(timezone.utc) - _gen_dt).total_seconds() / 3600
-                except Exception:
-                    pass
-            if _monthly_age_hours is None or _monthly_age_hours > 20:
-                broadcast_sync_log("Rebuilding monthly ASOS cache (last 30 days)...", 'info')
-                asos.rebuild_monthly_station_cache(days_back=20)
-                broadcast_sync_log("Monthly ASOS cache updated", 'success')
-                broadcast_sync_log("Rebuilding ASOS verification cache...", 'info')
-                asos.precompute_verification_cache()
-                broadcast_sync_log("ASOS verification cache updated", 'success')
-
-                # Publish static GitHub Pages site after every verification rebuild
-                try:
-                    broadcast_sync_log("Publishing verification site to GitHub Pages...", 'info')
-                    import export_verification_site as evs
-                    evs.generate_site()
-                    pushed = evs.push_to_github_pages()
-                    if pushed:
-                        broadcast_sync_log("GitHub Pages site published", 'success')
-                    else:
-                        broadcast_sync_log("GitHub Pages: no changes (site already current)", 'info')
-                except Exception as _pages_exc:
-                    broadcast_sync_log(f"GitHub Pages publish failed (non-fatal): {_pages_exc}", 'warning')
-                    logger.warning(f"GitHub Pages publish failed: {_pages_exc}", exc_info=True)
-            else:
-                broadcast_sync_log(f"Monthly ASOS cache is {_monthly_age_hours:.1f}h old, skipping rebuild", 'info')
+            broadcast_sync_log(f"Rebuilding monthly ASOS cache (last {ASOS_MONTHLY_WINDOW_DAYS} days)...", 'info')
+            asos.rebuild_monthly_station_cache(days_back=ASOS_MONTHLY_WINDOW_DAYS)
+            broadcast_sync_log("Monthly ASOS cache updated", 'success')
+            broadcast_sync_log("Rebuilding ASOS verification cache...", 'info')
+            asos.precompute_verification_cache()
+            broadcast_sync_log("ASOS verification cache updated", 'success')
 
             results['asos'] = {
                 'status': 'success',
@@ -9478,6 +9492,67 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
             broadcast_sync_log(f"Warning: Storm reports sync failed: {e}", 'warning')
             logger.warning("Storm reports sync failed: %s", e)
             results['storm_reports'] = {'status': 'error', 'error': str(e)}
+
+        # Sync fire reports — FIRMS VIIRS NOAA-20 24h CONUS, ≥10 MW FRP (non-critical)
+        try:
+            fr = _fire_reports.sync_fire_reports()
+            results['fire_reports'] = fr
+            broadcast_sync_log(f"Fire reports: {fr.get('detection_count', 0)} detections cached", 'info')
+        except Exception as e:
+            broadcast_sync_log(f"Warning: Fire reports sync failed: {e}", 'warning')
+            logger.warning("Fire reports sync failed: %s", e)
+            results['fire_reports'] = {'status': 'error', 'error': str(e)}
+
+        # Update storm crop exposure timeseries (non-critical)
+        try:
+            broadcast_sync_log("Updating storm crop timeseries (CDL intersection)…", 'info')
+
+            def _sc_log(msg):
+                broadcast_sync_log(f"  [storm-crop] {msg}", 'info')
+
+            sc_result = _storm_crop_ts.update_timeseries(progress_cb=_sc_log)
+            results['storm_crop_timeseries'] = sc_result
+            broadcast_sync_log(
+                f"Storm crop timeseries: +{sc_result.get('added', 0)} new days, "
+                f"{sc_result.get('refreshed', 0)} refreshed, "
+                f"{sc_result.get('total_dates', 0)} total",
+                'info',
+            )
+        except Exception as e:
+            broadcast_sync_log(f"Warning: Storm crop timeseries failed: {e}", 'warning')
+            logger.warning("Storm crop timeseries update failed: %s", e)
+            results['storm_crop_timeseries'] = {'status': 'error', 'error': str(e)}
+
+        # Sync Polymarket NYC temperature markets (non-critical)
+        try:
+            broadcast_sync_log("Fetching Polymarket NYC temperature market odds…", 'info')
+            pm_result = _polymarket.update_polymarket_cache()
+            results['polymarket'] = pm_result
+            broadcast_sync_log(
+                f"Polymarket: {pm_result.get('found', 0)} markets found, "
+                f"{pm_result.get('updated', 0)} updated",
+                'info',
+            )
+        except Exception as e:
+            broadcast_sync_log(f"Warning: Polymarket sync failed: {e}", 'warning')
+            logger.warning("Polymarket sync failed: %s", e)
+            results['polymarket'] = {'status': 'error', 'error': str(e)}
+
+        # Publish static GitHub Pages site (non-critical — runs every sync regardless of ASOS outcome)
+        try:
+            broadcast_sync_log("Publishing verification site to GitHub Pages...", 'info')
+            import export_verification_site as evs
+            evs.generate_site()
+            pushed = evs.push_to_github_pages()
+            if pushed:
+                broadcast_sync_log("GitHub Pages site published", 'success')
+            else:
+                broadcast_sync_log("GitHub Pages: no changes (site already current)", 'info')
+            results['github_pages'] = {'status': 'pushed' if pushed else 'current'}
+        except Exception as _pages_exc:
+            broadcast_sync_log(f"GitHub Pages publish failed (non-fatal): {_pages_exc}", 'warning')
+            logger.warning(f"GitHub Pages publish failed: {_pages_exc}", exc_info=True)
+            results['github_pages'] = {'status': 'error', 'error': str(_pages_exc)}
 
         # Check if any critical errors occurred
         if results['errors']:
@@ -10743,6 +10818,129 @@ def api_storm_reports():
     data = _storm_reports.load_storm_reports()
     if data is None:
         return jsonify({"error": "Storm reports not available. Run a sync first."}), 404
+    return jsonify(data)
+
+
+@app.route('/api/fire-reports')
+def api_fire_reports():
+    """Return cached FIRMS fire detection reports as JSON, or 404 if not yet synced."""
+    data = _fire_reports.load_fire_reports()
+    if data is None:
+        return jsonify({"error": "Fire reports not available. Run a sync first."}), 404
+    return jsonify(data)
+
+
+# Simple in-memory cache for storm crop impact computations.
+# Key: (hours, fetched_at_str)  Value: result dict
+_storm_crop_impact_cache: dict = {}
+
+
+@app.route('/api/storm-crop-impact')
+def api_storm_crop_impact():
+    """
+    Compute CDL acreage within storm-impact buffers for each hazard type.
+
+    Query params:
+      hours  – how many hours back to include (0 = all; default 48)
+
+    Returns per-hazard-type dict of {cdl_code: acres}, plus code metadata
+    and the assumed radii used.
+    """
+    try:
+        from cdl_tiles import compute_storm_impact, STORM_IMPACT_RADII_KM
+        from drought_crops import CDL_CATEGORIES
+    except ImportError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    hours = int(request.args.get("hours", 48))
+
+    sr_data = _storm_reports.load_storm_reports()
+    if not sr_data:
+        return jsonify({"success": False, "error": "Storm reports not available"}), 404
+    fr_data = _fire_reports.load_fire_reports()  # may be None — non-fatal
+
+    fetched_at    = sr_data.get("fetched_at", "")
+    fr_fetched_at = fr_data.get("fetched_at", "") if fr_data else ""
+    cache_key = (hours, fetched_at, fr_fetched_at)
+    if cache_key in _storm_crop_impact_cache:
+        return jsonify(_storm_crop_impact_cache[cache_key])
+
+    # Filter storm reports by hours
+    all_reports = sr_data.get("reports", [])
+    cutoff = None
+    if hours > 0:
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
+
+    reports_by_type: dict[str, list] = {"torn": [], "hail": [], "wind": []}
+    for rep in all_reports:
+        t = rep.get("type")
+        if t not in reports_by_type:
+            continue
+        if cutoff and rep.get("iso_time"):
+            try:
+                rep_dt = datetime.fromisoformat(rep["iso_time"].replace("Z", "+00:00"))
+                rep_dt = rep_dt.replace(tzinfo=None)
+                if rep_dt < cutoff:
+                    continue
+            except (ValueError, AttributeError):
+                pass
+        reports_by_type[t].append(rep)
+
+    # Filter fire detections by hours
+    fire_dets = fr_data.get("detections", []) if fr_data else []
+    if cutoff:
+        filtered_fire = []
+        for d in fire_dets:
+            if d.get("iso_time"):
+                try:
+                    dt = datetime.fromisoformat(d["iso_time"].replace("Z", "+00:00"))
+                    if dt.replace(tzinfo=None) >= cutoff:
+                        filtered_fire.append(d)
+                except (ValueError, AttributeError):
+                    filtered_fire.append(d)
+            else:
+                filtered_fire.append(d)
+        fire_dets = filtered_fire
+    reports_by_type["fire"] = fire_dets
+
+    # Run CDL sampling
+    impact = compute_storm_impact(reports_by_type)
+
+    # Build crop name lookup from CDL_CATEGORIES
+    code_info = {
+        str(code): {"name": name, "group": group, "is_cropland": is_crop}
+        for code, (name, group, is_crop) in CDL_CATEGORIES.items()
+    }
+
+    result = {
+        "success": True,
+        "hours": hours,
+        "fetched_at": fetched_at,
+        "radii_km": STORM_IMPACT_RADII_KM,
+        "report_counts": {t: len(reps) for t, reps in reports_by_type.items()},
+        "fire_available": fr_data is not None,
+        "impact": {
+            haz: {str(code): acres for code, acres in by_code.items()}
+            for haz, by_code in impact.items()
+        },
+        "code_info": code_info,
+    }
+
+    _storm_crop_impact_cache[cache_key] = result
+    # Evict old entries to prevent unbounded growth
+    if len(_storm_crop_impact_cache) > 20:
+        oldest = next(iter(_storm_crop_impact_cache))
+        del _storm_crop_impact_cache[oldest]
+
+    return jsonify(result)
+
+
+@app.route('/api/storm-crops/timeseries')
+def api_storm_crops_timeseries():
+    """Return precomputed daily storm crop exposure timeseries."""
+    data = _storm_crop_ts.load_timeseries()
+    if data is None:
+        return jsonify({"error": "Storm crop timeseries not yet computed. Run a sync first."}), 404
     return jsonify(data)
 
 
