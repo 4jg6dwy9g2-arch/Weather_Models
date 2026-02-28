@@ -1524,15 +1524,13 @@ async function loadMeanAsosVerification(period = 'all') {
 function _pctMae(cur, base) {
     if (cur == null || base == null || base === 0) return '';
     const pct = Math.round((cur - base) / base * 100);
-    if (pct === 0) return '';
-    const color = pct < 0 ? 'green' : 'red';
+    const color = pct < 0 ? 'green' : pct > 0 ? 'red' : 'gray';
     return ` <span style="color:${color};font-size:0.7em">(${pct > 0 ? '+' : ''}${pct}%)</span>`;
 }
 function _pctBias(cur, base) {
     if (cur == null || base == null || base === 0) return '';
     const pct = Math.round((Math.abs(cur) - Math.abs(base)) / Math.abs(base) * 100);
-    if (pct === 0) return '';
-    const color = pct < 0 ? 'green' : 'red';
+    const color = pct < 0 ? 'green' : pct > 0 ? 'red' : 'gray';
     return ` <span style="color:${color};font-size:0.7em">(${pct > 0 ? '+' : ''}${pct}%)</span>`;
 }
 
