@@ -127,6 +127,18 @@
                             <input class="form-check-input" type="checkbox" id="asosPeriodToggle">
                             <label class="form-check-label small" for="asosPeriodToggle">Last 20 days</label>
                         </div>
+                        <div class="btn-group btn-group-sm" role="group" id="validHourFilter">
+                            <input type="radio" class="btn-check" name="validHour" id="vh-all" value="" autocomplete="off" checked>
+                            <label class="btn btn-outline-secondary" for="vh-all">All</label>
+                            <input type="radio" class="btn-check" name="validHour" id="vh-00" value="0" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="vh-00">00Z</label>
+                            <input type="radio" class="btn-check" name="validHour" id="vh-06" value="6" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="vh-06">06Z</label>
+                            <input type="radio" class="btn-check" name="validHour" id="vh-12" value="12" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="vh-12">12Z</label>
+                            <input type="radio" class="btn-check" name="validHour" id="vh-18" value="18" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="vh-18">18Z</label>
+                        </div>
                     </div>
                 </div>
                 <div class="card-body p-0">
@@ -249,18 +261,6 @@
                                         <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
                                         <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
                                         <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
-                                    </div>
-                                    <div class="btn-group btn-group-sm" role="group" id="validHourFilter">
-                                        <input type="radio" class="btn-check" name="validHour" id="vh-all" value="" autocomplete="off" checked>
-                                        <label class="btn btn-outline-secondary" for="vh-all">All</label>
-                                        <input type="radio" class="btn-check" name="validHour" id="vh-00" value="0" autocomplete="off">
-                                        <label class="btn btn-outline-secondary" for="vh-00">00Z</label>
-                                        <input type="radio" class="btn-check" name="validHour" id="vh-06" value="6" autocomplete="off">
-                                        <label class="btn btn-outline-secondary" for="vh-06">06Z</label>
-                                        <input type="radio" class="btn-check" name="validHour" id="vh-12" value="12" autocomplete="off">
-                                        <label class="btn btn-outline-secondary" for="vh-12">12Z</label>
-                                        <input type="radio" class="btn-check" name="validHour" id="vh-18" value="18" autocomplete="off">
-                                        <label class="btn btn-outline-secondary" for="vh-18">18Z</label>
                                     </div>
                                     </div>
                                 </div>
@@ -518,7 +518,7 @@ function initAsosMap() {
 function getMaeColor(value, minVal, maxVal, variable) {
     // Fixed scale: different ranges for precipitation vs temp/mslp
     const fixedMin = 0;
-    const fixedMax = (variable === 'precip') ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+    const fixedMax = (variable === 'precip') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
     const ratio = Math.max(0, Math.min(1, (value - fixedMin) / (fixedMax - fixedMin)));
 
     // Green (#22c55e) -> Yellow (#eab308) -> Red (#ef4444)
@@ -542,7 +542,7 @@ function getMaeColor(value, minVal, maxVal, variable) {
 // Color interpolation for Bias with variable-specific color schemes
 function getBiasColor(value, minVal, maxVal, variable) {
     // Fixed scale: different ranges for precipitation vs temp/mslp
-    const fixedMax = (variable === 'precip') ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+    const fixedMax = (variable === 'precip') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
     const fixedMin = -fixedMax;
     const clampedValue = Math.max(fixedMin, Math.min(fixedMax, value));
     const ratio = clampedValue / fixedMax;  // -1 to 1
@@ -631,8 +631,8 @@ function updateColorScale(metric, minVal, maxVal, variable) {
     // Use fixed scale ranges - different for precipitation vs temp/mslp
     if (metric === 'bias') {
         if (variable === 'precip') {
-            minSpan.textContent = '-1.0';
-            maxSpan.textContent = '1.0';
+            minSpan.textContent = '-0.3';
+            maxSpan.textContent = '0.3';
             // Brown -> White -> Green gradient for precipitation
             scale.style.background = 'linear-gradient(to right, rgb(139, 69, 19), rgb(255, 255, 255), rgb(34, 139, 34))';
         } else if (variable === 'dewpoint') {
@@ -649,7 +649,7 @@ function updateColorScale(metric, minVal, maxVal, variable) {
     } else {  // MAE
         if (variable === 'precip') {
             minSpan.textContent = '0.0';
-            maxSpan.textContent = '1.0';
+            maxSpan.textContent = '0.3';
         } else {
             minSpan.textContent = '0.0';
             maxSpan.textContent = '10.0';
@@ -1786,6 +1786,7 @@ async function loadAsosVerification() {
     const model = document.getElementById('asosModel').value;
     const leadTime = document.getElementById('asosLeadTime').value;
     const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
+    const validHour = document.querySelector('input[name="validHour"]:checked')?.value ?? '';
 
     console.log(`[loadAsosVerification] Fetching map data for variable=${variable}, metric=${metric}, model=${model}, leadTime=${leadTime}`);
 
@@ -1794,9 +1795,9 @@ async function loadAsosVerification() {
     document.getElementById('asosMapEmpty').classList.add('d-none');
 
     try {
-        const response = await fetch(
-            `/api/asos/verification-map?variable=${variable}&metric=${metric}&model=${model}&lead_time=${leadTime}&period=${period}`
-        );
+        const url = `/api/asos/verification-map?variable=${variable}&metric=${metric}&model=${model}&lead_time=${leadTime}&period=${period}` +
+            (validHour !== '' ? `&valid_hour=${encodeURIComponent(validHour)}` : '');
+        const response = await fetch(url);
         console.log('[loadAsosVerification] Received response:', response);
 
         if (!response.ok) {
@@ -1847,8 +1848,8 @@ async function loadAsosVerification() {
             const color = getMarkerColor(station.value, metric, data.min_value, data.max_value, variable);
 
             // Calculate radius proportional to value magnitude
-            // Different scales for precipitation (0-1) vs temp/dewpoint (0-20) vs mslp (0-10)
-            const maxScale = (variable === 'precip') ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+            // Different scales for precipitation (0-0.3) vs temp/dewpoint (0-20) vs mslp (0-10)
+            const maxScale = (variable === 'precip') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
             let radius;
             if (metric === 'bias') {
                 const absValue = Math.abs(station.value);
@@ -2156,6 +2157,7 @@ document.querySelectorAll('input[name="validHour"]').forEach(radio => {
     radio.addEventListener('change', function() {
         const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
         loadMeanAsosVerification(period);
+        loadAsosVerification();
     });
 });
 document.querySelectorAll('input[name="tableMetric"]').forEach(radio => {
