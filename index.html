@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-02-28 23:37 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-02-28 23:41 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -127,6 +127,18 @@ thead tr:nth-child(2) th { background: white; }
         <option value="nws">NWS</option>
       </select>
       <select class="form-select form-select-sm" id="selLt" style="width:auto"></select>
+      <div class="btn-group btn-group-sm" role="group" id="mapVhFilter">
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-all" value="" autocomplete="off" checked>
+        <label class="btn btn-outline-secondary" for="mvh-all">All</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-00" value="0" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-00">00Z</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-06" value="6" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-06">06Z</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-12" value="12" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-12">12Z</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-18" value="18" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-18">18Z</label>
+      </div>
     </div>
   </div>
   <div class="card-body p-0">
@@ -466,7 +478,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-02-28_23:37_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-02-28_23:41_UTC').then(r => r.json()).catch(() => null),
     fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
@@ -573,8 +585,18 @@ function renderMap() {
   const model    = document.getElementById('selModel').value;
   const lt       = parseInt(document.getElementById('selLt').value, 10);
   const useMonthly = document.getElementById('periodToggle').checked && MAP_DATA.monthly;
+  const mapVh = document.querySelector('input[name="mapVh"]:checked')?.value ?? '';
 
-  const stationSet = useMonthly ? MAP_DATA.monthly : MAP_DATA.stations;
+  let stationSet;
+  if (useMonthly) {
+    stationSet = mapVh !== '' && MAP_DATA[`monthly_vh_${mapVh}`]
+      ? MAP_DATA[`monthly_vh_${mapVh}`]
+      : MAP_DATA.monthly;
+  } else {
+    stationSet = mapVh !== '' && MAP_DATA[`vh_${mapVh}`]
+      ? MAP_DATA[`vh_${mapVh}`]
+      : MAP_DATA.stations;
+  }
 
   const mi = MODEL_IDX[model] ?? 0;
   const vi = VAR_IDX[variable] ?? 0;
@@ -1215,6 +1237,7 @@ function buildPmTabs(cities) {
 // ============================================================
 ['selVar','selMetric','selModel','selLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderMap));
+document.querySelectorAll('input[name="mapVh"]').forEach(r => r.addEventListener('change', renderMap));
 document.getElementById('periodToggle').addEventListener('change', () => { renderTable(); renderMap(); });
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
