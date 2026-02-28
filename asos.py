@@ -30,6 +30,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 import json
 import bisect
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +123,9 @@ def should_include_precip(fcst_val, obs_val) -> bool:
     """
     if fcst_val is None or obs_val is None:
         return False
-    # Exclude zero-zero pairs (both correctly predict no precipitation)
-    if fcst_val == 0 and obs_val == 0:
+    # Exclude trace-and-below pairs: both values under 0.01" are either
+    # genuine dry periods or sub-hundredth model noise — not meaningful skill tests.
+    if max(fcst_val, obs_val) < 0.01:
         return False
     return True
 
@@ -607,9 +609,11 @@ def load_asos_forecasts_db() -> dict:
 
 
 def save_asos_forecasts_db(data: dict):
-    """Save the ASOS forecasts database to JSON file."""
-    with open(ASOS_FORECASTS_FILE, 'w') as f:
+    """Save the ASOS forecasts database to JSON file (atomic write)."""
+    tmp = ASOS_FORECASTS_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, ASOS_FORECASTS_FILE)
     logger.info(f"Saved ASOS forecasts to {ASOS_FORECASTS_FILE}")
 
 
@@ -628,10 +632,12 @@ def load_monthly_stats_cache() -> dict:
 
 
 def save_monthly_stats_cache(data: dict) -> None:
-    """Save the monthly per-station stats to the small sidecar file."""
+    """Save the monthly per-station stats to the small sidecar file (atomic write)."""
     global _monthly_stats_cache, _monthly_stats_mtime
-    with open(ASOS_MONTHLY_STATS_FILE, 'w') as f:
+    tmp = ASOS_MONTHLY_STATS_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
         json.dump(data, f)
+    os.replace(tmp, ASOS_MONTHLY_STATS_FILE)
     _monthly_stats_mtime = ASOS_MONTHLY_STATS_FILE.stat().st_mtime
     _monthly_stats_cache = data
     logger.info(f"Saved monthly stats to {ASOS_MONTHLY_STATS_FILE}")
@@ -2420,6 +2426,9 @@ def precompute_verification_cache() -> dict:
         'ifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'dewpoint': {}},
         'nws': {'temp': {}, 'mslp': {}, 'precip': {}, 'dewpoint': {}},
     }
+    # Structure: station_hourly_stats[station_id][model][var][snapped_lt_str][vh_str] = {sum_abs, sum, count}
+    # Built from fresh (non-accumulated) runs only; used for by_station_by_valid_hour in cache.
+    station_hourly_stats: dict = {}
 
     # Initialize with zeros for all lead times
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
@@ -2565,6 +2574,18 @@ def precompute_verification_cache() -> dict:
                         hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_errors'] += error
                         hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['count'] += 1
 
+                        # Update per-station hourly stats (for by_station_by_valid_hour in cache)
+                        s_h_station = (station_hourly_stats
+                                       .setdefault(station_id, {})
+                                       .setdefault(model, {})
+                                       .setdefault(var, {})
+                                       .setdefault(snapped_lt_str, {}))
+                        if vh_str not in s_h_station:
+                            s_h_station[vh_str] = {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+                        s_h_station[vh_str]['sum_abs_errors'] += abs_error
+                        s_h_station[vh_str]['sum_errors'] += error
+                        s_h_station[vh_str]['count'] += 1
+
     logger.info("Finalizing cache data...")
 
     # Precompute time series data (all historical data) using cached observations
@@ -2629,13 +2650,35 @@ def precompute_verification_cache() -> dict:
                     else:
                         entry[var] = {'mae': None, 'bias': None}
 
+    # Convert station_hourly_stats to final format - by_station_by_valid_hour
+    # (covers fresh/non-accumulated runs; grows over time as runs remain unaccumulated)
+    cache_data["by_station_by_valid_hour"] = {}
+    for station_id, model_data in station_hourly_stats.items():
+        for model, var_data in model_data.items():
+            for var, lt_data in var_data.items():
+                for lt_str, vh_data in lt_data.items():
+                    for vh_str, stats in vh_data.items():
+                        if stats['count'] > 0:
+                            entry = (cache_data["by_station_by_valid_hour"]
+                                     .setdefault(station_id, {})
+                                     .setdefault(model, {})
+                                     .setdefault(lt_str, {})
+                                     .setdefault(vh_str, {}))
+                            entry[var] = {
+                                'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                                'bias': round(stats['sum_errors'] / stats['count'], 2),
+                                'count': stats['count']
+                            }
+
     # Add time series data to cache
     cache_data["time_series"] = time_series_data
 
-    # Save to file
+    # Save to file (atomic write — never leave the cache in a half-written state)
     try:
-        with open(ASOS_VERIFICATION_CACHE_FILE, 'w') as f:
+        tmp = ASOS_VERIFICATION_CACHE_FILE.with_suffix('.tmp')
+        with open(tmp, 'w') as f:
             json.dump(cache_data, f, indent=2)
+        os.replace(tmp, ASOS_VERIFICATION_CACHE_FILE)
 
         elapsed = time.time() - start_time
         logger.info(f"Verification cache precomputed and saved in {elapsed:.1f}s to {ASOS_VERIFICATION_CACHE_FILE}")
@@ -3016,7 +3059,8 @@ def get_run_counts_by_lead_time(model: str, period: str = "all", valid_hour: Opt
 def get_verification_data_from_cache(
     model: str,
     variable: str,
-    lead_time_hours: int
+    lead_time_hours: int,
+    valid_hour: Optional[int] = None
 ) -> Dict[str, dict]:
     """
     Get verification data from cache for a specific model/variable/lead_time.
@@ -3027,6 +3071,9 @@ def get_verification_data_from_cache(
         model: Model name ('gfs', 'aifs', 'ifs', 'nws')
         variable: Variable name ('temp', 'mslp', 'precip')
         lead_time_hours: Lead time in hours
+        valid_hour: If set (0, 6, 12, or 18), filter to that UTC valid hour only.
+                    Uses by_station_by_valid_hour (fresh runs only); falls back to
+                    by_station when no valid_hour is requested.
 
     Returns:
         Dict mapping station_id to verification data (same format as get_verification_data)
@@ -3040,26 +3087,42 @@ def get_verification_data_from_cache(
         logger.warning("Cache not available, computing verification on-the-fly")
         return get_verification_data(model, variable, lead_time_hours)
 
-    # Extract from cache
     lt_str = str(lead_time_hours)
     results = {}
+    stations_info = cache.get("stations", {})
 
-    for station_id, station_data in cache.get("by_station", {}).items():
-        model_data = station_data.get(model.lower(), {})
-        lt_data = model_data.get(lt_str, {})
-        var_data = lt_data.get(variable)
+    if valid_hour is not None:
+        vh_str = str(valid_hour)
+        for station_id, model_data in cache.get("by_station_by_valid_hour", {}).items():
+            var_data = model_data.get(model.lower(), {}).get(lt_str, {}).get(vh_str, {}).get(variable)
+            if var_data:
+                station_info = stations_info.get(station_id, {})
+                results[station_id] = {
+                    'mae': var_data['mae'],
+                    'bias': var_data['bias'],
+                    'count': var_data['count'],
+                    'lat': station_info.get('lat'),
+                    'lon': station_info.get('lon'),
+                    'name': station_info.get('name', station_id),
+                    'state': station_info.get('state', '')
+                }
+    else:
+        for station_id, station_data in cache.get("by_station", {}).items():
+            model_data = station_data.get(model.lower(), {})
+            lt_data = model_data.get(lt_str, {})
+            var_data = lt_data.get(variable)
 
-        if var_data:
-            station_info = cache.get("stations", {}).get(station_id, {})
-            results[station_id] = {
-                'mae': var_data['mae'],
-                'bias': var_data['bias'],
-                'count': var_data['count'],
-                'lat': station_info.get('lat'),
-                'lon': station_info.get('lon'),
-                'name': station_info.get('name', station_id),
-                'state': station_info.get('state', '')
-            }
+            if var_data:
+                station_info = stations_info.get(station_id, {})
+                results[station_id] = {
+                    'mae': var_data['mae'],
+                    'bias': var_data['bias'],
+                    'count': var_data['count'],
+                    'lat': station_info.get('lat'),
+                    'lon': station_info.get('lon'),
+                    'name': station_info.get('name', station_id),
+                    'state': station_info.get('state', '')
+                }
 
     return results
 
@@ -3067,44 +3130,92 @@ def get_verification_data_from_cache(
 def get_verification_data_from_monthly_cache(
     model: str,
     variable: str,
-    lead_time_hours: int
+    lead_time_hours: int,
+    valid_hour: Optional[int] = None
 ) -> Dict[str, dict]:
     """
     Get verification data from the rolling monthly cache.
+
+    Args:
+        model: Model name
+        variable: Variable name
+        lead_time_hours: Lead time in hours
+        valid_hour: If set (0, 6, 12, or 18), filter to that UTC valid hour only.
     """
     if model.lower() == 'nws' and lead_time_hours > 168:
         return {}
 
-    monthly = load_monthly_stats_cache().get("by_station_monthly", {})
+    monthly_cache = load_monthly_stats_cache()
     db = load_asos_forecasts_db()
-
-    lt_str = str(lead_time_hours)
+    stations_info = db.get("stations", {})
     results = {}
 
-    for station_id, station_data in monthly.items():
-        model_data = station_data.get(model.lower(), {})
-        var_data = model_data.get(variable, {})
-        lt_stats = var_data.get(lt_str)
-        if not lt_stats:
-            continue
+    if valid_hour is not None:
+        vh_str = str(valid_hour)
+        monthly_vh = monthly_cache.get("by_station_monthly_by_valid_hour", {})
 
-        station_info = db.get("stations", {}).get(station_id, {})
-        count = lt_stats.get("count", 0)
-        if count <= 0:
-            continue
+        # Monthly valid_hour data uses canonical lead times (snapped)
+        _canonical_lts = sorted(set(list(range(6, 25, 6)) + list(range(48, 361, 24))))
+        lo = bisect.bisect_left(_canonical_lts, lead_time_hours)
+        snapped_lt = None
+        best_dist = 13
+        if lo < len(_canonical_lts):
+            d = _canonical_lts[lo] - lead_time_hours
+            if d <= 12:
+                snapped_lt, best_dist = _canonical_lts[lo], d
+        if lo > 0:
+            d = lead_time_hours - _canonical_lts[lo - 1]
+            if d < best_dist:
+                snapped_lt = _canonical_lts[lo - 1]
+        if snapped_lt is None:
+            return {}
 
-        mae = lt_stats.get("sum_abs_errors", 0.0) / count
-        bias = lt_stats.get("sum_errors", 0.0) / count
+        lt_str = str(snapped_lt)
+        for station_id, station_data in monthly_vh.items():
+            vh_stats = station_data.get(model.lower(), {}).get(variable, {}).get(lt_str, {}).get(vh_str)
+            if not vh_stats:
+                continue
+            count = vh_stats.get("count", 0)
+            if count <= 0:
+                continue
+            station_info = stations_info.get(station_id, {})
+            results[station_id] = {
+                'mae': round(vh_stats["sum_abs_errors"] / count, 2),
+                'bias': round(vh_stats["sum_errors"] / count, 2),
+                'count': count,
+                'lat': station_info.get('lat'),
+                'lon': station_info.get('lon'),
+                'name': station_info.get('name', station_id),
+                'state': station_info.get('state', '')
+            }
+    else:
+        monthly = monthly_cache.get("by_station_monthly", {})
+        lt_str = str(lead_time_hours)
 
-        results[station_id] = {
-            'mae': round(mae, 2),
-            'bias': round(bias, 2),
-            'count': count,
-            'lat': station_info.get('lat'),
-            'lon': station_info.get('lon'),
-            'name': station_info.get('name', station_id),
-            'state': station_info.get('state', '')
-        }
+        for station_id, station_data in monthly.items():
+            model_data = station_data.get(model.lower(), {})
+            var_data = model_data.get(variable, {})
+            lt_stats = var_data.get(lt_str)
+            if not lt_stats:
+                continue
+
+            station_info = stations_info.get(station_id, {})
+            count = lt_stats.get("count", 0)
+            if count <= 0:
+                continue
+
+            mae = lt_stats.get("sum_abs_errors", 0.0) / count
+            bias = lt_stats.get("sum_errors", 0.0) / count
+
+            results[station_id] = {
+                'mae': round(mae, 2),
+                'bias': round(bias, 2),
+                'count': count,
+                'lat': station_info.get('lat'),
+                'lon': station_info.get('lon'),
+                'name': station_info.get('name', station_id),
+                'state': station_info.get('state', '')
+            }
 
     return results
 

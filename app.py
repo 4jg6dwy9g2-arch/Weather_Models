@@ -8046,11 +8046,13 @@ def api_asos_verification_map():
     model = request.args.get('model', 'gfs')
     lead_time = int(request.args.get('lead_time', 24))
     period = request.args.get('period', 'all')
+    valid_hour_str = request.args.get('valid_hour', '')
+    valid_hour = int(valid_hour_str) if valid_hour_str != '' else None
     if period == 'monthly' and get_asos_data_span_days() < 20:
         period = 'all'
 
     # Check cache
-    cache_key = f"{variable}_{metric}_{model}_{lead_time}_{period}"
+    cache_key = f"{variable}_{metric}_{model}_{lead_time}_{period}_{valid_hour}"
     cache_ttl = 3600  # 1 hour
 
     if cache_key in _verification_cache:
@@ -8061,9 +8063,9 @@ def api_asos_verification_map():
     try:
         # Get verification data (all-time cache or recent window)
         if period == 'monthly':
-            verification = asos.get_verification_data_from_monthly_cache(model, variable, lead_time)
+            verification = asos.get_verification_data_from_monthly_cache(model, variable, lead_time, valid_hour=valid_hour)
         else:
-            verification = asos.get_verification_data_from_cache(model, variable, lead_time)
+            verification = asos.get_verification_data_from_cache(model, variable, lead_time, valid_hour=valid_hour)
 
         if not verification:
             return jsonify({
@@ -9047,6 +9049,24 @@ def api_asos_sync():
     except Exception as e:
         logger.error(f"ASOS sync error: {e}")
         return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/asos/rebuild-verification-cache', methods=['POST'])
+def api_rebuild_verification_cache():
+    """Rebuild only the ASOS verification cache (no data fetch)."""
+    try:
+        result = asos.precompute_verification_cache()
+        station_count = len(result.get('by_station', {})) if result else 0
+        vh_count = len(result.get('by_station_by_valid_hour', {})) if result else 0
+        return jsonify({
+            "success": True,
+            "message": "Verification cache rebuilt",
+            "station_count": station_count,
+            "valid_hour_station_count": vh_count,
+        })
+    except Exception as e:
+        logger.error(f"Verification cache rebuild error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/asos/nws-resync')
