@@ -21,6 +21,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import asos
 import export_verification_table as evt
 import drought_monitor as _drought_monitor
+import polymarket as _polymarket
 
 PAGES_WORKTREE = Path('/Users/kennypratt/weather-pages')
 
@@ -284,6 +285,41 @@ def extract_spotlight_obs(station_ids: list, lead_times: list) -> dict:
             result[sid][str(lead_time)] = records
 
     return result
+
+
+def extract_polymarket_data() -> dict | None:
+    """Load Polymarket cache and return a trimmed version for the static site."""
+    try:
+        cache = _polymarket.load_polymarket_cache()
+        if not cache:
+            return None
+        result = {}
+        for key, val in cache.items():
+            if key == '_cities':
+                result[key] = val
+                continue
+            markets_out = {}
+            for date_str, entry in val.get('markets', {}).items():
+                snaps_out = []
+                for s in entry.get('snapshots', []):
+                    snaps_out.append({
+                        'fetched_at':          s.get('fetched_at'),
+                        'lead_hours':          s.get('lead_hours'),
+                        'market_implied_temp': s.get('market_implied_temp'),
+                        'nws_high':            s.get('nws_high'),
+                        'volume':              s.get('volume'),
+                    })
+                markets_out[date_str] = {
+                    'resolved':        entry.get('resolved'),
+                    'winning_bracket': entry.get('winning_bracket'),
+                    'observed_high':   entry.get('observed_high'),
+                    'snapshots':       snaps_out,
+                }
+            result[key] = {'markets': markets_out}
+        return result
+    except Exception as e:
+        print(f"  Warning: could not load Polymarket cache: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +681,42 @@ thead tr:nth-child(2) th {{ background: white; }}
   </div>
 </div>
 
+<!-- POLYMARKET SECTION DIVIDER -->
+<div class="d-flex align-items-center my-4 gap-3">
+  <hr style="flex:1;border-color:#c7d2fe;">
+  <span style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#6366f1;">
+    <i class="bi bi-currency-dollar"></i> Prediction Markets
+  </span>
+  <hr style="flex:1;border-color:#c7d2fe;">
+</div>
+
+<!-- POLYMARKET CARD -->
+<div class="card mb-3" style="border-color:#c7d2fe;">
+  <div class="card-header text-white" style="background:#4f46e5;">
+    <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+      <div>
+        <strong><i class="bi bi-graph-up-arrow"></i> Polymarket — Daily High Temperature</strong>
+        <div style="font-size:0.78rem;opacity:.85;font-weight:400;margin-top:2px;">
+          Prediction market accuracy vs. NWS forecast
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="card-body" id="pmChartSection" style="display:none;background:#f5f3ff;">
+    <p class="text-muted mb-2" style="font-size:0.8rem;">
+      Average absolute error across all cities (NYC, Miami, Atlanta, Chicago, Seattle, Dallas) using the final sync before each market resolved vs. ASOS observed high.
+    </p>
+    <div style="position:relative;height:260px"><canvas id="pmMaeChart"></canvas></div>
+  </div>
+  <div class="card-header border-top d-flex align-items-center gap-2 py-1" style="background:#eef2ff;">
+    <small class="text-muted me-2" style="font-size:0.75rem;">Lead-time verification by city:</small>
+    <ul class="nav nav-tabs card-header-tabs mb-0" id="pmCityTabs"></ul>
+  </div>
+  <div id="pmPane" class="p-0">
+    <div class="text-center text-muted p-4 small">Loading&hellip;</div>
+  </div>
+</div>
+
 </div><!-- /container-fluid -->
 
 <script>
@@ -667,6 +739,8 @@ let detailSt = null, detailIsMonthly = false;
 let OBS_DATA = null;
 let obsCharts = {{}};
 let obsSid = null;
+let PM_DATA = null;
+let pmMaeChart = null;
 
 const DROUGHT_COLORS = {{0:'#FFFF00',1:'#FCD37F',2:'#FFAA00',3:'#E60000',4:'#730000'}};
 
@@ -702,13 +776,14 @@ async function loadDroughtOverlay() {{
 }}
 
 async function loadAll() {{
-  const [m, t, ts, obs] = await Promise.all([
+  const [m, t, ts, obs, pm] = await Promise.all([
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
     fetch('data/station_obs.json?v={generated_at.replace(" ","_")}').then(r => r.json()).catch(() => null),
+    fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
-  MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs;
+  MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
 
   // Populate lead-time dropdown from published lead times
   const sel = document.getElementById('selLt');
@@ -728,6 +803,12 @@ async function loadAll() {{
   renderMap();
   renderTable();
   renderTs();
+  if (PM_DATA) {{
+    const cities = PM_DATA._cities || [];
+    buildPmTabs(cities);
+    buildPmAllCitiesChart();
+    if (cities.length > 0) renderPmCity(cities[0].key);
+  }}
 }}
 
 // ============================================================
@@ -1105,8 +1186,7 @@ function fmtLt(lt) {{
 function pctMae(cur, base) {{
   if (cur == null || base == null || base === 0) return '';
   const p = Math.round((cur-base)/base*100);
-  if (p === 0) return '';
-  return ` <span style="color:${{p<0?'green':'red'}};font-size:.7em">${{p>0?'+':''}}${{p}}%</span>`;
+  return ` <span style="color:${{p<0?'green':p>0?'red':'gray'}};font-size:.7em">${{p>0?'+':''}}${{p}}%</span>`;
 }}
 function winner(models) {{
   const v = models.filter(m => m.mae != null);
@@ -1287,6 +1367,157 @@ function renderTs() {{
 }}
 
 // ============================================================
+// Polymarket section
+// ============================================================
+function pmDiffClass(d) {{
+  if (d == null) return '';
+  return d > 0.5 ? 'text-danger fw-bold' : d < -0.5 ? 'text-primary fw-bold' : '';
+}}
+function pmSignedStr(v) {{
+  if (v == null) return '\u2014';
+  return (v >= 0 ? '+' : '') + v.toFixed(1) + '\u00b0F';
+}}
+function pmTempStr(v) {{
+  return v != null ? v.toFixed(1) + '\u00b0F' : '\u2014';
+}}
+function fmtPmDate(isoStr) {{
+  return new Date(isoStr + 'T12:00:00').toLocaleDateString('en-US',
+    {{weekday:'short', month:'short', day:'numeric'}});
+}}
+
+function buildPmAllCitiesChart() {{
+  const el = document.getElementById('pmMaeChart');
+  if (!el || !PM_DATA) return;
+  const cities = PM_DATA._cities || [];
+  const byDate = {{}};
+  cities.forEach(c => {{
+    const cityData = PM_DATA[c.key];
+    if (!cityData) return;
+    Object.entries(cityData.markets || {{}}).forEach(([d, entry]) => {{
+      if (!entry.resolved || entry.observed_high == null) return;
+      const obs   = entry.observed_high;
+      const snaps = entry.snapshots || [];
+      const fin   = snaps.reduce((b,s) =>
+        Math.abs(s.lead_hours ?? 999) < Math.abs((b ?? {{lead_hours:9999}}).lead_hours) ? s : b, null);
+      if (!fin) return;
+      if (!byDate[d]) byDate[d] = {{mErrs:[], nErrs:[]}};
+      if (fin.market_implied_temp != null) byDate[d].mErrs.push(Math.abs(fin.market_implied_temp - obs));
+      if (fin.nws_high != null)            byDate[d].nErrs.push(Math.abs(fin.nws_high - obs));
+    }});
+  }});
+  const avg    = arr => arr.length ? arr.reduce((s,v)=>s+v,0)/arr.length : null;
+  const dates  = Object.keys(byDate).sort();
+  if (!dates.length) return;
+  const sec = document.getElementById('pmChartSection');
+  if (sec) sec.style.display = '';
+  const labels = dates.map(fmtPmDate);
+  const mMAE   = dates.map(d => avg(byDate[d].mErrs));
+  const nMAE   = dates.map(d => avg(byDate[d].nErrs));
+  if (pmMaeChart) {{ pmMaeChart.destroy(); pmMaeChart = null; }}
+  pmMaeChart = new Chart(el.getContext('2d'), {{
+    type: 'line',
+    data: {{
+      labels,
+      datasets: [
+        {{ label:'Market', data:mMAE, borderColor:'#2563eb', backgroundColor:'#2563eb',
+           borderWidth:2, pointRadius:4, tension:0.3 }},
+        {{ label:'NWS', data:nMAE, borderColor:'#d97706', backgroundColor:'#d97706',
+           borderWidth:2, pointRadius:4, tension:0.3, borderDash:[5,4] }},
+      ],
+    }},
+    options: {{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{{mode:'index', intersect:false}},
+      plugins:{{
+        legend:{{position:'top', labels:{{usePointStyle:true}}}},
+        tooltip:{{callbacks:{{label:ctx => ctx.parsed.y != null
+          ? ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '\u00b0F' : null}}}},
+      }},
+      scales:{{
+        x:{{grid:{{display:false}}, title:{{display:true, text:'Date'}},
+           ticks:{{maxRotation:45, minRotation:45}}}},
+        y:{{min:0, grid:{{color:'#e5e7eb'}}, title:{{display:true, text:'Avg MAE (\u00b0F)'}}}},
+      }},
+    }},
+  }});
+}}
+
+function buildPmLeadTimeTable(resolvedDates, markets) {{
+  const BUCKET = 24;
+  const byBucket = {{}};
+  resolvedDates.forEach(d => {{
+    const obs = markets[d].observed_high;
+    if (obs == null) return;
+    (markets[d].snapshots || []).forEach(s => {{
+      const b = Math.floor((s.lead_hours ?? 0) / BUCKET) * BUCKET;
+      if (!byBucket[b]) byBucket[b] = {{mErrs:[], nErrs:[]}};
+      if (s.market_implied_temp != null) byBucket[b].mErrs.push(s.market_implied_temp - obs);
+      if (s.nws_high != null)            byBucket[b].nErrs.push(s.nws_high - obs);
+    }});
+  }});
+  const avg = arr => arr.length ? arr.reduce((s,v)=>s+v,0)/arr.length : null;
+  const buckets = Object.keys(byBucket).map(Number).sort((a,b)=>b-a);
+  let rows = '';
+  buckets.forEach(b => {{
+    const mMAE  = avg(byBucket[b].mErrs.map(Math.abs));
+    const nMAE  = avg(byBucket[b].nErrs.map(Math.abs));
+    const mBias = avg(byBucket[b].mErrs);
+    const nBias = avg(byBucket[b].nErrs);
+    const n     = Math.max(byBucket[b].mErrs.length, byBucket[b].nErrs.length);
+    const label = b === 0 ? '<24h' : b + '\u2013' + (b + BUCKET) + 'h';
+    rows += '<tr><td class="ps-2">' + label + '</td>' +
+      '<td>' + (mMAE != null ? mMAE.toFixed(1) + '\u00b0F' : '\u2014') + '</td>' +
+      '<td>' + (nMAE != null ? nMAE.toFixed(1) + '\u00b0F' : '\u2014') + '</td>' +
+      '<td class="' + pmDiffClass(mBias) + '">' + pmSignedStr(mBias) + '</td>' +
+      '<td class="' + pmDiffClass(nBias) + '">' + pmSignedStr(nBias) + '</td>' +
+      '<td class="text-muted">' + n + '</td></tr>';
+  }});
+  if (!rows) rows = '<tr><td colspan="6" class="text-center text-muted py-3" style="font-size:0.82rem">No resolved markets with observed temperatures yet.</td></tr>';
+  return '<div class="px-3 pt-2 pb-1"><strong style="font-size:0.78rem;color:#555;text-transform:uppercase;letter-spacing:.04em">Lead-Time Verification</strong></div>' +
+    '<div style="overflow-x:auto"><table class="table table-sm table-hover mb-0" style="font-size:0.82rem">' +
+    '<thead class="table-light"><tr>' +
+    '<th class="ps-2">Lead Window</th><th>Market MAE</th><th>NWS MAE</th>' +
+    '<th>Market Bias</th><th>NWS Bias</th><th>N</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+}}
+
+function renderPmCity(cityKey) {{
+  const pane = document.getElementById('pmPane');
+  const cityData = PM_DATA?.[cityKey];
+  if (!cityData) {{
+    pane.innerHTML = '<div class="text-center text-muted p-4 small">No data for this city yet.</div>';
+    return;
+  }}
+  const markets  = cityData.markets || {{}};
+  const allDates = Object.keys(markets).sort();
+  const resolved = allDates.filter(d => markets[d].resolved).reverse();
+  const resolvedWithObs = resolved.filter(d => markets[d].observed_high != null);
+  const html = buildPmLeadTimeTable(resolvedWithObs, markets);
+  pane.innerHTML = html || '<div class="text-center text-muted p-4 small">Collecting sync snapshots \u2014 verification will appear once markets resolve.</div>';
+}}
+
+function buildPmTabs(cities) {{
+  const tabBar = document.getElementById('pmCityTabs');
+  tabBar.innerHTML = '';
+  cities.forEach((c, i) => {{
+    const li  = document.createElement('li');
+    li.className = 'nav-item';
+    const btn = document.createElement('button');
+    btn.className = 'nav-link' + (i === 0 ? ' active' : '');
+    btn.style.fontSize = '0.8rem';
+    btn.style.padding  = '0.25rem 0.7rem';
+    btn.textContent = c.display;
+    btn.addEventListener('click', () => {{
+      tabBar.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderPmCity(c.key);
+    }});
+    li.appendChild(btn);
+    tabBar.appendChild(li);
+  }});
+}}
+
+// ============================================================
 // Event listeners
 // ============================================================
 ['selVar','selMetric','selModel','selLt'].forEach(id =>
@@ -1356,6 +1587,14 @@ def generate_site(output_dir: Path = PAGES_WORKTREE) -> None:
     spotlight_data = extract_spotlight_obs(SPOTLIGHT_STATIONS, SPOTLIGHT_LEAD_TIMES)
     with open(data_dir / 'station_obs.json', 'w') as f:
         json.dump(spotlight_data, f, separators=sep)
+
+    print("Exporting Polymarket data...")
+    pm_data = extract_polymarket_data()
+    if pm_data:
+        with open(data_dir / 'polymarket.json', 'w') as f:
+            json.dump(pm_data, f, separators=sep)
+    else:
+        print("  Polymarket cache not available — run a sync first")
 
     print("Exporting drought monitor data...")
     dm_data = _drought_monitor.load_drought_data()

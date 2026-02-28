@@ -152,6 +152,7 @@ ASOS_VERIFICATION_CACHE_FILE = DATA_DIR / "asos_verification_cache.json"
 # 5-minute METAR pressure archive (dedicated, independent of verification data)
 ASOS_METAR_PRESSURE_FILE = DATA_DIR / "asos_metar_pressure.json"
 ASOS_MONTHLY_STATS_FILE = DATA_DIR / "asos_monthly_stats.json"
+MONTHLY_WINDOW_DAYS = 20
 
 # Retention period for stored forecasts
 FORECASTS_RETENTION_DAYS = 21
@@ -2846,7 +2847,7 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
     return result
 
 
-def get_station_detail_monthly(station_id: str, model: str, days_back: int = 30) -> dict:
+def get_station_detail_monthly(station_id: str, model: str, days_back: int = MONTHLY_WINDOW_DAYS) -> dict:
     """
     Get detailed verification for a single station using the monthly cache.
     """
@@ -2949,7 +2950,7 @@ def get_run_counts_by_lead_time(model: str, period: str = "all", valid_hour: Opt
     runs = db.get("runs", {})
     now = datetime.now(timezone.utc)
     period = (period or "all").lower()
-    cutoff = now - timedelta(days=30) if period == "monthly" else None
+    cutoff = now - timedelta(days=MONTHLY_WINDOW_DAYS) if period == "monthly" else None
 
     verification_lead_times = sorted(list(range(6, 25, 6)) + list(range(48, 361, 24)))
 
@@ -3316,6 +3317,8 @@ def rebuild_monthly_station_cache(days_back: int = 20) -> None:
                             continue
 
                         fcst_val = fcst_values[fcst_idx]
+                        if var == 'precip' and not should_include_precip(fcst_val, obs_val):
+                            continue
                         error = fcst_val - obs_val
 
                         monthly.setdefault(station_id, {}).setdefault(model, {}).setdefault(var, {}).setdefault(
@@ -3428,7 +3431,7 @@ def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = Non
 
 def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[int] = None) -> dict:
     """
-    Get mean verification for the last ~30 days from the monthly cache.
+    Get mean verification for the rolling monthly window from the monthly cache.
 
     Args:
         model: Model name ('gfs', 'aifs', 'ifs', 'nws')
