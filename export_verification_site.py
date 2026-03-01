@@ -1431,6 +1431,7 @@ function renderTable() {{
     const lt   = v.lead_times[i];
     const runs = Math.max(v.gfs_run_count?.[i]??0,v.aifs_run_count?.[i]??0,v.kenny_run_count?.[i]??0,
                           v.ifs_run_count?.[i]??0, v.nws_run_count?.[i]??0);
+    if (runs === 0) continue;
     const gTm=v.gfs_temp_mae?.[i],  gTb=v.gfs_temp_bias?.[i];
     const aTm=v.aifs_temp_mae?.[i], aTb=v.aifs_temp_bias?.[i];
     const kTm=v.kenny_temp_mae?.[i],kTb=v.kenny_temp_bias?.[i];

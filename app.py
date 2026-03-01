@@ -8850,29 +8850,33 @@ def api_asos_mean_verification():
         # Assuming lead_times are the same for all models
         all_lead_times = gfs_results["lead_times"]
 
-        # Filter to only include lead times where at least one model has non-null temp data
-        filtered_indices = []
-        for i, lt in enumerate(all_lead_times):
-            has_data = (
-                (gfs_results["temp_mae"][i] is not None) or
-                (aifs_results["temp_mae"][i] is not None) or
-                (kenny_results["temp_mae"][i] is not None) or
-                (ifs_results["temp_mae"][i] is not None) or
-                (nws_results["temp_mae"][i] is not None)
-            )
-            if has_data:
-                filtered_indices.append(i)
-
         # Helper to filter array by indices
         def filter_array(arr, indices):
             return [arr[i] for i in indices if i < len(arr)]
 
-        lead_times = filter_array(all_lead_times, filtered_indices)
+        # Compute run counts first so we can use them as the filter criterion.
+        # A row should only appear if at least one model has a verified run at
+        # that lead time — this prevents Kenny's on-the-fly computation from
+        # producing MAE values at lead times where the run counter is 0.
         gfs_run_counts = asos.get_run_counts_by_lead_time('gfs', period, valid_hour=valid_hour)
         aifs_run_counts = asos.get_run_counts_by_lead_time('aifs', period, valid_hour=valid_hour)
         kenny_run_counts = asos.get_run_counts_by_lead_time('kenny', period, valid_hour=valid_hour)
         ifs_run_counts = asos.get_run_counts_by_lead_time('ifs', period, valid_hour=valid_hour)
         nws_run_counts = asos.get_run_counts_by_lead_time('nws', period, valid_hour=valid_hour)
+
+        filtered_indices = []
+        for i, lt in enumerate(all_lead_times):
+            lt_int = int(lt)
+            has_runs = (
+                gfs_run_counts.get(lt_int, 0) > 0 or
+                aifs_run_counts.get(lt_int, 0) > 0 or
+                ifs_run_counts.get(lt_int, 0) > 0 or
+                nws_run_counts.get(lt_int, 0) > 0
+            )
+            if has_runs:
+                filtered_indices.append(i)
+
+        lead_times = filter_array(all_lead_times, filtered_indices)
 
         combined_verification = {
             "lead_times": lead_times,
