@@ -126,7 +126,7 @@ def extract_station_data() -> dict:
             'd': model_arr
         }
 
-    # Extract by-valid-hour station data (fresh/non-accumulated runs only)
+    # Extract by-valid-hour station data (all-time accumulated)
     by_vh_raw = cache.get('by_station_by_valid_hour', {})
     for vh in [0, 6, 12, 18]:
         vh_str = str(vh)
@@ -326,8 +326,8 @@ def extract_spotlight_obs(station_ids: list, lead_times: list) -> dict:
     t=time ISO, ot/op/od=obs temp/precip/dewpoint, tb/pb/db=bias dicts {model: float|null}
     """
     db = asos.load_asos_forecasts_db()
-    kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "temp")
-    kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "dewpoint")
+    kenny_temp_station_biases, kenny_temp_global_bias = asos._compute_kenny_station_biases(db, "temp")
+    kenny_dew_station_biases, kenny_dew_global_bias = asos._compute_kenny_station_biases(db, "dewpoint")
     runs = db.get("runs", {})
     models = ["gfs", "aifs", "kenny", "ifs", "nws"]
     now = datetime.now(timezone.utc)
@@ -391,14 +391,14 @@ def extract_spotlight_obs(station_ids: list, lead_times: list) -> dict:
                     fprecip = fp[idx]  if idx < len(fp)  else None
                     fdew    = fd[idx]  if idx < len(fd)  else None
                     if m == 'kenny' and ftemp is not None:
-                        st_bias = (kenny_temp_station_hour_biases.get(sid) or {}).get(valid_time.hour)
+                        st_bias = (kenny_temp_station_biases.get(sid) or {}).get(valid_time.hour)
                         if st_bias is None:
-                            st_bias = kenny_temp_global_hour_biases.get(valid_time.hour, 0.0)
+                            st_bias = kenny_temp_global_bias.get(valid_time.hour, 0.0)
                         ftemp = ftemp - st_bias
                     if m == 'kenny' and fdew is not None:
-                        st_bias = (kenny_dew_station_hour_biases.get(sid) or {}).get(valid_time.hour)
+                        st_bias = (kenny_dew_station_biases.get(sid) or {}).get(valid_time.hour)
                         if st_bias is None:
-                            st_bias = kenny_dew_global_hour_biases.get(valid_time.hour, 0.0)
+                            st_bias = kenny_dew_global_bias.get(valid_time.hour, 0.0)
                         fdew = fdew - st_bias
 
                     raw_tb = round(ftemp   - obs_temp,     2) if ftemp   is not None and obs_temp     is not None else None

@@ -8441,8 +8441,8 @@ def api_asos_station_obs_timeseries():
 
     try:
         db = asos.load_asos_forecasts_db()
-        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "temp")
-        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "dewpoint")
+        kenny_temp_station_biases, kenny_temp_global_bias = asos._compute_kenny_station_biases(db, "temp")
+        kenny_dew_station_biases, kenny_dew_global_bias = asos._compute_kenny_station_biases(db, "dewpoint")
         runs = db.get("runs", {})
         if not runs:
             return jsonify({"success": False, "error": "No ASOS forecast runs available"}), 404
@@ -8520,14 +8520,14 @@ def api_asos_station_obs_timeseries():
                 fcst_dewpoint = fcst_dewpoints[idx] if idx < len(fcst_dewpoints) else None
 
                 if m == "kenny" and fcst_temp is not None:
-                    st_bias = (kenny_temp_station_hour_biases.get(station_id) or {}).get(valid_time.hour)
+                    st_bias = (kenny_temp_station_biases.get(station_id) or {}).get(valid_time.hour)
                     if st_bias is None:
-                        st_bias = kenny_temp_global_hour_biases.get(valid_time.hour, 0.0)
+                        st_bias = kenny_temp_global_bias.get(valid_time.hour, 0.0)
                     fcst_temp = fcst_temp - st_bias
                 if m == "kenny" and fcst_dewpoint is not None:
-                    st_bias = (kenny_dew_station_hour_biases.get(station_id) or {}).get(valid_time.hour)
+                    st_bias = (kenny_dew_station_biases.get(station_id) or {}).get(valid_time.hour)
                     if st_bias is None:
-                        st_bias = kenny_dew_global_hour_biases.get(valid_time.hour, 0.0)
+                        st_bias = kenny_dew_global_bias.get(valid_time.hour, 0.0)
                     fcst_dewpoint = fcst_dewpoint - st_bias
 
                 temp_bias = (fcst_temp - obs_temp) if (fcst_temp is not None and obs_temp is not None) else None

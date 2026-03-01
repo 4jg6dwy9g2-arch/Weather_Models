@@ -172,13 +172,14 @@ def _is_kenny_bias_corrected_var(model: str, variable: str) -> bool:
     return (model or "").lower() == "kenny" and variable in ("temp", "dewpoint")
 
 
-def _compute_kenny_station_hour_biases(db: dict, variable: str = "temp") -> tuple[dict[str, dict[int, float]], dict[int, float]]:
+def _compute_kenny_station_biases(db: dict, variable: str = "temp") -> tuple[dict[str, dict[int, float]], dict[int, float]]:
     """
-    Compute AIFS 6-hour variable bias by station and valid time-of-day hour.
+    Compute all-time AIFS F006 bias per station and valid time-of-day hour (0/6/12/18Z).
 
     Returns:
-      - station_hour_biases: {station_id: {valid_hour: mean_bias}}
-      - global_hour_biases: {valid_hour: mean_bias}  # fallback when station is sparse
+      - station_biases: {station_id: {valid_hour: mean_bias}}  — all-time per-station per-hour
+      - global_bias:   {valid_hour: mean_bias}                 — fallback when station has no data
+    bias = mean(forecast - observed); correction = forecast - bias.
     """
     if variable not in ("temp", "dewpoint"):
         return {}, {0: 0.0, 6: 0.0, 12: 0.0, 18: 0.0}
@@ -190,29 +191,28 @@ def _compute_kenny_station_hour_biases(db: dict, variable: str = "temp") -> tupl
     global_stats = {h: {"sum": 0.0, "count": 0} for h in cycle_hours}
     station_stats: dict[str, dict[int, dict[str, float]]] = {}
 
-    # Historical contribution from accumulated by-valid-hour stats.
-    # lead_time=6 bias already grouped by valid hour.
-    by_vh = (
-        db.get("cumulative_stats", {})
-        .get("by_lead_time_by_valid_hour", {})
-        .get("aifs", {})
-        .get(variable, {})
-        .get("6", {})
-    )
-    for vh_str, vh_stats in by_vh.items():
-        try:
-            valid_hour = int(vh_str)
-        except Exception:
-            continue
-        if valid_hour not in global_stats:
-            continue
-        count = int(vh_stats.get("count", 0) or 0)
-        if count <= 0:
-            continue
-        global_stats[valid_hour]["sum"] += float(vh_stats.get("sum_errors", 0.0) or 0.0)
-        global_stats[valid_hour]["count"] += count
+    # Load all-time accumulated per-station per-valid-hour bias from cumulative_stats
+    cumulative_by_station_by_vh = db.get("cumulative_stats", {}).get("by_station_by_valid_hour", {})
+    for station_id, model_data in cumulative_by_station_by_vh.items():
+        lt_data = model_data.get("aifs", {}).get(variable, {}).get("6", {})
+        for vh_str, vh_stats in lt_data.items():
+            try:
+                valid_hour = int(vh_str)
+            except Exception:
+                continue
+            if valid_hour not in cycle_hours:
+                continue
+            count = int(vh_stats.get("count", 0) or 0)
+            if count <= 0:
+                continue
+            error_sum = float(vh_stats.get("sum_errors", 0.0) or 0.0)
+            st = station_stats.setdefault(station_id, {h: {"sum": 0.0, "count": 0} for h in cycle_hours})
+            st[valid_hour]["sum"] += error_sum
+            st[valid_hour]["count"] += count
+            global_stats[valid_hour]["sum"] += error_sum
+            global_stats[valid_hour]["count"] += count
 
-    # Fresh runs not yet folded into cumulative stats.
+    # Add fresh runs not yet folded into cumulative stats
     runs = db.get("runs", {})
     stations = db.get("stations", {})
     accumulated_run_keys = db.get("cumulative_stats", {}).get("accumulated_run_keys", {})
@@ -235,7 +235,7 @@ def _compute_kenny_station_hour_biases(db: dict, variable: str = "temp") -> tupl
         if valid_time >= now:
             continue
         valid_hour = valid_time.hour
-        if valid_hour not in global_stats:
+        if valid_hour not in cycle_hours:
             continue
 
         model_data = run_data.get("aifs", {})
@@ -251,28 +251,23 @@ def _compute_kenny_station_hour_biases(db: dict, variable: str = "temp") -> tupl
             error = fcst_vals[idx] - obs[obs_key]
             global_stats[valid_hour]["sum"] += error
             global_stats[valid_hour]["count"] += 1
-
-            st = station_stats.setdefault(
-                station_id,
-                {h: {"sum": 0.0, "count": 0} for h in cycle_hours}
-            )
+            st = station_stats.setdefault(station_id, {h: {"sum": 0.0, "count": 0} for h in cycle_hours})
             st[valid_hour]["sum"] += error
             st[valid_hour]["count"] += 1
 
-    global_bias = {}
-    for h in cycle_hours:
-        c = global_stats[h]["count"]
-        global_bias[h] = (global_stats[h]["sum"] / c) if c > 0 else 0.0
-
-    station_bias: dict[str, dict[int, float]] = {}
+    global_bias = {
+        h: (global_stats[h]["sum"] / global_stats[h]["count"]) if global_stats[h]["count"] > 0 else 0.0
+        for h in cycle_hours
+    }
+    station_biases: dict[str, dict[int, float]] = {}
     for sid, per_hour in station_stats.items():
-        station_bias[sid] = {}
+        station_biases[sid] = {}
         for h in cycle_hours:
             c = per_hour[h]["count"]
             if c > 0:
-                station_bias[sid][h] = per_hour[h]["sum"] / c
+                station_biases[sid][h] = per_hour[h]["sum"] / c
 
-    return station_bias, global_bias
+    return station_biases, global_bias
 
 
 def _apply_model_value_adjustment(
@@ -281,18 +276,18 @@ def _apply_model_value_adjustment(
     station_id: str,
     valid_time: datetime,
     fcst_val,
-    kenny_station_hour_biases: Optional[dict[str, dict[int, float]]] = None,
-    kenny_global_hour_biases: Optional[dict[int, float]] = None
+    kenny_station_biases: Optional[dict[str, dict[int, float]]] = None,
+    kenny_global_bias: Optional[dict[int, float]] = None
 ):
     if fcst_val is None:
         return None
     if _is_kenny_bias_corrected_var(model, variable):
         hour = valid_time.hour
         hour_bias = None
-        if kenny_station_hour_biases is not None:
-            hour_bias = (kenny_station_hour_biases.get(station_id) or {}).get(hour)
-        if hour_bias is None and kenny_global_hour_biases is not None:
-            hour_bias = kenny_global_hour_biases.get(hour, 0.0)
+        if kenny_station_biases is not None:
+            hour_bias = (kenny_station_biases.get(station_id) or {}).get(hour)
+        if hour_bias is None and kenny_global_bias is not None:
+            hour_bias = kenny_global_bias.get(hour, 0.0)
         if hour_bias is None:
             hour_bias = 0.0
         # Bias is defined as (forecast - observed); correction is forecast - bias.
@@ -871,10 +866,13 @@ def accumulate_stats_from_run(
         data["cumulative_stats"] = {"by_station": {}, "by_lead_time": {}, "by_lead_time_by_valid_hour": {}, "time_series": {}}
     if "by_lead_time_by_valid_hour" not in data["cumulative_stats"]:
         data["cumulative_stats"]["by_lead_time_by_valid_hour"] = {}
+    if "by_station_by_valid_hour" not in data["cumulative_stats"]:
+        data["cumulative_stats"]["by_station_by_valid_hour"] = {}
 
     cumulative_by_station = data["cumulative_stats"]["by_station"]
     cumulative_by_lead_time = data["cumulative_stats"]["by_lead_time"]
     cumulative_by_lt_by_vh = data["cumulative_stats"]["by_lead_time_by_valid_hour"]
+    cumulative_by_station_by_vh = data["cumulative_stats"]["by_station_by_valid_hour"]
 
     # Initialize time series structure if needed
     if "time_series" not in data["cumulative_stats"]:
@@ -1024,6 +1022,25 @@ def accumulate_stats_from_run(
                         cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["sum_weights"] += weight
                     # Note: lt_str stored here may be non-canonical; _snap_to_canonical_lt() in
                     # precompute_verification_cache() remaps it to the correct canonical bucket.
+
+                    # Update by_station_by_valid_hour (per-station, per-valid-hour breakdown)
+                    s_vh = (cumulative_by_station_by_vh
+                            .setdefault(station_id, {})
+                            .setdefault(model, {})
+                            .setdefault(var, {})
+                            .setdefault(lt_str, {}))
+                    if vh_str not in s_vh:
+                        s_vh[vh_str] = {
+                            "sum_abs_errors": 0.0, "sum_errors": 0.0, "count": 0,
+                            "sum_weighted_abs_errors": 0.0, "sum_weights": 0.0,
+                        }
+                    s_vh[vh_str]["sum_abs_errors"] += abs_error
+                    s_vh[vh_str]["sum_errors"] += error
+                    s_vh[vh_str]["count"] += 1
+                    if _is_precip_var(var):
+                        weight = _precip_weight(obs_val)
+                        s_vh[vh_str]["sum_weighted_abs_errors"] += abs_error * weight
+                        s_vh[vh_str]["sum_weights"] += weight
 
     # Accumulate time series data (daily errors by lead time)
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
@@ -1656,9 +1673,9 @@ def get_verification_data(
     source_model = _source_model_for_verification(model)
     db = load_asos_forecasts_db()
     if _is_kenny_bias_corrected_var(model, variable):
-        kenny_station_hour_biases, kenny_global_hour_biases = _compute_kenny_station_hour_biases(db, variable)
+        kenny_station_biases, kenny_global_bias = _compute_kenny_station_biases(db, variable)
     else:
-        kenny_station_hour_biases, kenny_global_hour_biases = None, None
+        kenny_station_biases, kenny_global_bias = None, None
     stations = db.get("stations", {})
     runs = db.get("runs", {})
     cumulative_by_station = db.get("cumulative_stats", {}).get("by_station", {})
@@ -1742,7 +1759,7 @@ def get_verification_data(
                 continue
             fcst_val = _apply_model_value_adjustment(
                 model, variable, station_id, valid_time, fcst_values[fcst_idx],
-                kenny_station_hour_biases, kenny_global_hour_biases
+                kenny_station_biases, kenny_global_bias
             )
 
             # Get stored observation
@@ -1819,9 +1836,9 @@ def get_verification_data_recent(
     source_model = _source_model_for_verification(model)
     db = load_asos_forecasts_db()
     if _is_kenny_bias_corrected_var(model, variable):
-        kenny_station_hour_biases, kenny_global_hour_biases = _compute_kenny_station_hour_biases(db, variable)
+        kenny_station_biases, kenny_global_bias = _compute_kenny_station_biases(db, variable)
     else:
-        kenny_station_hour_biases, kenny_global_hour_biases = None, None
+        kenny_station_biases, kenny_global_bias = None, None
     stations = db.get("stations", {})
     runs = db.get("runs", {})
 
@@ -1877,7 +1894,7 @@ def get_verification_data_recent(
                 continue
             fcst_val = _apply_model_value_adjustment(
                 model, variable, station_id, valid_time, fcst_values[fcst_idx],
-                kenny_station_hour_biases, kenny_global_hour_biases
+                kenny_station_biases, kenny_global_bias
             )
 
             obs = (
@@ -1956,11 +1973,11 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
     now = datetime.now(timezone.utc)
     models = [model.lower()] if model else ['gfs', 'aifs', 'ifs', 'nws']
     if model and model.lower() == "kenny":
-        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = _compute_kenny_station_hour_biases(db, "temp")
-        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = _compute_kenny_station_hour_biases(db, "dewpoint")
+        kenny_temp_station_biases, kenny_temp_global_bias = _compute_kenny_station_biases(db, "temp")
+        kenny_dew_station_biases, kenny_dew_global_bias = _compute_kenny_station_biases(db, "dewpoint")
     else:
-        kenny_temp_station_hour_biases = kenny_temp_global_hour_biases = None
-        kenny_dew_station_hour_biases = kenny_dew_global_hour_biases = None
+        kenny_temp_station_biases = kenny_temp_global_bias = None
+        kenny_dew_station_biases = kenny_dew_global_bias = None
 
     # Collect all forecast hours (from current runs and cumulative stats)
     all_forecast_hours = set()
@@ -2053,7 +2070,7 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
                 if i < len(fcst_temps) and fcst_temps[i] is not None and obs.get('temp') is not None:
                     fcst_temp = _apply_model_value_adjustment(
                         m, "temp", station_id, valid_time, fcst_temps[i],
-                        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases
+                        kenny_temp_station_biases, kenny_temp_global_bias
                     )
                     error = fcst_temp - obs['temp']
                     stats_by_lt[lt][m]['temp']['sum_abs_errors'] += abs(error)
@@ -2086,7 +2103,7 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
                 if i < len(fcst_dewpoints) and fcst_dewpoints[i] is not None and obs.get('dewpoint') is not None:
                     fcst_dew = _apply_model_value_adjustment(
                         m, "dewpoint", station_id, valid_time, fcst_dewpoints[i],
-                        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases
+                        kenny_dew_station_biases, kenny_dew_global_bias
                     )
                     error = fcst_dew - obs['dewpoint']
                     stats_by_lt[lt][m]['dewpoint']['sum_abs_errors'] += abs(error)
@@ -2304,9 +2321,9 @@ def get_verification_time_series(
     source_model = _source_model_for_verification(model)
     db = load_asos_forecasts_db()
     if _is_kenny_bias_corrected_var(model, variable):
-        kenny_station_hour_biases, kenny_global_hour_biases = _compute_kenny_station_hour_biases(db, variable)
+        kenny_station_biases, kenny_global_bias = _compute_kenny_station_biases(db, variable)
     else:
-        kenny_station_hour_biases, kenny_global_hour_biases = None, None
+        kenny_station_biases, kenny_global_bias = None, None
     stations = db.get("stations", {})
     runs = db.get("runs", {})
 
@@ -2384,7 +2401,7 @@ def get_verification_time_series(
 
             fcst_val = _apply_model_value_adjustment(
                 model, variable, station_id, valid_time, fcst_values[fcst_idx],
-                kenny_station_hour_biases, kenny_global_hour_biases
+                kenny_station_biases, kenny_global_bias
             )
 
             # Get observation
@@ -2469,11 +2486,11 @@ def get_mean_verification_by_lead_time(
         source_model = _source_model_for_verification(model)
         db = load_asos_forecasts_db()
         if _is_kenny_bias_corrected_var(model, "temp"):
-            kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = _compute_kenny_station_hour_biases(db, "temp")
-            kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = _compute_kenny_station_hour_biases(db, "dewpoint")
+            kenny_temp_station_biases, kenny_temp_global_bias = _compute_kenny_station_biases(db, "temp")
+            kenny_dew_station_biases, kenny_dew_global_bias = _compute_kenny_station_biases(db, "dewpoint")
         else:
-            kenny_temp_station_hour_biases = kenny_temp_global_hour_biases = None
-            kenny_dew_station_hour_biases = kenny_dew_global_hour_biases = None
+            kenny_temp_station_biases = kenny_temp_global_bias = None
+            kenny_dew_station_biases = kenny_dew_global_bias = None
         stations = db.get("stations", {})
         runs = db.get("runs", {})
         cumulative_by_lead_time = db.get("cumulative_stats", {}).get("by_lead_time", {})
@@ -2572,7 +2589,7 @@ def get_mean_verification_by_lead_time(
                     if i < len(fcst_temps) and fcst_temps[i] is not None and obs.get('temp') is not None:
                         fcst_temp = _apply_model_value_adjustment(
                             model, "temp", station_id, valid_time, fcst_temps[i],
-                            kenny_temp_station_hour_biases, kenny_temp_global_hour_biases
+                            kenny_temp_station_biases, kenny_temp_global_bias
                         )
                         error = fcst_temp - obs['temp']
                         aggregated_stats[lt]['temp']['sum_abs_errors'] += abs(error)
@@ -2624,7 +2641,7 @@ def get_mean_verification_by_lead_time(
                     if i < len(fcst_dewpoints) and fcst_dewpoints[i] is not None and obs.get('dewpoint') is not None:
                         fcst_dew = _apply_model_value_adjustment(
                             model, "dewpoint", station_id, valid_time, fcst_dewpoints[i],
-                            kenny_dew_station_hour_biases, kenny_dew_global_hour_biases
+                            kenny_dew_station_biases, kenny_dew_global_bias
                         )
                         error = fcst_dew - obs['dewpoint']
                         aggregated_stats[lt]['dewpoint']['sum_abs_errors'] += abs(error)
@@ -3112,8 +3129,40 @@ def precompute_verification_cache() -> dict:
         'nws': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
     }
     # Structure: station_hourly_stats[station_id][model][var][snapped_lt_str][vh_str] = {sum_abs, sum, count}
-    # Built from fresh (non-accumulated) runs only; used for by_station_by_valid_hour in cache.
+    # Pre-seeded from accumulated by_station_by_valid_hour, then fresh runs added on top,
+    # so the resulting cache by_station_by_valid_hour covers all-time data.
     station_hourly_stats: dict = {}
+    cumulative_by_station_by_vh = db.get("cumulative_stats", {}).get("by_station_by_valid_hour", {})
+    for _sid, _model_data in cumulative_by_station_by_vh.items():
+        for _model, _var_data in _model_data.items():
+            for _var, _lt_data in _var_data.items():
+                for _lt_str, _vh_data in _lt_data.items():
+                    try:
+                        _lt = int(_lt_str)
+                    except Exception:
+                        continue
+                    _snapped = _snap_to_canonical_lt(_lt)
+                    if _snapped is None:
+                        continue
+                    _snapped_str = str(_snapped)
+                    for _vh_str, _stats in _vh_data.items():
+                        if not _stats.get('count', 0):
+                            continue
+                        _s = (station_hourly_stats
+                              .setdefault(_sid, {})
+                              .setdefault(_model, {})
+                              .setdefault(_var, {})
+                              .setdefault(_snapped_str, {}))
+                        if _vh_str not in _s:
+                            _s[_vh_str] = {
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0,
+                            }
+                        _s[_vh_str]['sum_abs_errors'] += _stats.get('sum_abs_errors', 0.0)
+                        _s[_vh_str]['sum_errors'] += _stats.get('sum_errors', 0.0)
+                        _s[_vh_str]['count'] += _stats.get('count', 0)
+                        _s[_vh_str]['sum_weighted_abs_errors'] += _stats.get('sum_weighted_abs_errors', 0.0)
+                        _s[_vh_str]['sum_weights'] += _stats.get('sum_weights', 0.0)
 
     # Initialize with zeros for all lead times
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
@@ -3695,8 +3744,8 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
         runs = db.get("runs", {})
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=days_back)
-        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = _compute_kenny_station_hour_biases(db, "temp")
-        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = _compute_kenny_station_hour_biases(db, "dewpoint")
+        kenny_temp_station_biases, kenny_temp_global_bias = _compute_kenny_station_biases(db, "temp")
+        kenny_dew_station_biases, kenny_dew_global_bias = _compute_kenny_station_biases(db, "dewpoint")
 
         lead_times_set = set()
         for run_data in runs.values():
@@ -3742,7 +3791,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
                 if i < len(temps) and temps[i] is not None and obs.get("temp") is not None:
                     fcst_temp = _apply_model_value_adjustment(
                         "kenny", "temp", station_id, valid_time, temps[i],
-                        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases
+                        kenny_temp_station_biases, kenny_temp_global_bias
                     )
                     err = fcst_temp - obs["temp"]
                     stats[lt]["temp"]["sum_abs"] += abs(err)
@@ -3770,7 +3819,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
                 if i < len(dewpoints) and dewpoints[i] is not None and obs.get("dewpoint") is not None:
                     fcst_dew = _apply_model_value_adjustment(
                         "kenny", "dewpoint", station_id, valid_time, dewpoints[i],
-                        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases
+                        kenny_dew_station_biases, kenny_dew_global_bias
                     )
                     err = fcst_dew - obs["dewpoint"]
                     stats[lt]["dewpoint"]["sum_abs"] += abs(err)
