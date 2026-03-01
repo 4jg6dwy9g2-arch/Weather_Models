@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-03-01 17:26 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-03-01 18:29 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -275,6 +275,8 @@ thead tr:nth-child(2) th { background: white; }
       <div class="btn-group btn-group-sm">
         <input type="radio" class="btn-check" name="tableMetric" id="tm-mae" value="mae" autocomplete="off" checked>
         <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
+        <input type="radio" class="btn-check" name="tableMetric" id="tm-wmae" value="wmae" autocomplete="off">
+        <label class="btn btn-outline-primary" for="tm-wmae">WMAE (Precip)</label>
         <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
         <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
       </div>
@@ -488,7 +490,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-03-01_17:26_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-03-01_18:29_UTC').then(r => r.json()).catch(() => null),
     fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
@@ -918,7 +920,10 @@ function winner(models) {
 function renderTable() {
   const period  = document.getElementById('periodToggle').checked ? 'monthly' : 'all';
   const vh      = document.querySelector('input[name="validHour"]:checked').value;
-  const isMae   = document.querySelector('input[name="tableMetric"]:checked').value === 'mae';
+  const tableMetric = document.querySelector('input[name="tableMetric"]:checked').value;
+  const isBias  = tableMetric === 'bias';
+  const isWmae  = tableMetric === 'wmae';
+  const isMae   = !isBias;
   const key     = `${period}_${vh===''?'all':vh}`;
   const v       = TABLE_DATA?.data?.[key];
   const a       = TABLE_DATA?.data?.['all_all'];
@@ -950,9 +955,13 @@ function renderTable() {
     const nTm=v.nws_temp_mae?.[i],  nTb=v.nws_temp_bias?.[i];
     const pfx = precipVar === 'precip_24hr' ? 'precip_24hr' : 'precip';
     const gRm=v[`gfs_${pfx}_mae`]?.[i],   gRb=v[`gfs_${pfx}_bias`]?.[i];
+    const gRw=v[`gfs_${pfx}_wmae`]?.[i] ?? gRm;
     const aRm=v[`aifs_${pfx}_mae`]?.[i],  aRb=v[`aifs_${pfx}_bias`]?.[i];
+    const aRw=v[`aifs_${pfx}_wmae`]?.[i] ?? aRm;
     const iRm=v[`ifs_${pfx}_mae`]?.[i],   iRb=v[`ifs_${pfx}_bias`]?.[i];
+    const iRw=v[`ifs_${pfx}_wmae`]?.[i] ?? iRm;
     const nRm=v[`nws_${pfx}_mae`]?.[i],   nRb=v[`nws_${pfx}_bias`]?.[i];
+    const nRw=v[`nws_${pfx}_wmae`]?.[i] ?? nRm;
     const gDm=v.gfs_dewpoint_mae?.[i], gDb=v.gfs_dewpoint_bias?.[i];
     const aDm=v.aifs_dewpoint_mae?.[i],aDb=v.aifs_dewpoint_bias?.[i];
     const iDm=v.ifs_dewpoint_mae?.[i], iDb=v.ifs_dewpoint_bias?.[i];
@@ -962,7 +971,7 @@ function renderTable() {
     const iPm=v.ifs_mslp_mae?.[i],     iPb=v.ifs_mslp_bias?.[i];
 
     const [tW,tC]=winner([{n:'GFS',mae:gTm,cls:'badge bg-primary'},{n:'AIFS',mae:aTm,cls:'badge bg-info text-dark'},{n:'IFS',mae:iTm,cls:'badge bg-success'},{n:'NWS',mae:nTm,cls:'badge bg-dark'}]);
-    const [rW,rC]=winner([{n:'GFS',mae:gRm,cls:'badge bg-primary'},{n:'AIFS',mae:aRm,cls:'badge bg-info text-dark'},{n:'IFS',mae:iRm,cls:'badge bg-success'},{n:'NWS',mae:nRm,cls:'badge bg-dark'}]);
+    const [rW,rC]=winner([{n:'GFS',mae:isWmae?gRw:gRm,cls:'badge bg-primary'},{n:'AIFS',mae:isWmae?aRw:aRm,cls:'badge bg-info text-dark'},{n:'IFS',mae:isWmae?iRw:iRm,cls:'badge bg-success'},{n:'NWS',mae:isWmae?nRw:nRm,cls:'badge bg-dark'}]);
     const [dW,dC]=winner([{n:'GFS',mae:gDm,cls:'badge bg-primary'},{n:'AIFS',mae:aDm,cls:'badge bg-info text-dark'},{n:'IFS',mae:iDm,cls:'badge bg-success'},{n:'NWS',mae:nDm,cls:'badge bg-dark'}]);
 
     const tr = document.createElement('tr');
@@ -973,10 +982,10 @@ function renderTable() {
       <td class="text-center">${isMae?f1(iTm,a?.ifs_temp_mae?.[i]):sg(iTb)}</td>
       <td class="text-center">${isMae?f1(nTm,a?.nws_temp_mae?.[i]):sg(nTb)}</td>
       <td><span class="${tC}">${tW}</span></td>
-      <td class="text-center border-start">${isMae?f2(gRm,a?.[`gfs_${pfx}_mae`]?.[i]):sg(gRb,2)}</td>
-      <td class="text-center">${isMae?f2(aRm,a?.[`aifs_${pfx}_mae`]?.[i]):sg(aRb,2)}</td>
-      <td class="text-center">${isMae?f2(iRm,a?.[`ifs_${pfx}_mae`]?.[i]):sg(iRb,2)}</td>
-      <td class="text-center">${isMae?f2(nRm,a?.[`nws_${pfx}_mae`]?.[i]):sg(nRb,2)}</td>
+      <td class="text-center border-start">${isMae?f2(isWmae?gRw:gRm,isWmae?a?.[`gfs_${pfx}_wmae`]?.[i]:a?.[`gfs_${pfx}_mae`]?.[i]):sg(gRb,2)}</td>
+      <td class="text-center">${isMae?f2(isWmae?aRw:aRm,isWmae?a?.[`aifs_${pfx}_wmae`]?.[i]:a?.[`aifs_${pfx}_mae`]?.[i]):sg(aRb,2)}</td>
+      <td class="text-center">${isMae?f2(isWmae?iRw:iRm,isWmae?a?.[`ifs_${pfx}_wmae`]?.[i]:a?.[`ifs_${pfx}_mae`]?.[i]):sg(iRb,2)}</td>
+      <td class="text-center">${isMae?f2(isWmae?nRw:nRm,isWmae?a?.[`nws_${pfx}_wmae`]?.[i]:a?.[`nws_${pfx}_mae`]?.[i]):sg(nRb,2)}</td>
       <td><span class="${rC}">${rW}</span></td>
       <td class="text-center border-start">${isMae?f1(gDm,a?.gfs_dewpoint_mae?.[i]):sg(gDb)}</td>
       <td class="text-center">${isMae?f1(aDm,a?.aifs_dewpoint_mae?.[i]):sg(aDb)}</td>
