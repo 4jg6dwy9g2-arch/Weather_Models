@@ -52,7 +52,7 @@ thead tr:nth-child(2) th { background: white; }
         <ul>
           <li><strong>GFS</strong> &mdash; NOAA Global Forecast System, 0.25° resolution, out to 15 days (360h)</li>
           <li><strong>AIFS</strong> &mdash; ECMWF AI Integrated Forecasting System, out to 15 days (360h)</li>
-          <li><strong>Kenny</strong> &mdash; Bias-corrected AIFS verification track (AIFS MAE/WMAE with zero-centered bias output)</li>
+          <li><strong>Kenny</strong> &mdash; Station-specific bias-corrected AIFS for temperature and dew point. For each ASOS station and valid hour (00Z/06Z/12Z/18Z), Kenny applies the recent 6-hour AIFS bias as a correction using forecast &minus; bias (so a &minus;6&deg; bias adds +6&deg; to AIFS, and a +6&deg; bias subtracts 6&deg;). If station-hour history is sparse, it falls back to a global valid-hour bias. Other variables are the same as AIFS.</li>
           <li><strong>IFS</strong> &mdash; ECMWF Integrated Forecasting System (open data), out to 15 days (360h)</li>
           <li><strong>NWS</strong> &mdash; National Weather Service point forecasts via the NWS API, limited to 7 days (168h)</li>
         </ul>
