@@ -96,7 +96,6 @@
         <div class="section-header d-flex align-items-center justify-content-between">
             <span><i class="bi bi-graph-up"></i> Daily MAE — All Cities</span>
             <select class="form-select form-select-sm" id="maeBucketSelect" style="width:auto;font-weight:normal;">
-                <option value="final">Final snap</option>
                 <option value="0">&lt;6h</option>
                 <option value="6">6–12h</option>
                 <option value="12">12–18h</option>
@@ -107,7 +106,7 @@
         </div>
         <div class="pm-card">
             <p id="maeChartDesc" class="text-muted mb-2" style="font-size:0.82rem;">
-                Average absolute error across all cities using the final sync before each market resolved.
+                Average absolute error across all cities for snapshots in the &lt;6h lead window.
             </p>
             <div style="position:relative;height:280px"><canvas id="allCitiesMaeChart"></canvas></div>
         </div>
@@ -324,16 +323,32 @@ function buildLeadTimeTable(resolvedDates, markets) {
 function renderCity(cityKey, allData) {
     const pane = document.getElementById('cityPane');
 
-    const cityData = allData[cityKey];
-    if (!cityData) {
-        pane.innerHTML = '<div class="empty-state">No data for this city yet.</div>';
-        return;
-    }
+    let markets = {};
+    let resolvedWithObs = [];
 
-    const markets         = cityData.markets || {};
-    const allDates        = Object.keys(markets).sort();
-    const resolved        = allDates.filter(d =>  markets[d].resolved).reverse();
-    const resolvedWithObs = resolved.filter(d => markets[d].observed_high !== null);
+    if (cityKey === '__all__') {
+        const cities = allData._cities || [];
+        cities.forEach(c => {
+            const cityData = allData[c.key];
+            if (!cityData || !cityData.markets) return;
+            Object.entries(cityData.markets).forEach(([dateKey, entry]) => {
+                if (!entry || !entry.resolved || entry.observed_high == null) return;
+                const compositeKey = `${c.key}__${dateKey}`;
+                markets[compositeKey] = entry;
+                resolvedWithObs.push(compositeKey);
+            });
+        });
+    } else {
+        const cityData = allData[cityKey];
+        if (!cityData) {
+            pane.innerHTML = '<div class="empty-state">No data for this city yet.</div>';
+            return;
+        }
+        markets = cityData.markets || {};
+        const allDates = Object.keys(markets).sort();
+        const resolved = allDates.filter(d => markets[d].resolved).reverse();
+        resolvedWithObs = resolved.filter(d => markets[d].observed_high !== null);
+    }
 
     const html = buildLeadTimeTable(resolvedWithObs, markets);
     pane.innerHTML = html || `<div class="empty-state">
@@ -349,10 +364,12 @@ let _activeCity = null;
 function buildTabs(cities) {
     const tabBar = document.getElementById('cityTabs');
     tabBar.innerHTML = '';
-    cities.forEach((c, i) => {
+    const tabCities = [{ key: '__all__', display: 'All' }, ...cities];
+    tabCities.forEach((c, i) => {
         const li  = document.createElement('li');
         li.className = 'nav-item';
         const btn = document.createElement('button');
+        btn.dataset.cityKey = c.key;
         btn.className = 'nav-link' + (i === 0 ? ' active' : '');
         btn.textContent = c.display;
         btn.addEventListener('click', () => {
@@ -395,12 +412,13 @@ async function loadData() {
     }
 
     buildTabs(cities);
-    _activeCity = _activeCity || cities[0].key;
+    const validKeys = new Set(['__all__', ...cities.map(c => c.key)]);
+    if (!validKeys.has(_activeCity)) _activeCity = '__all__';
 
     // Re-activate previously selected tab
     const tabs = document.getElementById('cityTabs').querySelectorAll('.nav-link');
-    tabs.forEach((btn, i) => {
-        if (cities[i] && cities[i].key === _activeCity) {
+    tabs.forEach(btn => {
+        if (btn.dataset.cityKey === _activeCity) {
             tabs.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
         }

@@ -2626,6 +2626,62 @@ def _init_cumulative_stats(location_data: dict):
         stats["generated_at"] = None
 
 
+def _get_run_observed_with_fallback(run_data: dict) -> dict:
+    """
+    Return observed temps/mslps aligned to the run's forecast times.
+
+    Uses stored run_data["observed"] when present, and backfills missing values
+    from WeatherLink so cumulative stats don't lose historical days when runs
+    are trimmed.
+    """
+    gfs_data = run_data.get("gfs", {})
+    forecast_times = gfs_data.get("times", [])
+    n = len(forecast_times)
+    if n == 0:
+        return {"temps": [], "mslps": []}
+
+    observed = run_data.get("observed") or {}
+    stored_temps = observed.get("temps") or []
+    stored_mslps = observed.get("mslps") or []
+
+    need_fallback = (
+        len(stored_temps) < n
+        or len(stored_mslps) < n
+        or any(v is None for v in stored_temps[:n])
+        or any(v is None for v in stored_mslps[:n])
+    )
+    if not need_fallback:
+        return {"temps": stored_temps, "mslps": stored_mslps}
+
+    obs_times = []
+    for time_str in forecast_times:
+        try:
+            dt = datetime.fromisoformat(time_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            obs_times.append(dt.astimezone(timezone.utc).replace(tzinfo=None))
+        except Exception:
+            obs_times.append(None)
+
+    fallback = weatherlink.get_observations(obs_times, times_are_utc=True) if obs_times else {}
+    fb_temps = fallback.get("temps", []) if isinstance(fallback, dict) else []
+    fb_mslps = fallback.get("mslps", []) if isinstance(fallback, dict) else []
+
+    merged_temps = []
+    merged_mslps = []
+    for i in range(n):
+        t = stored_temps[i] if i < len(stored_temps) else None
+        p = stored_mslps[i] if i < len(stored_mslps) else None
+        if t is None and i < len(fb_temps):
+            t = fb_temps[i]
+        if p is None and i < len(fb_mslps):
+            p = fb_mslps[i]
+        merged_temps.append(t)
+        merged_mslps.append(p)
+
+    return {"temps": merged_temps, "mslps": merged_mslps}
+
+
 def _accumulate_fairfax_stats_from_run(location_data: dict, run_data: dict):
     """
     Accumulate long-term verification stats from a run before it is trimmed.
@@ -2634,8 +2690,8 @@ def _accumulate_fairfax_stats_from_run(location_data: dict, run_data: dict):
     _init_cumulative_stats(location_data)
     cumulative = location_data["cumulative_stats"]["by_lead_time"]
 
-    observed = run_data.get("observed")
-    if not observed or not observed.get("temps"):
+    observed = _get_run_observed_with_fallback(run_data)
+    if not observed.get("temps"):
         return
 
     gfs_data = run_data.get("gfs", {})
@@ -2711,8 +2767,8 @@ def _accumulate_fairfax_daily_stats_from_run(location_data: dict, run_data: dict
     _init_cumulative_stats(location_data)
     time_series = location_data["cumulative_stats"]["time_series"]
 
-    observed = run_data.get("observed")
-    if not observed or not observed.get("temps"):
+    observed = _get_run_observed_with_fallback(run_data)
+    if not observed.get("temps"):
         return
 
     gfs_data = run_data.get("gfs", {})
@@ -6816,6 +6872,23 @@ def fetch_asos_forecasts_for_model(model_name, forecast_hours, stations, init_ho
 
             station_forecasts[sid]['precips'] = interval_precips
 
+    # Compute 24-hour precipitation totals (12Z-to-12Z accumulation)
+    # precips_24hr[i] is non-None only at forecast hours where valid_time.hour == 12
+    for sid in station_forecasts:
+        precips = station_forecasts[sid]['precips']
+        precips_24hr = []
+        for i, fh in enumerate(forecast_hours):
+            valid_time = init_time + timedelta(hours=fh)
+            if valid_time.hour == 12 and i >= 3:
+                four_vals = precips[i-3:i+1]
+                if all(v is not None for v in four_vals):
+                    precips_24hr.append(sum(four_vals))
+                else:
+                    precips_24hr.append(None)
+            else:
+                precips_24hr.append(None)
+        station_forecasts[sid]['precips_24hr'] = precips_24hr
+
     return init_time, station_forecasts
 
 
@@ -8037,12 +8110,15 @@ def api_asos_verification_map():
 
     Query params:
         variable: temp, mslp, or precip
-        metric: mae or bias
+        metric: mae, wmae, or bias
         model: gfs, aifs, or ifs
         lead_time: forecast lead time in hours
     """
     variable = request.args.get('variable', 'temp')
     metric = request.args.get('metric', 'mae')
+    if metric == 'wmae' and variable not in ('precip', 'precip_24hr'):
+        # WMAE is precipitation-specific; fall back to MAE for other variables.
+        metric = 'mae'
     model = request.args.get('model', 'gfs')
     lead_time = int(request.args.get('lead_time', 24))
     period = request.args.get('period', 'all')
@@ -8365,6 +8441,8 @@ def api_asos_station_obs_timeseries():
 
     try:
         db = asos.load_asos_forecasts_db()
+        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "temp")
+        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "dewpoint")
         runs = db.get("runs", {})
         if not runs:
             return jsonify({"success": False, "error": "No ASOS forecast runs available"}), 404
@@ -8372,7 +8450,7 @@ def api_asos_station_obs_timeseries():
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=ASOS_MONTHLY_WINDOW_DAYS) if period == "monthly" else None
 
-        models = ["gfs", "aifs", "ifs", "nws"]
+        models = ["gfs", "aifs", "kenny", "ifs", "nws"]
         if model not in models:
             model = "gfs"
 
@@ -8425,7 +8503,8 @@ def api_asos_station_obs_timeseries():
             precip_biases = {}
             dewpoint_biases = {}
             for m in models:
-                model_data = run_data.get(m, {})
+                source_model = "aifs" if m == "kenny" else m
+                model_data = run_data.get(source_model, {})
                 fcst = model_data.get(station_id)
                 if not fcst:
                     temp_biases[m] = None
@@ -8440,9 +8519,24 @@ def api_asos_station_obs_timeseries():
                 fcst_precip = fcst_precips[idx] if idx < len(fcst_precips) else None
                 fcst_dewpoint = fcst_dewpoints[idx] if idx < len(fcst_dewpoints) else None
 
-                temp_biases[m] = (fcst_temp - obs_temp) if (fcst_temp is not None and obs_temp is not None) else None
-                precip_biases[m] = (fcst_precip - obs_precip) if (fcst_precip is not None and obs_precip is not None) else None
-                dewpoint_biases[m] = (fcst_dewpoint - obs_dewpoint) if (fcst_dewpoint is not None and obs_dewpoint is not None) else None
+                if m == "kenny" and fcst_temp is not None:
+                    st_bias = (kenny_temp_station_hour_biases.get(station_id) or {}).get(valid_time.hour)
+                    if st_bias is None:
+                        st_bias = kenny_temp_global_hour_biases.get(valid_time.hour, 0.0)
+                    fcst_temp = fcst_temp - st_bias
+                if m == "kenny" and fcst_dewpoint is not None:
+                    st_bias = (kenny_dew_station_hour_biases.get(station_id) or {}).get(valid_time.hour)
+                    if st_bias is None:
+                        st_bias = kenny_dew_global_hour_biases.get(valid_time.hour, 0.0)
+                    fcst_dewpoint = fcst_dewpoint - st_bias
+
+                temp_bias = (fcst_temp - obs_temp) if (fcst_temp is not None and obs_temp is not None) else None
+                precip_bias = (fcst_precip - obs_precip) if (fcst_precip is not None and obs_precip is not None) else None
+                dewpoint_bias = (fcst_dewpoint - obs_dewpoint) if (fcst_dewpoint is not None and obs_dewpoint is not None) else None
+
+                temp_biases[m] = temp_bias
+                precip_biases[m] = precip_bias
+                dewpoint_biases[m] = dewpoint_bias
 
             # Keep timestamps where at least one variable/model bias is available.
             if (
@@ -8619,6 +8713,7 @@ def api_asos_verification_time_series():
     try:
         gfs_data = asos.get_verification_time_series_from_cache('gfs', variable, lead_time, days_back)
         aifs_data = asos.get_verification_time_series_from_cache('aifs', variable, lead_time, days_back)
+        kenny_data = asos.get_verification_time_series_from_cache('kenny', variable, lead_time, days_back)
         ifs_data = asos.get_verification_time_series_from_cache('ifs', variable, lead_time, days_back)
         include_nws = variable in ('temp', 'precip', 'dewpoint')
         nws_data = asos.get_verification_time_series_from_cache('nws', variable, lead_time, days_back) if include_nws else None
@@ -8628,7 +8723,7 @@ def api_asos_verification_time_series():
             return jsonify({"success": False, "error": gfs_data["error"]}), 404
 
         # Calculate daily winners based on MAE
-        winner_counts = {"GFS": 0, "AIFS": 0, "IFS": 0, "NWS": 0, "Tie": 0}
+        winner_counts = {"GFS": 0, "AIFS": 0, "Kenny": 0, "IFS": 0, "NWS": 0, "Tie": 0}
         def _safe_get(arr, i):
             return arr[i] if isinstance(arr, list) and i < len(arr) else None
 
@@ -8637,6 +8732,7 @@ def api_asos_verification_time_series():
             maes = []
             gfs_mae = _safe_get(gfs_data.get("mae"), i)
             aifs_mae = _safe_get(aifs_data.get("mae"), i)
+            kenny_mae = _safe_get(kenny_data.get("mae"), i)
             ifs_mae = _safe_get(ifs_data.get("mae"), i)
             nws_mae = _safe_get(nws_data.get("mae"), i) if include_nws and nws_data else None
 
@@ -8644,6 +8740,8 @@ def api_asos_verification_time_series():
                 maes.append(("GFS", gfs_mae))
             if aifs_mae is not None:
                 maes.append(("AIFS", aifs_mae))
+            if kenny_mae is not None:
+                maes.append(("Kenny", kenny_mae))
             if ifs_mae is not None:
                 maes.append(("IFS", ifs_mae))
             if nws_mae is not None:
@@ -8664,16 +8762,25 @@ def api_asos_verification_time_series():
             "dates": gfs_data["dates"],
             "gfs": {
                 "mae": gfs_data["mae"],
+                "wmae": gfs_data.get("wmae", gfs_data.get("mae", [])),
                 "bias": gfs_data["bias"],
                 "counts": gfs_data["counts"]
             },
             "aifs": {
                 "mae": aifs_data["mae"],
+                "wmae": aifs_data.get("wmae", aifs_data.get("mae", [])),
                 "bias": aifs_data["bias"],
                 "counts": aifs_data["counts"]
             },
+            "kenny": {
+                "mae": kenny_data["mae"],
+                "wmae": kenny_data.get("wmae", kenny_data.get("mae", [])),
+                "bias": kenny_data["bias"],
+                "counts": kenny_data["counts"]
+            },
             "ifs": {
                 "mae": ifs_data["mae"],
+                "wmae": ifs_data.get("wmae", ifs_data.get("mae", [])),
                 "bias": ifs_data["bias"],
                 "counts": ifs_data["counts"]
             },
@@ -8685,6 +8792,7 @@ def api_asos_verification_time_series():
         if include_nws and nws_data:
             result["nws"] = {
                 "mae": nws_data.get("mae", []),
+                "wmae": nws_data.get("wmae", nws_data.get("mae", [])),
                 "bias": nws_data.get("bias", []),
                 "counts": nws_data.get("counts", [])
             }
@@ -8718,11 +8826,13 @@ def api_asos_mean_verification():
         if period == 'monthly':
             gfs_results = asos.get_mean_verification_from_monthly_cache('gfs', valid_hour=valid_hour)
             aifs_results = asos.get_mean_verification_from_monthly_cache('aifs', valid_hour=valid_hour)
+            kenny_results = asos.get_mean_verification_from_monthly_cache('kenny', valid_hour=valid_hour)
             ifs_results = asos.get_mean_verification_from_monthly_cache('ifs', valid_hour=valid_hour)
             nws_results = asos.get_mean_verification_from_monthly_cache('nws', valid_hour=valid_hour)
         else:
             gfs_results = asos.get_mean_verification_from_cache('gfs', valid_hour=valid_hour)
             aifs_results = asos.get_mean_verification_from_cache('aifs', valid_hour=valid_hour)
+            kenny_results = asos.get_mean_verification_from_cache('kenny', valid_hour=valid_hour)
             ifs_results = asos.get_mean_verification_from_cache('ifs', valid_hour=valid_hour)
             nws_results = asos.get_mean_verification_from_cache('nws', valid_hour=valid_hour)
 
@@ -8731,6 +8841,8 @@ def api_asos_mean_verification():
             return jsonify({"success": False, "error": gfs_results["error"]}), 404
         if "error" in aifs_results:
             return jsonify({"success": False, "error": aifs_results["error"]}), 404
+        if "error" in kenny_results:
+            return jsonify({"success": False, "error": kenny_results["error"]}), 404
         if "error" in ifs_results:
             return jsonify({"success": False, "error": ifs_results["error"]}), 404
 
@@ -8744,6 +8856,7 @@ def api_asos_mean_verification():
             has_data = (
                 (gfs_results["temp_mae"][i] is not None) or
                 (aifs_results["temp_mae"][i] is not None) or
+                (kenny_results["temp_mae"][i] is not None) or
                 (ifs_results["temp_mae"][i] is not None) or
                 (nws_results["temp_mae"][i] is not None)
             )
@@ -8757,6 +8870,7 @@ def api_asos_mean_verification():
         lead_times = filter_array(all_lead_times, filtered_indices)
         gfs_run_counts = asos.get_run_counts_by_lead_time('gfs', period, valid_hour=valid_hour)
         aifs_run_counts = asos.get_run_counts_by_lead_time('aifs', period, valid_hour=valid_hour)
+        kenny_run_counts = asos.get_run_counts_by_lead_time('kenny', period, valid_hour=valid_hour)
         ifs_run_counts = asos.get_run_counts_by_lead_time('ifs', period, valid_hour=valid_hour)
         nws_run_counts = asos.get_run_counts_by_lead_time('nws', period, valid_hour=valid_hour)
 
@@ -8764,12 +8878,15 @@ def api_asos_mean_verification():
             "lead_times": lead_times,
             "gfs_run_count": [gfs_run_counts.get(int(lt), 0) for lt in lead_times],
             "aifs_run_count": [aifs_run_counts.get(int(lt), 0) for lt in lead_times],
+            "kenny_run_count": [kenny_run_counts.get(int(lt), 0) for lt in lead_times],
             "ifs_run_count": [ifs_run_counts.get(int(lt), 0) for lt in lead_times],
             "nws_run_count": [nws_run_counts.get(int(lt), 0) for lt in lead_times],
             "gfs_temp_mae": filter_array(gfs_results["temp_mae"], filtered_indices),
             "gfs_temp_bias": filter_array(gfs_results["temp_bias"], filtered_indices),
             "aifs_temp_mae": filter_array(aifs_results["temp_mae"], filtered_indices),
             "aifs_temp_bias": filter_array(aifs_results["temp_bias"], filtered_indices),
+            "kenny_temp_mae": filter_array(kenny_results["temp_mae"], filtered_indices),
+            "kenny_temp_bias": filter_array(kenny_results["temp_bias"], filtered_indices),
             "ifs_temp_mae": filter_array(ifs_results["temp_mae"], filtered_indices),
             "ifs_temp_bias": filter_array(ifs_results["temp_bias"], filtered_indices),
             "nws_temp_mae": filter_array(nws_results["temp_mae"], filtered_indices),
@@ -8778,22 +8895,48 @@ def api_asos_mean_verification():
             "gfs_mslp_bias": filter_array(gfs_results["mslp_bias"], filtered_indices),
             "aifs_mslp_mae": filter_array(aifs_results["mslp_mae"], filtered_indices),
             "aifs_mslp_bias": filter_array(aifs_results["mslp_bias"], filtered_indices),
+            "kenny_mslp_mae": filter_array(kenny_results["mslp_mae"], filtered_indices),
+            "kenny_mslp_bias": filter_array(kenny_results["mslp_bias"], filtered_indices),
             "ifs_mslp_mae": filter_array(ifs_results["mslp_mae"], filtered_indices),
             "ifs_mslp_bias": filter_array(ifs_results["mslp_bias"], filtered_indices),
             "nws_mslp_mae": filter_array(nws_results["mslp_mae"], filtered_indices),
             "nws_mslp_bias": filter_array(nws_results["mslp_bias"], filtered_indices),
             "gfs_precip_mae": filter_array(gfs_results["precip_mae"], filtered_indices),
             "gfs_precip_bias": filter_array(gfs_results["precip_bias"], filtered_indices),
+            "gfs_precip_wmae": filter_array(gfs_results.get("precip_wmae", gfs_results["precip_mae"]), filtered_indices),
             "aifs_precip_mae": filter_array(aifs_results["precip_mae"], filtered_indices),
             "aifs_precip_bias": filter_array(aifs_results["precip_bias"], filtered_indices),
+            "aifs_precip_wmae": filter_array(aifs_results.get("precip_wmae", aifs_results["precip_mae"]), filtered_indices),
+            "kenny_precip_mae": filter_array(kenny_results["precip_mae"], filtered_indices),
+            "kenny_precip_bias": filter_array(kenny_results["precip_bias"], filtered_indices),
+            "kenny_precip_wmae": filter_array(kenny_results.get("precip_wmae", kenny_results["precip_mae"]), filtered_indices),
             "ifs_precip_mae": filter_array(ifs_results["precip_mae"], filtered_indices),
             "ifs_precip_bias": filter_array(ifs_results["precip_bias"], filtered_indices),
+            "ifs_precip_wmae": filter_array(ifs_results.get("precip_wmae", ifs_results["precip_mae"]), filtered_indices),
             "nws_precip_mae": filter_array(nws_results["precip_mae"], filtered_indices),
             "nws_precip_bias": filter_array(nws_results["precip_bias"], filtered_indices),
+            "nws_precip_wmae": filter_array(nws_results.get("precip_wmae", nws_results["precip_mae"]), filtered_indices),
+            "gfs_precip_24hr_mae": filter_array(gfs_results.get("precip_24hr_mae", []), filtered_indices),
+            "gfs_precip_24hr_bias": filter_array(gfs_results.get("precip_24hr_bias", []), filtered_indices),
+            "gfs_precip_24hr_wmae": filter_array(gfs_results.get("precip_24hr_wmae", gfs_results.get("precip_24hr_mae", [])), filtered_indices),
+            "aifs_precip_24hr_mae": filter_array(aifs_results.get("precip_24hr_mae", []), filtered_indices),
+            "aifs_precip_24hr_bias": filter_array(aifs_results.get("precip_24hr_bias", []), filtered_indices),
+            "aifs_precip_24hr_wmae": filter_array(aifs_results.get("precip_24hr_wmae", aifs_results.get("precip_24hr_mae", [])), filtered_indices),
+            "kenny_precip_24hr_mae": filter_array(kenny_results.get("precip_24hr_mae", []), filtered_indices),
+            "kenny_precip_24hr_bias": filter_array(kenny_results.get("precip_24hr_bias", []), filtered_indices),
+            "kenny_precip_24hr_wmae": filter_array(kenny_results.get("precip_24hr_wmae", kenny_results.get("precip_24hr_mae", [])), filtered_indices),
+            "ifs_precip_24hr_mae": filter_array(ifs_results.get("precip_24hr_mae", []), filtered_indices),
+            "ifs_precip_24hr_bias": filter_array(ifs_results.get("precip_24hr_bias", []), filtered_indices),
+            "ifs_precip_24hr_wmae": filter_array(ifs_results.get("precip_24hr_wmae", ifs_results.get("precip_24hr_mae", [])), filtered_indices),
+            "nws_precip_24hr_mae": filter_array(nws_results.get("precip_24hr_mae", []), filtered_indices),
+            "nws_precip_24hr_bias": filter_array(nws_results.get("precip_24hr_bias", []), filtered_indices),
+            "nws_precip_24hr_wmae": filter_array(nws_results.get("precip_24hr_wmae", nws_results.get("precip_24hr_mae", [])), filtered_indices),
             "gfs_dewpoint_mae": filter_array(gfs_results["dewpoint_mae"], filtered_indices),
             "gfs_dewpoint_bias": filter_array(gfs_results["dewpoint_bias"], filtered_indices),
             "aifs_dewpoint_mae": filter_array(aifs_results["dewpoint_mae"], filtered_indices),
             "aifs_dewpoint_bias": filter_array(aifs_results["dewpoint_bias"], filtered_indices),
+            "kenny_dewpoint_mae": filter_array(kenny_results["dewpoint_mae"], filtered_indices),
+            "kenny_dewpoint_bias": filter_array(kenny_results["dewpoint_bias"], filtered_indices),
             "ifs_dewpoint_mae": filter_array(ifs_results["dewpoint_mae"], filtered_indices),
             "ifs_dewpoint_bias": filter_array(ifs_results["dewpoint_bias"], filtered_indices),
             "nws_dewpoint_mae": filter_array(nws_results["dewpoint_mae"], filtered_indices),
@@ -8984,6 +9127,14 @@ def api_asos_sync():
         except Exception as e:
             logger.error(f"ASOS observations fetch failed: {e}")
             results['observations'] = {'status': 'error', 'error': str(e)}
+
+        # Rebuild verification cache (no longer triggered inside fetch_and_store_observations)
+        try:
+            logger.info("Rebuilding ASOS verification cache...")
+            asos.precompute_verification_cache()
+            logger.info("ASOS verification cache rebuilt")
+        except Exception as e:
+            logger.error(f"Verification cache rebuild failed: {e}")
 
         # Fetch 6-hourly data for trend visualization (separate from verification)
         logger.info("=" * 60)
@@ -9378,11 +9529,11 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 broadcast_sync_log(f"GFS ASOS data already synced for {gfs_init} - skipping", 'info')
                 logger.info(f"ASOS GFS already synced for {gfs_init}")
                 asos_results['gfs'] = {'status': 'skipped', 'reason': 'already synced'}
+                gfs_forecasts_to_store = None
             else:
                 broadcast_sync_log(f"Extracting GFS forecasts at {len(stations)} ASOS stations...", 'info')
-                asos.store_asos_forecasts(gfs_init, forecast_hours, 'gfs', gfs_forecasts)
-                broadcast_sync_log(f"GFS ASOS data synced for {len(gfs_forecasts)} stations", 'success')
                 asos_results['gfs'] = {'status': 'synced', 'stations': len(gfs_forecasts)}
+                gfs_forecasts_to_store = gfs_forecasts
 
             # Fetch AIFS
             aifs_init, aifs_forecasts = fetch_asos_forecasts_for_model('aifs', forecast_hours, stations, init_hour)
@@ -9391,11 +9542,11 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 broadcast_sync_log(f"AIFS ASOS data already synced for {aifs_init} - skipping", 'info')
                 logger.info(f"ASOS AIFS already synced for {aifs_init}")
                 asos_results['aifs'] = {'status': 'skipped', 'reason': 'already synced'}
+                aifs_forecasts_to_store = None
             else:
                 broadcast_sync_log(f"Extracting AIFS forecasts at {len(stations)} ASOS stations...", 'info')
-                asos.store_asos_forecasts(aifs_init, forecast_hours, 'aifs', aifs_forecasts)
-                broadcast_sync_log(f"AIFS ASOS data synced for {len(aifs_forecasts)} stations", 'success')
                 asos_results['aifs'] = {'status': 'synced', 'stations': len(aifs_forecasts)}
+                aifs_forecasts_to_store = aifs_forecasts
 
             # Fetch IFS
             ifs_init, ifs_forecasts = fetch_asos_forecasts_for_model('ifs', forecast_hours, stations, init_hour)
@@ -9404,13 +9555,14 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 broadcast_sync_log(f"IFS ASOS data already synced for {ifs_init} - skipping", 'info')
                 logger.info(f"ASOS IFS already synced for {ifs_init}")
                 asos_results['ifs'] = {'status': 'skipped', 'reason': 'already synced'}
+                ifs_forecasts_to_store = None
             else:
                 broadcast_sync_log(f"Extracting IFS forecasts at {len(stations)} ASOS stations...", 'info')
-                asos.store_asos_forecasts(ifs_init, forecast_hours, 'ifs', ifs_forecasts)
-                broadcast_sync_log(f"IFS ASOS data synced for {len(ifs_forecasts)} stations", 'success')
                 asos_results['ifs'] = {'status': 'synced', 'stations': len(ifs_forecasts)}
+                ifs_forecasts_to_store = ifs_forecasts
 
             # Fetch NWS forecasts
+            nws_forecasts_to_store = None
             try:
                 broadcast_sync_log("Fetching NWS forecasts for ASOS stations (batch mode with rate limiting)...", 'info')
                 nws_raw = nws_batch.fetch_nws_forecasts_batch_sync(stations)
@@ -9430,9 +9582,7 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 # Transform to ASOS format
                 logger.info(f"Transforming NWS data with gfs_init={gfs_init} (type: {type(gfs_init)})")
                 nws_forecasts = nws_batch.transform_nws_to_asos_format(nws_raw, nws_forecast_hours, gfs_init, wpc_precip=wpc_precip)
-
-                # Use GFS init time for NWS forecasts (aligns verification timing)
-                asos.store_asos_forecasts(gfs_init, nws_forecast_hours, 'nws', nws_forecasts)
+                nws_forecasts_to_store = (gfs_init, nws_forecast_hours, nws_forecasts)
 
                 success_count = sum(1 for f in nws_raw.values() if f is not None)
                 broadcast_sync_log(f"NWS forecasts synced for {success_count}/{len(stations)} stations", 'success')
@@ -9443,6 +9593,22 @@ def run_master_sync(force: bool = False, init_hour: Optional[int] = None) -> dic
                 logger.warning(f"NWS forecast fetch failed: {e}")
                 logger.warning(f"Full traceback: {traceback.format_exc()}")
                 asos_results['nws'] = {'status': 'error', 'error': str(e)}
+
+            # Write all new model forecasts in a single DB load/cleanup/save
+            batch_entries = []
+            if gfs_forecasts_to_store is not None:
+                batch_entries.append((gfs_init,  forecast_hours,     'gfs',  gfs_forecasts_to_store))
+            if aifs_forecasts_to_store is not None:
+                batch_entries.append((aifs_init, forecast_hours,     'aifs', aifs_forecasts_to_store))
+            if ifs_forecasts_to_store is not None:
+                batch_entries.append((ifs_init,  forecast_hours,     'ifs',  ifs_forecasts_to_store))
+            if nws_forecasts_to_store is not None:
+                nws_i, nws_fh, nws_f = nws_forecasts_to_store
+                batch_entries.append((nws_i, nws_fh, 'nws', nws_f))
+            if batch_entries:
+                broadcast_sync_log(f"Saving {len(batch_entries)} model forecast(s) to DB...", 'info')
+                asos.store_asos_forecasts_batch(batch_entries)
+                broadcast_sync_log("Model forecasts saved", 'success')
 
             # Fetch observations
             broadcast_sync_log("Fetching ASOS observations from Iowa Environmental Mesonet...", 'info')

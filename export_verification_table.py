@@ -42,17 +42,20 @@ def fetch_all_data(rebuild_monthly: bool = True):
             if period == 'monthly' and use_monthly:
                 gfs   = asos.get_mean_verification_from_monthly_cache('gfs',  valid_hour=vh)
                 aifs  = asos.get_mean_verification_from_monthly_cache('aifs', valid_hour=vh)
+                kenny = asos.get_mean_verification_from_monthly_cache('kenny', valid_hour=vh)
                 ifs   = asos.get_mean_verification_from_monthly_cache('ifs',  valid_hour=vh)
                 nws   = asos.get_mean_verification_from_monthly_cache('nws',  valid_hour=vh)
             else:
                 gfs   = asos.get_mean_verification_from_cache('gfs',  valid_hour=vh)
                 aifs  = asos.get_mean_verification_from_cache('aifs', valid_hour=vh)
+                kenny = asos.get_mean_verification_from_cache('kenny', valid_hour=vh)
                 ifs   = asos.get_mean_verification_from_cache('ifs',  valid_hour=vh)
                 nws   = asos.get_mean_verification_from_cache('nws',  valid_hour=vh)
 
             effective_period = period if (period != 'monthly' or use_monthly) else 'all'
             gfs_rc  = asos.get_run_counts_by_lead_time('gfs',  effective_period, valid_hour=vh)
             aifs_rc = asos.get_run_counts_by_lead_time('aifs', effective_period, valid_hour=vh)
+            kenny_rc = asos.get_run_counts_by_lead_time('kenny', effective_period, valid_hour=vh)
             ifs_rc  = asos.get_run_counts_by_lead_time('ifs',  effective_period, valid_hour=vh)
             nws_rc  = asos.get_run_counts_by_lead_time('nws',  effective_period, valid_hour=vh)
 
@@ -62,28 +65,55 @@ def fetch_all_data(rebuild_monthly: bool = True):
                 'lead_times':           lead_times,
                 'gfs_run_count':        [gfs_rc.get(int(lt), 0)  for lt in lead_times],
                 'aifs_run_count':       [aifs_rc.get(int(lt), 0) for lt in lead_times],
+                'kenny_run_count':      [kenny_rc.get(int(lt), 0) for lt in lead_times],
                 'ifs_run_count':        [ifs_rc.get(int(lt), 0)  for lt in lead_times],
                 'nws_run_count':        [nws_rc.get(int(lt), 0)  for lt in lead_times],
                 'gfs_temp_mae':         gfs.get('temp_mae', []),
                 'gfs_temp_bias':        gfs.get('temp_bias', []),
                 'aifs_temp_mae':        aifs.get('temp_mae', []),
                 'aifs_temp_bias':       aifs.get('temp_bias', []),
+                'kenny_temp_mae':       kenny.get('temp_mae', []),
+                'kenny_temp_bias':      kenny.get('temp_bias', []),
                 'ifs_temp_mae':         ifs.get('temp_mae', []),
                 'ifs_temp_bias':        ifs.get('temp_bias', []),
                 'nws_temp_mae':         nws.get('temp_mae', []),
                 'nws_temp_bias':        nws.get('temp_bias', []),
-                'gfs_precip_mae':       gfs.get('precip_mae', []),
-                'gfs_precip_bias':      gfs.get('precip_bias', []),
-                'aifs_precip_mae':      aifs.get('precip_mae', []),
-                'aifs_precip_bias':     aifs.get('precip_bias', []),
-                'ifs_precip_mae':       ifs.get('precip_mae', []),
-                'ifs_precip_bias':      ifs.get('precip_bias', []),
-                'nws_precip_mae':       nws.get('precip_mae', []),
-                'nws_precip_bias':      nws.get('precip_bias', []),
+                'gfs_precip_mae':        gfs.get('precip_mae', []),
+                'gfs_precip_bias':       gfs.get('precip_bias', []),
+                'gfs_precip_wmae':       gfs.get('precip_wmae', gfs.get('precip_mae', [])),
+                'aifs_precip_mae':       aifs.get('precip_mae', []),
+                'aifs_precip_bias':      aifs.get('precip_bias', []),
+                'aifs_precip_wmae':      aifs.get('precip_wmae', aifs.get('precip_mae', [])),
+                'kenny_precip_mae':      kenny.get('precip_mae', []),
+                'kenny_precip_bias':     kenny.get('precip_bias', []),
+                'kenny_precip_wmae':     kenny.get('precip_wmae', kenny.get('precip_mae', [])),
+                'ifs_precip_mae':        ifs.get('precip_mae', []),
+                'ifs_precip_bias':       ifs.get('precip_bias', []),
+                'ifs_precip_wmae':       ifs.get('precip_wmae', ifs.get('precip_mae', [])),
+                'nws_precip_mae':        nws.get('precip_mae', []),
+                'nws_precip_bias':       nws.get('precip_bias', []),
+                'nws_precip_wmae':       nws.get('precip_wmae', nws.get('precip_mae', [])),
+                'gfs_precip_24hr_mae':   gfs.get('precip_24hr_mae', []),
+                'gfs_precip_24hr_bias':  gfs.get('precip_24hr_bias', []),
+                'gfs_precip_24hr_wmae':  gfs.get('precip_24hr_wmae', gfs.get('precip_24hr_mae', [])),
+                'aifs_precip_24hr_mae':  aifs.get('precip_24hr_mae', []),
+                'aifs_precip_24hr_bias': aifs.get('precip_24hr_bias', []),
+                'aifs_precip_24hr_wmae': aifs.get('precip_24hr_wmae', aifs.get('precip_24hr_mae', [])),
+                'kenny_precip_24hr_mae':  kenny.get('precip_24hr_mae', []),
+                'kenny_precip_24hr_bias': kenny.get('precip_24hr_bias', []),
+                'kenny_precip_24hr_wmae': kenny.get('precip_24hr_wmae', kenny.get('precip_24hr_mae', [])),
+                'ifs_precip_24hr_mae':   ifs.get('precip_24hr_mae', []),
+                'ifs_precip_24hr_bias':  ifs.get('precip_24hr_bias', []),
+                'ifs_precip_24hr_wmae':  ifs.get('precip_24hr_wmae', ifs.get('precip_24hr_mae', [])),
+                'nws_precip_24hr_mae':   nws.get('precip_24hr_mae', []),
+                'nws_precip_24hr_bias':  nws.get('precip_24hr_bias', []),
+                'nws_precip_24hr_wmae':  nws.get('precip_24hr_wmae', nws.get('precip_24hr_mae', [])),
                 'gfs_dewpoint_mae':     gfs.get('dewpoint_mae', []),
                 'gfs_dewpoint_bias':    gfs.get('dewpoint_bias', []),
                 'aifs_dewpoint_mae':    aifs.get('dewpoint_mae', []),
                 'aifs_dewpoint_bias':   aifs.get('dewpoint_bias', []),
+                'kenny_dewpoint_mae':   kenny.get('dewpoint_mae', []),
+                'kenny_dewpoint_bias':  kenny.get('dewpoint_bias', []),
                 'ifs_dewpoint_mae':     ifs.get('dewpoint_mae', []),
                 'ifs_dewpoint_bias':    ifs.get('dewpoint_bias', []),
                 'nws_dewpoint_mae':     nws.get('dewpoint_mae', []),
@@ -92,6 +122,8 @@ def fetch_all_data(rebuild_monthly: bool = True):
                 'gfs_mslp_bias':        gfs.get('mslp_bias', []),
                 'aifs_mslp_mae':        aifs.get('mslp_mae', []),
                 'aifs_mslp_bias':       aifs.get('mslp_bias', []),
+                'kenny_mslp_mae':       kenny.get('mslp_mae', []),
+                'kenny_mslp_bias':      kenny.get('mslp_bias', []),
                 'ifs_mslp_mae':         ifs.get('mslp_mae', []),
                 'ifs_mslp_bias':        ifs.get('mslp_bias', []),
             }
@@ -136,6 +168,12 @@ def generate_html(data: dict, use_monthly: bool = False) -> str:
       <input class="form-check-input" type="checkbox" id="periodToggle">
       <label class="form-check-label" for="periodToggle">Last 20 days</label>
     </div>
+    <div class="btn-group btn-group-sm" role="group" id="precipPeriodToggle">
+      <input type="radio" class="btn-check" name="precipPeriod" id="pp-6hr" value="precip" autocomplete="off" checked>
+      <label class="btn btn-outline-secondary" for="pp-6hr">Precip 6hr</label>
+      <input type="radio" class="btn-check" name="precipPeriod" id="pp-24hr" value="precip_24hr" autocomplete="off">
+      <label class="btn btn-outline-secondary" for="pp-24hr">24hr</label>
+    </div>
     <div class="btn-group btn-group-sm" role="group" id="validHourFilter">
       <input type="radio" class="btn-check" name="validHour" id="vh-all" value="" autocomplete="off" checked>
       <label class="btn btn-outline-secondary" for="vh-all">All</label>
@@ -157,7 +195,7 @@ def generate_html(data: dict, use_monthly: bool = False) -> str:
   <tr>
     <th rowspan="2">Lead</th><th rowspan="2">Runs</th>
     <th colspan="5" class="text-center border-start">Temp (°F)</th>
-    <th colspan="5" class="text-center border-start">Precip (in)</th>
+    <th colspan="5" class="text-center border-start" id="precipTableHeader">Precip 6hr (in)</th>
     <th colspan="5" class="text-center border-start">Dew Point (°F)</th>
     <th colspan="3" class="text-center border-start">Pressure (mb)</th>
   </tr>
@@ -221,6 +259,11 @@ function renderTable() {{
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = '';
 
+  const precipVar = document.querySelector('input[name="precipPeriod"]:checked')?.value ?? 'precip';
+  const precipLabel = precipVar === 'precip_24hr' ? 'Precip 24hr (in)' : 'Precip 6hr (in)';
+  const precipHeader = document.getElementById('precipTableHeader');
+  if (precipHeader) precipHeader.textContent = precipLabel;
+
   if (!v || !v.lead_times || v.lead_times.length === 0) {{
     tbody.innerHTML = '<tr><td colspan="20" class="text-center text-muted">No data</td></tr>';
     return;
@@ -233,6 +276,8 @@ function renderTable() {{
   const f2 = (val, ref) => val != null ? val.toFixed(2) + (isMae && a ? pctMae(val, ref) : '') : '--';
   const sg = (val, dp=1) => val != null ? (val > 0 ? '+' : '') + val.toFixed(dp) : '--';
 
+  const pfx = precipVar === 'precip_24hr' ? 'precip_24hr' : 'precip';
+
   for (let i = 0; i < v.lead_times.length; i++) {{
     const lt = v.lead_times[i];
     const runs = Math.max(v.gfs_run_count?.[i]??0, v.aifs_run_count?.[i]??0,
@@ -243,10 +288,10 @@ function renderTable() {{
     const iTm = v.ifs_temp_mae?.[i],  iTb = v.ifs_temp_bias?.[i];
     const nTm = v.nws_temp_mae?.[i],  nTb = v.nws_temp_bias?.[i];
 
-    const gRm = v.gfs_precip_mae?.[i],  gRb = v.gfs_precip_bias?.[i];
-    const aRm = v.aifs_precip_mae?.[i], aRb = v.aifs_precip_bias?.[i];
-    const iRm = v.ifs_precip_mae?.[i],  iRb = v.ifs_precip_bias?.[i];
-    const nRm = v.nws_precip_mae?.[i],  nRb = v.nws_precip_bias?.[i];
+    const gRm = v[`gfs_${{pfx}}_mae`]?.[i],  gRb = v[`gfs_${{pfx}}_bias`]?.[i];
+    const aRm = v[`aifs_${{pfx}}_mae`]?.[i], aRb = v[`aifs_${{pfx}}_bias`]?.[i];
+    const iRm = v[`ifs_${{pfx}}_mae`]?.[i],  iRb = v[`ifs_${{pfx}}_bias`]?.[i];
+    const nRm = v[`nws_${{pfx}}_mae`]?.[i],  nRb = v[`nws_${{pfx}}_bias`]?.[i];
 
     const gDm = v.gfs_dewpoint_mae?.[i],  gDb = v.gfs_dewpoint_bias?.[i];
     const aDm = v.aifs_dewpoint_mae?.[i], aDb = v.aifs_dewpoint_bias?.[i];
@@ -279,10 +324,10 @@ function renderTable() {{
       <td class="text-center">${{isMae ? f1(iTm,a?.ifs_temp_mae?.[i])  : sg(iTb)}}</td>
       <td class="text-center">${{isMae ? f1(nTm,a?.nws_temp_mae?.[i])  : sg(nTb)}}</td>
       <td><span class="${{tCls}}">${{tWin}}</span></td>
-      <td class="text-center border-start">${{isMae ? f2(gRm,a?.gfs_precip_mae?.[i]) : sg(gRb,2)}}</td>
-      <td class="text-center">${{isMae ? f2(aRm,a?.aifs_precip_mae?.[i]) : sg(aRb,2)}}</td>
-      <td class="text-center">${{isMae ? f2(iRm,a?.ifs_precip_mae?.[i])  : sg(iRb,2)}}</td>
-      <td class="text-center">${{isMae ? f2(nRm,a?.nws_precip_mae?.[i])  : sg(nRb,2)}}</td>
+      <td class="text-center border-start">${{isMae ? f2(gRm,a?.[`gfs_${{pfx}}_mae`]?.[i]) : sg(gRb,2)}}</td>
+      <td class="text-center">${{isMae ? f2(aRm,a?.[`aifs_${{pfx}}_mae`]?.[i]) : sg(aRb,2)}}</td>
+      <td class="text-center">${{isMae ? f2(iRm,a?.[`ifs_${{pfx}}_mae`]?.[i])  : sg(iRb,2)}}</td>
+      <td class="text-center">${{isMae ? f2(nRm,a?.[`nws_${{pfx}}_mae`]?.[i])  : sg(nRb,2)}}</td>
       <td><span class="${{rCls}}">${{rWin}}</span></td>
       <td class="text-center border-start">${{isMae ? f1(gDm,a?.gfs_dewpoint_mae?.[i]) : sg(gDb)}}</td>
       <td class="text-center">${{isMae ? f1(aDm,a?.aifs_dewpoint_mae?.[i]) : sg(aDb)}}</td>
@@ -300,6 +345,7 @@ function renderTable() {{
 document.getElementById('periodToggle').addEventListener('change', renderTable);
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
+document.querySelectorAll('input[name="precipPeriod"]').forEach(r => r.addEventListener('change', renderTable));
 renderTable();
 </script>
 </body>

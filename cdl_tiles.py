@@ -339,3 +339,123 @@ def sample_pixel(lat: float, lng: float) -> dict:
     except Exception as exc:
         logger.debug("CDL sample_pixel failed lat=%.4f lng=%.4f: %s", lat, lng, exc)
         return {"code": None, "name": None}
+
+
+# ── Storm crop impact ──────────────────────────────────────────────────────────
+
+# Assumed impact radii in km for each hazard type:
+#   torn (tornado)  — 5 km:   immediate damage path + secondary debris zone
+#   hail            — 10 km:  typical severe-hail swath from one supercell
+#   wind            — 17.5 km: straight-line wind / squall-line corridor
+#   fire            — 0.5 km: buffer around each VIIRS 375 m detection pixel
+STORM_IMPACT_RADII_KM: dict[str, float] = {
+    "torn": 2.5,
+    "hail": 5.0,
+    "wind": 8.75,
+    "fire": 0.5,
+}
+
+# Use overview level 2 (~80 m/px in EPSG:5070) — same level used by sample_pixel(),
+# confirmed to return correct categorical CDL codes. 1 pixel ≈ 1.58 acres.
+# Level 4 (~320 m/px) was tried but overview resampling corrupts categorical codes.
+_IMPACT_OVERVIEW_LEVEL = 2
+
+
+def compute_storm_impact(
+    reports_by_type: dict[str, list[dict]],
+    radii_km: dict[str, float] | None = None,
+) -> dict[str, dict[int, float]]:
+    """
+    Sample CDL within a circular buffer around each storm report and
+    accumulate pixel counts per CDL code for each hazard type.
+
+    Args:
+        reports_by_type: {'torn': [{lat, lon, ...}], 'hail': [...], 'wind': [...]}
+        radii_km:        Per-type radius overrides; defaults to STORM_IMPACT_RADII_KM.
+
+    Returns:
+        {haz_type: {cdl_code (int): acres (float)}}
+        Acreage may double-count overlapping storm impact zones.
+    """
+    if radii_km is None:
+        radii_km = STORM_IMPACT_RADII_KM
+
+    results: dict[str, dict[int, float]] = {k: {} for k in reports_by_type}
+
+    if not CDL_PATH.exists():
+        logger.warning("CDL raster not found for storm impact: %s", CDL_PATH)
+        return results
+
+    try:
+        with rasterio.open(CDL_PATH, overview_level=_IMPACT_OVERVIEW_LEVEL) as src:
+            pixel_area_m2 = abs(src.res[0]) * abs(src.res[1])
+            pixel_acres = pixel_area_m2 / 4046.856  # m² → acres
+            tfm = src.transform       # affine: x = c + (col+0.5)*a, y = f + (row+0.5)*e
+
+            for haz_type, reports in reports_by_type.items():
+                radius_m = radii_km.get(haz_type, 10.0) * 1000.0
+                code_pixels: dict[int, int] = {}
+
+                # Batch-project all report centres in one pyproj call (much faster
+                # than one call per report, especially for fire with ~3000 points).
+                valid: list[tuple[float, float]] = []
+                for rep in reports:
+                    try:
+                        valid.append((float(rep["lat"]), float(rep["lon"])))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                if not valid:
+                    results[haz_type] = {}
+                    continue
+                lats_b, lons_b = zip(*valid)
+                xs_all, ys_all = warp_transform(
+                    "EPSG:4326", src.crs, list(lons_b), list(lats_b)
+                )
+
+                for cx, cy in zip(xs_all, ys_all):
+
+                    # Bounding box in native CRS
+                    x_lo, x_hi = cx - radius_m, cx + radius_m
+                    y_lo, y_hi = cy - radius_m, cy + radius_m
+
+                    # Convert to raster row/col (y_hi → top row, y_lo → bottom row)
+                    row_top, col_left  = src.index(x_lo, y_hi)
+                    row_bot, col_right = src.index(x_hi, y_lo)
+
+                    row_top   = max(0, row_top)
+                    col_left  = max(0, col_left)
+                    row_bot   = min(src.height, row_bot)
+                    col_right = min(src.width,  col_right)
+
+                    if row_top >= row_bot or col_left >= col_right:
+                        continue
+
+                    win = Window(col_left, row_top,
+                                 col_right - col_left, row_bot - row_top)
+                    data = src.read(1, window=win)
+
+                    # Pixel-centre coordinates in native CRS
+                    c_arr = np.arange(col_left, col_right)
+                    r_arr = np.arange(row_top,  row_bot)
+                    cc, rr = np.meshgrid(c_arr, r_arr)
+                    px = tfm.c + (cc + 0.5) * tfm.a
+                    py = tfm.f + (rr + 0.5) * tfm.e
+
+                    # Circular mask
+                    mask = ((px - cx) ** 2 + (py - cy) ** 2) <= radius_m ** 2
+
+                    # Accumulate pixel counts by CDL code
+                    unique, counts = np.unique(data[mask], return_counts=True)
+                    for code, cnt in zip(unique.tolist(), counts.tolist()):
+                        if code > 0:  # 0 = background / outside US
+                            code_pixels[code] = code_pixels.get(code, 0) + cnt
+
+                results[haz_type] = {
+                    code: cnt * pixel_acres
+                    for code, cnt in code_pixels.items()
+                }
+
+    except Exception as exc:
+        logger.error("compute_storm_impact failed: %s", exc, exc_info=True)
+
+    return results

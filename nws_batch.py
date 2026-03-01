@@ -627,10 +627,24 @@ def transform_nws_to_asos_format(
                     if found_any:
                         precips[i] = precip_6hr
 
+        # Compute 24-hour precipitation totals (12Z-to-12Z accumulation)
+        precips_24hr = []
+        for i, hour in enumerate(forecast_hours):
+            target_time = init_time + timedelta(hours=hour)
+            if target_time.hour == 12 and i >= 3:
+                four_vals = precips[i-3:i+1]
+                if all(v is not None for v in four_vals):
+                    precips_24hr.append(sum(four_vals))
+                else:
+                    precips_24hr.append(None)
+            else:
+                precips_24hr.append(None)
+
         result[station_id] = {
             'temps': temps,
             'mslps': mslps,
             'precips': precips,
+            'precips_24hr': precips_24hr,
             'dewpoints': dewpoints,
         }
 

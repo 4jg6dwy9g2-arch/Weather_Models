@@ -55,6 +55,11 @@
             Single Run Bias
         </button>
     </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="polymarket-tab" data-bs-toggle="tab" data-bs-target="#polymarketPane" type="button" role="tab" aria-controls="polymarketPane" aria-selected="false">
+            Polymarket
+        </button>
+    </li>
 </ul>
 
 <div class="tab-content" id="modelVerificationContent">
@@ -69,6 +74,9 @@
     </div>
     <div class="tab-pane fade" id="singleBiasPane" role="tabpanel" aria-labelledby="single-bias-tab">
         <iframe class="verification-frame" src="/single-run-bias?embed=1" title="Single Run Bias"></iframe>
+    </div>
+    <div class="tab-pane fade" id="polymarketPane" role="tabpanel" aria-labelledby="polymarket-tab">
+        <iframe class="verification-frame" src="/polymarket?embed=1" title="Polymarket NYC Temperature"></iframe>
     </div>
 </div>
 {% endblock %}

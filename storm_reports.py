@@ -125,6 +125,26 @@ def sync_storm_reports() -> dict:
     return {"success": True, "report_count": len(all_reports), "fetched_at": fetched_at}
 
 
+def fetch_reports_for_date(date_str: str) -> dict[str, list[dict]]:
+    """Fetch SPC storm reports for a single calendar date (YYYYMMDD).
+
+    Returns {'torn': [...], 'hail': [...], 'wind': [...]} — may be empty lists
+    if no reports exist or the fetch fails.
+    """
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_utc.strftime("%Y%m%d")
+    result: dict[str, list[dict]] = {t: [] for t in REPORT_TYPES}
+    for rtype in REPORT_TYPES:
+        if date_str == today_str:
+            url = f"{SPC_BASE}/today_{rtype}.csv"
+        else:
+            date_short = date_str[2:]  # YYYYMMDD → YYMMDD
+            url = f"{SPC_BASE}/{date_short}_rpts_{rtype}.csv"
+        rows = _fetch_csv(url)
+        result[rtype] = _parse_rows(rows, rtype, date_str)
+    return result
+
+
 def load_storm_reports() -> dict | None:
     """Return cached storm reports dict, or None if unavailable."""
     if not DATA_FILE.exists():

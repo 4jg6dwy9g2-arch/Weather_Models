@@ -27,7 +27,7 @@ PAGES_WORKTREE = Path('/Users/kennypratt/weather-pages')
 
 # Lead times to publish (matches the map dropdown)
 PUBLISH_LEAD_TIMES = [6, 12, 24, 48, 72, 120, 168, 240, 288, 360]
-MODELS = ['gfs', 'aifs', 'ifs', 'nws']
+MODELS = ['gfs', 'aifs', 'kenny', 'ifs', 'nws']
 VARIABLES = ['temp', 'precip', 'dewpoint', 'mslp', 'precip_24hr']
 TS_LEAD_TIMES = [6, 24, 72, 168]   # pre-bake these for the time series chart
 SPOTLIGHT_STATIONS = ['IAD', 'BWI']
@@ -63,6 +63,20 @@ def extract_station_data() -> dict:
         'stations': {}
     }
 
+    kenny_temp_by_lt = {lt: asos.get_verification_data_from_cache('kenny', 'temp', lt) for lt in available_lts}
+    kenny_dew_by_lt = {lt: asos.get_verification_data_from_cache('kenny', 'dewpoint', lt) for lt in available_lts}
+
+    kenny_temp_by_vh_lt = {}
+    for vh in [0, 6, 12, 18]:
+        kenny_temp_by_vh_lt[vh] = {
+            lt: asos.get_verification_data_from_cache('kenny', 'temp', lt, valid_hour=vh) for lt in available_lts
+        }
+    kenny_dew_by_vh_lt = {}
+    for vh in [0, 6, 12, 18]:
+        kenny_dew_by_vh_lt[vh] = {
+            lt: asos.get_verification_data_from_cache('kenny', 'dewpoint', lt, valid_hour=vh) for lt in available_lts
+        }
+
     for station_id, st_cache_data in by_station.items():
         meta = stations_meta.get(station_id, {})
         lat = meta.get('lat')
@@ -74,13 +88,23 @@ def extract_station_data() -> dict:
         model_arr = []
         has_any = False
         for model in MODELS:
-            m_data = st_cache_data.get(model, {})
+            source_model = 'aifs' if model == 'kenny' else model
+            m_data = st_cache_data.get(source_model, {})
             var_arr = []
             for var in VARIABLES:
                 lt_arr = []
                 for lt in available_lts:
                     if model == 'nws' and lt > 168:
                         lt_arr.append(None)
+                        continue
+                    if model == 'kenny' and var in ('temp', 'dewpoint'):
+                        kmap = kenny_temp_by_lt if var == 'temp' else kenny_dew_by_lt
+                        kv = kmap.get(lt, {}).get(station_id)
+                        if kv and kv.get('count', 0) > 0:
+                            lt_arr.append([kv.get('mae'), kv.get('bias')])
+                            has_any = True
+                        else:
+                            lt_arr.append(None)
                         continue
                     entry = m_data.get(str(lt), {})
                     v = entry.get(var) if entry else None
@@ -116,13 +140,23 @@ def extract_station_data() -> dict:
             model_arr = []
             has_any = False
             for model in MODELS:
-                m_data = station_vh_data.get(model, {})
+                source_model = 'aifs' if model == 'kenny' else model
+                m_data = station_vh_data.get(source_model, {})
                 var_arr = []
                 for var in VARIABLES:
                     lt_arr = []
                     for lt in available_lts:
                         if model == 'nws' and lt > 168:
                             lt_arr.append(None)
+                            continue
+                        if model == 'kenny' and var in ('temp', 'dewpoint'):
+                            kmap = kenny_temp_by_vh_lt if var == 'temp' else kenny_dew_by_vh_lt
+                            kv = kmap.get(vh, {}).get(lt, {}).get(station_id)
+                            if kv and kv.get('count', 0) > 0:
+                                lt_arr.append([kv.get('mae'), kv.get('bias')])
+                                has_any = True
+                            else:
+                                lt_arr.append(None)
                             continue
                         v = m_data.get(str(lt), {}).get(vh_str, {}).get(var)
                         if v and v.get('count', 0) > 0:
@@ -260,6 +294,7 @@ def extract_timeseries_data() -> dict:
             try:
                 gfs = asos.get_verification_time_series_from_cache('gfs', var, lt, days_back=365)
                 aifs_d = asos.get_verification_time_series_from_cache('aifs', var, lt, days_back=365)
+                kenny_d = asos.get_verification_time_series_from_cache('kenny', var, lt, days_back=365)
                 ifs_d = asos.get_verification_time_series_from_cache('ifs', var, lt, days_back=365)
                 include_nws = var in ('temp', 'precip', 'precip_24hr', 'dewpoint')
                 nws_d = asos.get_verification_time_series_from_cache('nws', var, lt, days_back=365) if include_nws else {}
@@ -269,12 +304,13 @@ def extract_timeseries_data() -> dict:
 
                 combo = {
                     'dates': gfs.get('dates', []),
-                    'gfs':  {'mae': gfs.get('mae', []),   'bias': gfs.get('bias', [])},
-                    'aifs': {'mae': aifs_d.get('mae', []), 'bias': aifs_d.get('bias', [])},
-                    'ifs':  {'mae': ifs_d.get('mae', []),  'bias': ifs_d.get('bias', [])},
+                    'gfs':  {'mae': gfs.get('mae', []),   'wmae': gfs.get('wmae', gfs.get('mae', [])),   'bias': gfs.get('bias', [])},
+                    'aifs': {'mae': aifs_d.get('mae', []), 'wmae': aifs_d.get('wmae', aifs_d.get('mae', [])), 'bias': aifs_d.get('bias', [])},
+                    'kenny': {'mae': kenny_d.get('mae', []), 'wmae': kenny_d.get('wmae', kenny_d.get('mae', [])), 'bias': kenny_d.get('bias', [])},
+                    'ifs':  {'mae': ifs_d.get('mae', []),  'wmae': ifs_d.get('wmae', ifs_d.get('mae', [])),  'bias': ifs_d.get('bias', [])},
                 }
                 if include_nws and 'error' not in nws_d:
-                    combo['nws'] = {'mae': nws_d.get('mae', []), 'bias': nws_d.get('bias', [])}
+                    combo['nws'] = {'mae': nws_d.get('mae', []), 'wmae': nws_d.get('wmae', nws_d.get('mae', [])), 'bias': nws_d.get('bias', [])}
 
                 ts[var][str(lt)] = combo
             except Exception as e:
@@ -290,8 +326,10 @@ def extract_spotlight_obs(station_ids: list, lead_times: list) -> dict:
     t=time ISO, ot/op/od=obs temp/precip/dewpoint, tb/pb/db=bias dicts {model: float|null}
     """
     db = asos.load_asos_forecasts_db()
+    kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "temp")
+    kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = asos._compute_kenny_station_hour_biases(db, "dewpoint")
     runs = db.get("runs", {})
-    models = ["gfs", "aifs", "ifs", "nws"]
+    models = ["gfs", "aifs", "kenny", "ifs", "nws"]
     now = datetime.now(timezone.utc)
 
     result = {}
@@ -341,7 +379,8 @@ def extract_spotlight_obs(station_ids: list, lead_times: list) -> dict:
 
                 tb, pb, db_bias = {}, {}, {}
                 for m in models:
-                    fcst = run_data.get(m, {}).get(sid)
+                    source_model = 'aifs' if m == 'kenny' else m
+                    fcst = run_data.get(source_model, {}).get(sid)
                     if not fcst:
                         tb[m] = pb[m] = db_bias[m] = None
                         continue
@@ -351,9 +390,23 @@ def extract_spotlight_obs(station_ids: list, lead_times: list) -> dict:
                     ftemp   = ft[idx]  if idx < len(ft)  else None
                     fprecip = fp[idx]  if idx < len(fp)  else None
                     fdew    = fd[idx]  if idx < len(fd)  else None
-                    tb[m]      = round(ftemp   - obs_temp,     2) if ftemp   is not None and obs_temp     is not None else None
-                    pb[m]      = round(fprecip - obs_precip,   3) if fprecip is not None and obs_precip   is not None else None
-                    db_bias[m] = round(fdew    - obs_dewpoint, 2) if fdew    is not None and obs_dewpoint is not None else None
+                    if m == 'kenny' and ftemp is not None:
+                        st_bias = (kenny_temp_station_hour_biases.get(sid) or {}).get(valid_time.hour)
+                        if st_bias is None:
+                            st_bias = kenny_temp_global_hour_biases.get(valid_time.hour, 0.0)
+                        ftemp = ftemp - st_bias
+                    if m == 'kenny' and fdew is not None:
+                        st_bias = (kenny_dew_station_hour_biases.get(sid) or {}).get(valid_time.hour)
+                        if st_bias is None:
+                            st_bias = kenny_dew_global_hour_biases.get(valid_time.hour, 0.0)
+                        fdew = fdew - st_bias
+
+                    raw_tb = round(ftemp   - obs_temp,     2) if ftemp   is not None and obs_temp     is not None else None
+                    raw_pb = round(fprecip - obs_precip,   3) if fprecip is not None and obs_precip   is not None else None
+                    raw_db = round(fdew    - obs_dewpoint, 2) if fdew    is not None and obs_dewpoint is not None else None
+                    tb[m]      = raw_tb
+                    pb[m]      = raw_pb
+                    db_bias[m] = raw_db
 
                 if (obs_temp is None and obs_precip is None and obs_dewpoint is None
                         and all(v is None for v in tb.values())
@@ -469,6 +522,7 @@ thead tr:nth-child(2) th {{ background: white; }}
         <ul>
           <li><strong>GFS</strong> &mdash; NOAA Global Forecast System, 0.25° resolution, out to 15 days (360h)</li>
           <li><strong>AIFS</strong> &mdash; ECMWF AI Integrated Forecasting System, out to 15 days (360h)</li>
+          <li><strong>Kenny</strong> &mdash; Station-specific bias-corrected AIFS for temperature and dew point. For each ASOS station and valid hour (00Z/06Z/12Z/18Z), Kenny applies the recent 6-hour AIFS bias as a correction using forecast &minus; bias (so a &minus;6&deg; bias adds +6&deg; to AIFS, and a +6&deg; bias subtracts 6&deg;). If station-hour history is sparse, it falls back to a global valid-hour bias. Other variables are the same as AIFS.</li>
           <li><strong>IFS</strong> &mdash; ECMWF Integrated Forecasting System (open data), out to 15 days (360h)</li>
           <li><strong>NWS</strong> &mdash; National Weather Service point forecasts via the NWS API, limited to 7 days (168h)</li>
         </ul>
@@ -488,6 +542,7 @@ thead tr:nth-child(2) th {{ background: white; }}
         <h6>Metrics</h6>
         <ul>
           <li><strong>MAE</strong> (Mean Absolute Error) &mdash; average of |forecast &minus; observed| across all matched cases. Lower is better; always &ge; 0.</li>
+          <li><strong>WMAE</strong> (Weighted MAE, precipitation only) &mdash; same absolute error, but each case is weighted by observed precipitation amount (minimum weight 0.01"). Heavier rain/snow events therefore contribute more than marginal events.</li>
           <li><strong>Bias</strong> &mdash; average of (forecast &minus; observed). Positive = model runs warm/wet/high; negative = model runs cold/dry/low.</li>
         </ul>
 
@@ -540,6 +595,7 @@ thead tr:nth-child(2) th {{ background: white; }}
       <select class="form-select form-select-sm" id="selModel" style="width:auto">
         <option value="gfs">GFS</option>
         <option value="aifs">AIFS</option>
+        <option value="kenny">Kenny</option>
         <option value="ifs">IFS</option>
         <option value="nws">NWS</option>
       </select>
@@ -648,6 +704,7 @@ thead tr:nth-child(2) th {{ background: white; }}
       <span class="ms-2">
         <span style="display:inline-block;width:10px;height:10px;background:#0d6efd;border-radius:2px"></span> GFS&nbsp;
         <span style="display:inline-block;width:10px;height:10px;background:#0dcaf0;border-radius:2px"></span> AIFS&nbsp;
+        <span style="display:inline-block;width:10px;height:10px;background:#fd7e14;border-radius:2px"></span> Kenny&nbsp;
         <span style="display:inline-block;width:10px;height:10px;background:#20c997;border-radius:2px"></span> IFS&nbsp;
         <span style="display:inline-block;width:10px;height:10px;background:#6c757d;border-radius:2px"></span> NWS
       </span>
@@ -692,6 +749,8 @@ thead tr:nth-child(2) th {{ background: white; }}
       <div class="btn-group btn-group-sm">
         <input type="radio" class="btn-check" name="tableMetric" id="tm-mae" value="mae" autocomplete="off" checked>
         <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
+        <input type="radio" class="btn-check" name="tableMetric" id="tm-wmae" value="wmae" autocomplete="off">
+        <label class="btn btn-outline-primary" for="tm-wmae">WMAE (Precip)</label>
         <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
         <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
       </div>
@@ -721,29 +780,33 @@ thead tr:nth-child(2) th {{ background: white; }}
         <thead>
           <tr>
             <th rowspan="2">Lead</th><th rowspan="2">Runs</th>
-            <th colspan="5" class="text-center border-start">Temp (°F)</th>
-            <th colspan="5" class="text-center border-start" id="precipTableHeader">Precip 6hr (in)</th>
-            <th colspan="5" class="text-center border-start">Dew Point (°F)</th>
-            <th colspan="3" class="text-center border-start">Pressure (mb)</th>
+            <th colspan="6" class="text-center border-start">Temp (°F)</th>
+            <th colspan="6" class="text-center border-start" id="precipTableHeader">Precip 6hr (in)</th>
+            <th colspan="6" class="text-center border-start">Dew Point (°F)</th>
+            <th colspan="4" class="text-center border-start">Pressure (mb)</th>
           </tr>
           <tr>
             <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
             <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(253,126,20,.16)">Kenny</th>
             <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
             <th class="text-center" style="background:rgba(33,37,41,.10)">NWS</th>
             <th class="text-center">Win</th>
             <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
             <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(253,126,20,.16)">Kenny</th>
             <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
             <th class="text-center" style="background:rgba(33,37,41,.10)">NWS</th>
             <th class="text-center">Win</th>
             <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
             <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(253,126,20,.16)">Kenny</th>
             <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
             <th class="text-center" style="background:rgba(33,37,41,.10)">NWS</th>
             <th class="text-center">Win</th>
             <th class="text-center border-start" style="background:rgba(13,110,253,.10)">GFS</th>
             <th class="text-center" style="background:rgba(13,202,240,.10)">AIFS</th>
+            <th class="text-center" style="background:rgba(253,126,20,.16)">Kenny</th>
             <th class="text-center" style="background:rgba(25,135,84,.10)">IFS</th>
           </tr>
         </thead>
@@ -767,6 +830,7 @@ thead tr:nth-child(2) th {{ background: white; }}
       </select>
       <select class="form-select form-select-sm" id="tsMetric" style="width:auto">
         <option value="mae">MAE</option>
+        <option value="wmae">WMAE (Precip)</option>
         <option value="bias">Bias</option>
       </select>
       <select class="form-select form-select-sm" id="tsLt" style="width:auto">
@@ -788,6 +852,7 @@ thead tr:nth-child(2) th {{ background: white; }}
       <strong><i class="bi bi-trophy"></i> Daily Winners (Lowest MAE):</strong>
       <span class="ms-3"><span class="badge bg-primary">GFS</span> <span id="tsGfsWins">0</span> days</span>
       <span class="ms-2"><span class="badge bg-info text-dark">AIFS</span> <span id="tsAifsWins">0</span> days</span>
+      <span class="ms-2"><span class="badge" style="background:#fd7e14;">Kenny</span> <span id="tsKennyWins">0</span> days</span>
       <span class="ms-2"><span class="badge bg-success">IFS</span> <span id="tsIfsWins">0</span> days</span>
       <span class="ms-2"><span class="badge bg-dark">NWS</span> <span id="tsNwsWins">0</span> days</span>
       <span class="ms-2"><span class="badge bg-secondary">Tie</span> <span id="tsTieWins">0</span> days</span>
@@ -820,10 +885,9 @@ thead tr:nth-child(2) th {{ background: white; }}
   <div class="card-body" id="pmChartSection" style="display:none;background:#f5f3ff;">
     <div class="d-flex align-items-center justify-content-between mb-2">
       <p id="pmMaeDesc" class="text-muted mb-0" style="font-size:0.8rem;">
-        Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.
+        Average absolute error across all cities for snapshots in the &lt;6h lead window vs. ASOS observed high.
       </p>
       <select class="form-select form-select-sm ms-2" id="pmMaeBucketSelect" style="width:auto;flex-shrink:0;">
-        <option value="final">Final snap</option>
         <option value="0">&lt;6h</option>
         <option value="6">6&ndash;12h</option>
         <option value="12">12&ndash;18h</option>
@@ -849,8 +913,8 @@ thead tr:nth-child(2) th {{ background: white; }}
 // ============================================================
 // Data loaded async from sibling JSON files
 // ============================================================
-const MODELS    = ['gfs','aifs','ifs','nws'];
-const MODEL_IDX = {{gfs:0,aifs:1,ifs:2,nws:3}};
+const MODELS    = ['gfs','aifs','kenny','ifs','nws'];
+const MODEL_IDX = {{gfs:0,aifs:1,kenny:2,ifs:3,nws:4}};
 const VAR_IDX   = {{temp:0,precip:1,dewpoint:2,mslp:3,precip_24hr:4}};
 const VAR_UNITS = {{temp:'°F',precip:'in',dewpoint:'°F',mslp:'mb',precip_24hr:'in'}};
 const VAR_PRECIP = 'precip';
@@ -933,7 +997,7 @@ async function loadAll() {{
     const cities = PM_DATA._cities || [];
     buildPmTabs(cities);
     buildPmAllCitiesChart();
-    if (cities.length > 0) renderPmCity(cities[0].key);
+    if (cities.length > 0) renderPmCity('__all__');
   }}
 }}
 
@@ -1074,6 +1138,7 @@ function renderMap() {{
 const DT_COLORS = {{
   gfs:  {{border:'#0d6efd', bg:'rgba(13,110,253,.12)'}},
   aifs: {{border:'#0dcaf0', bg:'rgba(13,202,240,.12)'}},
+  kenny: {{border:'#fd7e14', bg:'rgba(253,126,20,.12)'}},
   ifs:  {{border:'#20c997', bg:'rgba(32,201,151,.12)'}},
   nws:  {{border:'#212529', bg:'rgba(33,37,41,.12)'}},
 }};
@@ -1165,10 +1230,11 @@ function renderObsCharts(sid, lt) {{
   const mStyles = {{
     gfs:  {{bg:'#0d6efd'}},
     aifs: {{bg:'#0dcaf0'}},
+    kenny: {{bg:'#fd7e14'}},
     ifs:  {{bg:'#20c997'}},
     nws:  {{bg:'#6c757d'}},
   }};
-  const mOrder = ['gfs','aifs','ifs','nws'];
+  const mOrder = ['gfs','aifs','kenny','ifs','nws'];
 
   function buildBiasSets(key) {{
     const rankData = mOrder.map(() => []);
@@ -1336,7 +1402,10 @@ function winner(models) {{
 function renderTable() {{
   const period  = document.getElementById('periodToggle').checked ? 'monthly' : 'all';
   const vh      = document.querySelector('input[name="validHour"]:checked').value;
-  const isMae   = document.querySelector('input[name="tableMetric"]:checked').value === 'mae';
+  const tableMetric = document.querySelector('input[name="tableMetric"]:checked').value;
+  const isBias  = tableMetric === 'bias';
+  const isWmae  = tableMetric === 'wmae';
+  const isMae   = !isBias;
   const key     = `${{period}}_${{vh===''?'all':vh}}`;
   const v       = TABLE_DATA?.data?.[key];
   const a       = TABLE_DATA?.data?.['all_all'];
@@ -1350,7 +1419,7 @@ function renderTable() {{
   if (precipHeader) precipHeader.textContent = precipLabel;
 
   if (!v?.lead_times?.length) {{
-    tbody.innerHTML = '<tr><td colspan="20" class="text-center text-muted">No data</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="24" class="text-center text-muted">No data</td></tr>';
     return;
   }}
 
@@ -1360,49 +1429,62 @@ function renderTable() {{
 
   for (let i=0; i<v.lead_times.length; i++) {{
     const lt   = v.lead_times[i];
-    const runs = Math.max(v.gfs_run_count?.[i]??0,v.aifs_run_count?.[i]??0,
+    const runs = Math.max(v.gfs_run_count?.[i]??0,v.aifs_run_count?.[i]??0,v.kenny_run_count?.[i]??0,
                           v.ifs_run_count?.[i]??0, v.nws_run_count?.[i]??0);
     const gTm=v.gfs_temp_mae?.[i],  gTb=v.gfs_temp_bias?.[i];
     const aTm=v.aifs_temp_mae?.[i], aTb=v.aifs_temp_bias?.[i];
+    const kTm=v.kenny_temp_mae?.[i],kTb=v.kenny_temp_bias?.[i];
     const iTm=v.ifs_temp_mae?.[i],  iTb=v.ifs_temp_bias?.[i];
     const nTm=v.nws_temp_mae?.[i],  nTb=v.nws_temp_bias?.[i];
     const pfx = precipVar === 'precip_24hr' ? 'precip_24hr' : 'precip';
     const gRm=v[`gfs_${{pfx}}_mae`]?.[i],   gRb=v[`gfs_${{pfx}}_bias`]?.[i];
+    const gRw=v[`gfs_${{pfx}}_wmae`]?.[i] ?? gRm;
     const aRm=v[`aifs_${{pfx}}_mae`]?.[i],  aRb=v[`aifs_${{pfx}}_bias`]?.[i];
+    const aRw=v[`aifs_${{pfx}}_wmae`]?.[i] ?? aRm;
+    const kRm=v[`kenny_${{pfx}}_mae`]?.[i], kRb=v[`kenny_${{pfx}}_bias`]?.[i];
+    const kRw=v[`kenny_${{pfx}}_wmae`]?.[i] ?? kRm;
     const iRm=v[`ifs_${{pfx}}_mae`]?.[i],   iRb=v[`ifs_${{pfx}}_bias`]?.[i];
+    const iRw=v[`ifs_${{pfx}}_wmae`]?.[i] ?? iRm;
     const nRm=v[`nws_${{pfx}}_mae`]?.[i],   nRb=v[`nws_${{pfx}}_bias`]?.[i];
+    const nRw=v[`nws_${{pfx}}_wmae`]?.[i] ?? nRm;
     const gDm=v.gfs_dewpoint_mae?.[i], gDb=v.gfs_dewpoint_bias?.[i];
     const aDm=v.aifs_dewpoint_mae?.[i],aDb=v.aifs_dewpoint_bias?.[i];
+    const kDm=v.kenny_dewpoint_mae?.[i],kDb=v.kenny_dewpoint_bias?.[i];
     const iDm=v.ifs_dewpoint_mae?.[i], iDb=v.ifs_dewpoint_bias?.[i];
     const nDm=v.nws_dewpoint_mae?.[i], nDb=v.nws_dewpoint_bias?.[i];
     const gPm=v.gfs_mslp_mae?.[i],     gPb=v.gfs_mslp_bias?.[i];
     const aPm=v.aifs_mslp_mae?.[i],    aPb=v.aifs_mslp_bias?.[i];
+    const kPm=v.kenny_mslp_mae?.[i],   kPb=v.kenny_mslp_bias?.[i];
     const iPm=v.ifs_mslp_mae?.[i],     iPb=v.ifs_mslp_bias?.[i];
 
-    const [tW,tC]=winner([{{n:'GFS',mae:gTm,cls:'badge bg-primary'}},{{n:'AIFS',mae:aTm,cls:'badge bg-info text-dark'}},{{n:'IFS',mae:iTm,cls:'badge bg-success'}},{{n:'NWS',mae:nTm,cls:'badge bg-dark'}}]);
-    const [rW,rC]=winner([{{n:'GFS',mae:gRm,cls:'badge bg-primary'}},{{n:'AIFS',mae:aRm,cls:'badge bg-info text-dark'}},{{n:'IFS',mae:iRm,cls:'badge bg-success'}},{{n:'NWS',mae:nRm,cls:'badge bg-dark'}}]);
-    const [dW,dC]=winner([{{n:'GFS',mae:gDm,cls:'badge bg-primary'}},{{n:'AIFS',mae:aDm,cls:'badge bg-info text-dark'}},{{n:'IFS',mae:iDm,cls:'badge bg-success'}},{{n:'NWS',mae:nDm,cls:'badge bg-dark'}}]);
+    const [tW,tC]=winner([{{n:'GFS',mae:gTm,cls:'badge bg-primary'}},{{n:'AIFS',mae:aTm,cls:'badge bg-info text-dark'}},{{n:'Kenny',mae:kTm,cls:'badge',style:'background:#fd7e14;'}},{{n:'IFS',mae:iTm,cls:'badge bg-success'}},{{n:'NWS',mae:nTm,cls:'badge bg-dark'}}]);
+    const [rW,rC]=winner([{{n:'GFS',mae:isWmae?gRw:gRm,cls:'badge bg-primary'}},{{n:'AIFS',mae:isWmae?aRw:aRm,cls:'badge bg-info text-dark'}},{{n:'Kenny',mae:isWmae?kRw:kRm,cls:'badge',style:'background:#fd7e14;'}},{{n:'IFS',mae:isWmae?iRw:iRm,cls:'badge bg-success'}},{{n:'NWS',mae:isWmae?nRw:nRm,cls:'badge bg-dark'}}]);
+    const [dW,dC]=winner([{{n:'GFS',mae:gDm,cls:'badge bg-primary'}},{{n:'AIFS',mae:aDm,cls:'badge bg-info text-dark'}},{{n:'Kenny',mae:kDm,cls:'badge',style:'background:#fd7e14;'}},{{n:'IFS',mae:iDm,cls:'badge bg-success'}},{{n:'NWS',mae:nDm,cls:'badge bg-dark'}}]);
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td><strong>${{fmtLt(lt)}}</strong></td><td class="text-center">${{runs}}</td>
       <td class="text-center border-start">${{isMae?f1(gTm,a?.gfs_temp_mae?.[i]):sg(gTb)}}</td>
       <td class="text-center">${{isMae?f1(aTm,a?.aifs_temp_mae?.[i]):sg(aTb)}}</td>
+      <td class="text-center">${{isMae?f1(kTm,a?.kenny_temp_mae?.[i]):sg(kTb)}}</td>
       <td class="text-center">${{isMae?f1(iTm,a?.ifs_temp_mae?.[i]):sg(iTb)}}</td>
       <td class="text-center">${{isMae?f1(nTm,a?.nws_temp_mae?.[i]):sg(nTb)}}</td>
       <td><span class="${{tC}}">${{tW}}</span></td>
-      <td class="text-center border-start">${{isMae?f2(gRm,a?.[`gfs_${{pfx}}_mae`]?.[i]):sg(gRb,2)}}</td>
-      <td class="text-center">${{isMae?f2(aRm,a?.[`aifs_${{pfx}}_mae`]?.[i]):sg(aRb,2)}}</td>
-      <td class="text-center">${{isMae?f2(iRm,a?.[`ifs_${{pfx}}_mae`]?.[i]):sg(iRb,2)}}</td>
-      <td class="text-center">${{isMae?f2(nRm,a?.[`nws_${{pfx}}_mae`]?.[i]):sg(nRb,2)}}</td>
+      <td class="text-center border-start">${{isMae?f2(isWmae?gRw:gRm,isWmae?a?.[`gfs_${{pfx}}_wmae`]?.[i]:a?.[`gfs_${{pfx}}_mae`]?.[i]):sg(gRb,2)}}</td>
+      <td class="text-center">${{isMae?f2(isWmae?aRw:aRm,isWmae?a?.[`aifs_${{pfx}}_wmae`]?.[i]:a?.[`aifs_${{pfx}}_mae`]?.[i]):sg(aRb,2)}}</td>
+      <td class="text-center">${{isMae?f2(isWmae?kRw:kRm,isWmae?a?.[`kenny_${{pfx}}_wmae`]?.[i]:a?.[`kenny_${{pfx}}_mae`]?.[i]):sg(kRb,2)}}</td>
+      <td class="text-center">${{isMae?f2(isWmae?iRw:iRm,isWmae?a?.[`ifs_${{pfx}}_wmae`]?.[i]:a?.[`ifs_${{pfx}}_mae`]?.[i]):sg(iRb,2)}}</td>
+      <td class="text-center">${{isMae?f2(isWmae?nRw:nRm,isWmae?a?.[`nws_${{pfx}}_wmae`]?.[i]:a?.[`nws_${{pfx}}_mae`]?.[i]):sg(nRb,2)}}</td>
       <td><span class="${{rC}}">${{rW}}</span></td>
       <td class="text-center border-start">${{isMae?f1(gDm,a?.gfs_dewpoint_mae?.[i]):sg(gDb)}}</td>
       <td class="text-center">${{isMae?f1(aDm,a?.aifs_dewpoint_mae?.[i]):sg(aDb)}}</td>
+      <td class="text-center">${{isMae?f1(kDm,a?.kenny_dewpoint_mae?.[i]):sg(kDb)}}</td>
       <td class="text-center">${{isMae?f1(iDm,a?.ifs_dewpoint_mae?.[i]):sg(iDb)}}</td>
       <td class="text-center">${{isMae?f1(nDm,a?.nws_dewpoint_mae?.[i]):sg(nDb)}}</td>
       <td><span class="${{dC}}">${{dW}}</span></td>
       <td class="text-center border-start">${{isMae?f1(gPm,a?.gfs_mslp_mae?.[i]):sg(gPb)}}</td>
       <td class="text-center">${{isMae?f1(aPm,a?.aifs_mslp_mae?.[i]):sg(aPb)}}</td>
+      <td class="text-center">${{isMae?f1(kPm,a?.kenny_mslp_mae?.[i]):sg(kPb)}}</td>
       <td class="text-center">${{isMae?f1(iPm,a?.ifs_mslp_mae?.[i]):sg(iPb)}}</td>
     `;
     tbody.appendChild(tr);
@@ -1415,6 +1497,8 @@ function renderTable() {{
 function renderTs() {{
   const variable = document.getElementById('tsVar').value;
   const metric   = document.getElementById('tsMetric').value;
+  const isPrecipVar = variable === 'precip' || variable === 'precip_24hr';
+  const resolvedMetric = (metric === 'wmae' && !isPrecipVar) ? 'mae' : metric;
   const lt       = document.getElementById('tsLt').value;
   const span     = parseInt(document.getElementById('tsSpan').value, 10);
   const combo    = TS_DATA?.[variable]?.[lt];
@@ -1440,14 +1524,19 @@ function renderTs() {{
   const mColors = {{
     gfs: {{border:'#0d6efd',bg:'rgba(13,110,253,.1)'}},
     aifs:{{border:'#0dcaf0',bg:'rgba(13,202,240,.1)'}},
+    kenny:{{border:'#fd7e14',bg:'rgba(253,126,20,.1)'}},
     ifs: {{border:'#20c997',bg:'rgba(32,201,151,.1)'}},
     nws: {{border:'#212529',bg:'rgba(33,37,41,.1)'}},
   }};
-  const datasets = ['gfs','aifs','ifs','nws']
+  const datasets = ['gfs','aifs','kenny','ifs','nws']
     .filter(m => combo[m])
     .map(m => ({{
       label: m.toUpperCase(),
-      data: combo[m][metric].slice(startIdx),
+      data: (
+        resolvedMetric === 'bias'
+          ? combo[m].bias
+          : (resolvedMetric === 'wmae' ? (combo[m].wmae || combo[m].mae) : combo[m].mae)
+      ).slice(startIdx),
       borderColor: mColors[m].border,
       backgroundColor: mColors[m].bg,
       borderWidth: 2,
@@ -1458,14 +1547,14 @@ function renderTs() {{
 
   // Daily winners tally (MAE only)
   const tallyEl = document.getElementById('tsWinnerTally');
-  if (metric === 'mae') {{
-    const wins = {{gfs:0, aifs:0, ifs:0, nws:0, tie:0}};
+  if (resolvedMetric === 'mae') {{
+    const wins = {{gfs:0, aifs:0, kenny:0, ifs:0, nws:0, tie:0}};
     for (let i = 0; i < dates.length; i++) {{
       const idx = startIdx + i;
       const candidates = [];
-      for (const m of ['gfs','aifs','ifs','nws']) {{
+      for (const m of ['gfs','aifs','kenny','ifs','nws']) {{
         if (!combo[m]) continue;
-        const v = combo[m].mae[idx];
+        const v = (resolvedMetric === 'wmae' ? (combo[m].wmae || combo[m].mae) : combo[m].mae)[idx];
         if (v != null) candidates.push({{key: m, val: v}});
       }}
       if (!candidates.length) continue;
@@ -1476,6 +1565,7 @@ function renderTs() {{
     }}
     document.getElementById('tsGfsWins').textContent  = wins.gfs;
     document.getElementById('tsAifsWins').textContent = wins.aifs;
+    document.getElementById('tsKennyWins').textContent = wins.kenny;
     document.getElementById('tsIfsWins').textContent  = wins.ifs;
     document.getElementById('tsNwsWins').textContent  = wins.nws;
     document.getElementById('tsTieWins').textContent  = wins.tie;
@@ -1501,7 +1591,7 @@ function renderTs() {{
         }}
       }},
       scales: {{
-        y: {{grid:{{color:'#e0e0e0'}}, title:{{display:true, text:`${{metric.toUpperCase()}} (${{unit}})`}}}},
+        y: {{grid:{{color:'#e0e0e0'}}, title:{{display:true, text:`${{resolvedMetric.toUpperCase()}} (${{unit}})`}}}},
         x: {{grid:{{display:false}}, title:{{display:true, text:'Date'}},
              ticks:{{maxRotation:45, minRotation:45}}}}
       }}
@@ -1542,16 +1632,14 @@ function pmBucketLabel(b) {{
 
 function buildPmAllCitiesChart(selectedBucket) {{
   if (selectedBucket === undefined)
-    selectedBucket = document.getElementById('pmMaeBucketSelect')?.value ?? 'final';
+    selectedBucket = document.getElementById('pmMaeBucketSelect')?.value ?? '0';
   const el = document.getElementById('pmMaeChart');
   if (!el || !PM_DATA) return;
-  const isFinal  = selectedBucket === 'final';
-  const bucketNum = isFinal ? null : Number(selectedBucket);
+  const bucketNum = Number(selectedBucket);
 
   const descEl = document.getElementById('pmMaeDesc');
-  if (descEl) descEl.textContent = isFinal
-    ? 'Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.'
-    : 'Average absolute error across all cities for snapshots in the ' + pmBucketLabel(bucketNum) + ' lead window vs. ASOS observed high.';
+  if (descEl) descEl.textContent =
+    'Average absolute error across all cities for snapshots in the ' + pmBucketLabel(bucketNum) + ' lead window vs. ASOS observed high.';
 
   const cities = PM_DATA._cities || [];
   const byDate = {{}};
@@ -1562,13 +1650,7 @@ function buildPmAllCitiesChart(selectedBucket) {{
       if (!entry.resolved || entry.observed_high == null) return;
       const obs   = entry.observed_high;
       const snaps = (entry.snapshots || []).filter(s => s.lead_hours != null && s.lead_hours >= 0);
-      let selected;
-      if (isFinal) {{
-        const fin = snaps.reduce((b,s) => b === null || s.lead_hours < b.lead_hours ? s : b, null);
-        selected = fin ? [fin] : [];
-      }} else {{
-        selected = snaps.filter(s => pmGetBucket(s.lead_hours) === bucketNum);
-      }}
+      const selected = snaps.filter(s => pmGetBucket(s.lead_hours) === bucketNum);
       if (!selected.length) return;
       if (!byDate[d]) byDate[d] = {{mErrs:[], nErrs:[]}};
       selected.forEach(s => {{
@@ -1654,15 +1736,32 @@ function buildPmLeadTimeTable(resolvedDates, markets) {{
 
 function renderPmCity(cityKey) {{
   const pane = document.getElementById('pmPane');
-  const cityData = PM_DATA?.[cityKey];
-  if (!cityData) {{
-    pane.innerHTML = '<div class="text-center text-muted p-4 small">No data for this city yet.</div>';
-    return;
+  let markets = {{}};
+  let resolvedWithObs = [];
+
+  if (cityKey === '__all__') {{
+    const cities = PM_DATA?._cities || [];
+    cities.forEach(c => {{
+      const cityData = PM_DATA?.[c.key];
+      if (!cityData || !cityData.markets) return;
+      Object.entries(cityData.markets).forEach(([dateKey, entry]) => {{
+        if (!entry || !entry.resolved || entry.observed_high == null) return;
+        const compositeKey = c.key + '__' + dateKey;
+        markets[compositeKey] = entry;
+        resolvedWithObs.push(compositeKey);
+      }});
+    }});
+  }} else {{
+    const cityData = PM_DATA?.[cityKey];
+    if (!cityData) {{
+      pane.innerHTML = '<div class="text-center text-muted p-4 small">No data for this city yet.</div>';
+      return;
+    }}
+    markets = cityData.markets || {{}};
+    const allDates = Object.keys(markets).sort();
+    const resolved = allDates.filter(d => markets[d].resolved).reverse();
+    resolvedWithObs = resolved.filter(d => markets[d].observed_high != null);
   }}
-  const markets  = cityData.markets || {{}};
-  const allDates = Object.keys(markets).sort();
-  const resolved = allDates.filter(d => markets[d].resolved).reverse();
-  const resolvedWithObs = resolved.filter(d => markets[d].observed_high != null);
   const html = buildPmLeadTimeTable(resolvedWithObs, markets);
   pane.innerHTML = html || '<div class="text-center text-muted p-4 small">Collecting sync snapshots \u2014 verification will appear once markets resolve.</div>';
 }}
@@ -1670,10 +1769,12 @@ function renderPmCity(cityKey) {{
 function buildPmTabs(cities) {{
   const tabBar = document.getElementById('pmCityTabs');
   tabBar.innerHTML = '';
-  cities.forEach((c, i) => {{
+  const tabCities = [{{key:'__all__', display:'All'}}, ...cities];
+  tabCities.forEach((c, i) => {{
     const li  = document.createElement('li');
     li.className = 'nav-item';
     const btn = document.createElement('button');
+    btn.dataset.cityKey = c.key;
     btn.className = 'nav-link' + (i === 0 ? ' active' : '');
     btn.style.fontSize = '0.8rem';
     btn.style.padding  = '0.25rem 0.7rem';
@@ -1681,7 +1782,7 @@ function buildPmTabs(cities) {{
     btn.addEventListener('click', () => {{
       tabBar.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      renderPmCity(c.key);
+      renderPmCity(btn.dataset.cityKey);
     }});
     li.appendChild(btn);
     tabBar.appendChild(li);

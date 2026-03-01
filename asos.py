@@ -135,6 +135,171 @@ def should_include_precip(fcst_val, obs_val) -> bool:
     return True
 
 
+def _is_precip_var(variable: str) -> bool:
+    return variable in ("precip", "precip_24hr")
+
+
+def _precip_weight(obs_val: float) -> float:
+    # Keep light events in-scope while increasing influence as observed precip grows.
+    return max(float(obs_val), 0.01)
+
+
+def _stats_wmae(stats: dict, fallback_mae: Optional[float] = None) -> Optional[float]:
+    weight_sum = stats.get("sum_weights", 0.0) or 0.0
+    if weight_sum > 0:
+        return (stats.get("sum_weighted_abs_errors", 0.0) or 0.0) / weight_sum
+    return fallback_mae
+
+
+ASOS_BASE_MODELS = ("gfs", "aifs", "ifs", "nws")
+ASOS_VERIFICATION_MODELS = ("gfs", "aifs", "kenny", "ifs", "nws")
+
+
+def _source_model_for_verification(model: str) -> str:
+    m = (model or "").lower()
+    return "aifs" if m == "kenny" else m
+
+
+def _is_bias_corrected_model(model: str) -> bool:
+    return (model or "").lower() == "kenny"
+
+
+def _bias_corrected_metric_value(model: str, metric_name: str, mae_value, raw_value):
+    return raw_value
+
+
+def _is_kenny_bias_corrected_var(model: str, variable: str) -> bool:
+    return (model or "").lower() == "kenny" and variable in ("temp", "dewpoint")
+
+
+def _compute_kenny_station_hour_biases(db: dict, variable: str = "temp") -> tuple[dict[str, dict[int, float]], dict[int, float]]:
+    """
+    Compute AIFS 6-hour variable bias by station and valid time-of-day hour.
+
+    Returns:
+      - station_hour_biases: {station_id: {valid_hour: mean_bias}}
+      - global_hour_biases: {valid_hour: mean_bias}  # fallback when station is sparse
+    """
+    if variable not in ("temp", "dewpoint"):
+        return {}, {0: 0.0, 6: 0.0, 12: 0.0, 18: 0.0}
+
+    fcst_key = "temps" if variable == "temp" else "dewpoints"
+    obs_key = "temp" if variable == "temp" else "dewpoint"
+
+    cycle_hours = (0, 6, 12, 18)
+    global_stats = {h: {"sum": 0.0, "count": 0} for h in cycle_hours}
+    station_stats: dict[str, dict[int, dict[str, float]]] = {}
+
+    # Historical contribution from accumulated by-valid-hour stats.
+    # lead_time=6 bias already grouped by valid hour.
+    by_vh = (
+        db.get("cumulative_stats", {})
+        .get("by_lead_time_by_valid_hour", {})
+        .get("aifs", {})
+        .get(variable, {})
+        .get("6", {})
+    )
+    for vh_str, vh_stats in by_vh.items():
+        try:
+            valid_hour = int(vh_str)
+        except Exception:
+            continue
+        if valid_hour not in global_stats:
+            continue
+        count = int(vh_stats.get("count", 0) or 0)
+        if count <= 0:
+            continue
+        global_stats[valid_hour]["sum"] += float(vh_stats.get("sum_errors", 0.0) or 0.0)
+        global_stats[valid_hour]["count"] += count
+
+    # Fresh runs not yet folded into cumulative stats.
+    runs = db.get("runs", {})
+    stations = db.get("stations", {})
+    accumulated_run_keys = db.get("cumulative_stats", {}).get("accumulated_run_keys", {})
+    now = datetime.now(timezone.utc)
+
+    for run_key, run_data in runs.items():
+        if run_key in accumulated_run_keys:
+            continue
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        forecast_hours = run_data.get("forecast_hours", [])
+        if 6 not in forecast_hours:
+            continue
+        idx = forecast_hours.index(6)
+        valid_time = init_time + timedelta(hours=6)
+        if valid_time >= now:
+            continue
+        valid_hour = valid_time.hour
+        if valid_hour not in global_stats:
+            continue
+
+        model_data = run_data.get("aifs", {})
+        for station_id, fcst_data in model_data.items():
+            if station_id not in stations:
+                continue
+            fcst_vals = fcst_data.get(fcst_key, [])
+            if idx >= len(fcst_vals) or fcst_vals[idx] is None:
+                continue
+            obs = get_composite_observation(db, station_id, valid_time)
+            if not obs or obs.get(obs_key) is None:
+                continue
+            error = fcst_vals[idx] - obs[obs_key]
+            global_stats[valid_hour]["sum"] += error
+            global_stats[valid_hour]["count"] += 1
+
+            st = station_stats.setdefault(
+                station_id,
+                {h: {"sum": 0.0, "count": 0} for h in cycle_hours}
+            )
+            st[valid_hour]["sum"] += error
+            st[valid_hour]["count"] += 1
+
+    global_bias = {}
+    for h in cycle_hours:
+        c = global_stats[h]["count"]
+        global_bias[h] = (global_stats[h]["sum"] / c) if c > 0 else 0.0
+
+    station_bias: dict[str, dict[int, float]] = {}
+    for sid, per_hour in station_stats.items():
+        station_bias[sid] = {}
+        for h in cycle_hours:
+            c = per_hour[h]["count"]
+            if c > 0:
+                station_bias[sid][h] = per_hour[h]["sum"] / c
+
+    return station_bias, global_bias
+
+
+def _apply_model_value_adjustment(
+    model: str,
+    variable: str,
+    station_id: str,
+    valid_time: datetime,
+    fcst_val,
+    kenny_station_hour_biases: Optional[dict[str, dict[int, float]]] = None,
+    kenny_global_hour_biases: Optional[dict[int, float]] = None
+):
+    if fcst_val is None:
+        return None
+    if _is_kenny_bias_corrected_var(model, variable):
+        hour = valid_time.hour
+        hour_bias = None
+        if kenny_station_hour_biases is not None:
+            hour_bias = (kenny_station_hour_biases.get(station_id) or {}).get(hour)
+        if hour_bias is None and kenny_global_hour_biases is not None:
+            hour_bias = kenny_global_hour_biases.get(hour, 0.0)
+        if hour_bias is None:
+            hour_bias = 0.0
+        # Bias is defined as (forecast - observed); correction is forecast - bias.
+        return fcst_val - hour_bias
+    return fcst_val
+
+
 def _qualifying_precip_sets(run_data: dict, stations) -> tuple:
     """
     Precompute qualifying precipitation events across all models for a run.
@@ -806,12 +971,18 @@ def accumulate_stats_from_run(
                         cumulative_by_station[station_id][model][var][lt_str] = {
                             "sum_abs_errors": 0.0,
                             "sum_errors": 0.0,
-                            "count": 0
+                            "count": 0,
+                            "sum_weighted_abs_errors": 0.0,
+                            "sum_weights": 0.0,
                         }
 
                     cumulative_by_station[station_id][model][var][lt_str]["sum_abs_errors"] += abs_error
                     cumulative_by_station[station_id][model][var][lt_str]["sum_errors"] += error
                     cumulative_by_station[station_id][model][var][lt_str]["count"] += 1
+                    if _is_precip_var(var):
+                        weight = _precip_weight(obs_val)
+                        cumulative_by_station[station_id][model][var][lt_str]["sum_weighted_abs_errors"] += abs_error * weight
+                        cumulative_by_station[station_id][model][var][lt_str]["sum_weights"] += weight
 
                     # Update by_lead_time stats
                     if var not in cumulative_by_lead_time[model]:
@@ -820,12 +991,18 @@ def accumulate_stats_from_run(
                         cumulative_by_lead_time[model][var][lt_str] = {
                             "sum_abs_errors": 0.0,
                             "sum_errors": 0.0,
-                            "count": 0
+                            "count": 0,
+                            "sum_weighted_abs_errors": 0.0,
+                            "sum_weights": 0.0,
                         }
 
                     cumulative_by_lead_time[model][var][lt_str]["sum_abs_errors"] += abs_error
                     cumulative_by_lead_time[model][var][lt_str]["sum_errors"] += error
                     cumulative_by_lead_time[model][var][lt_str]["count"] += 1
+                    if _is_precip_var(var):
+                        weight = _precip_weight(obs_val)
+                        cumulative_by_lead_time[model][var][lt_str]["sum_weighted_abs_errors"] += abs_error * weight
+                        cumulative_by_lead_time[model][var][lt_str]["sum_weights"] += weight
 
                     # Update by_lead_time_by_valid_hour stats (store at exact lt; snapping happens at read time)
                     vh_str = str(valid_time.hour)
@@ -835,11 +1012,16 @@ def accumulate_stats_from_run(
                         cumulative_by_lt_by_vh[model][var][lt_str] = {}
                     if vh_str not in cumulative_by_lt_by_vh[model][var][lt_str]:
                         cumulative_by_lt_by_vh[model][var][lt_str][vh_str] = {
-                            "sum_abs_errors": 0.0, "sum_errors": 0.0, "count": 0
+                            "sum_abs_errors": 0.0, "sum_errors": 0.0, "count": 0,
+                            "sum_weighted_abs_errors": 0.0, "sum_weights": 0.0
                         }
                     cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["sum_abs_errors"] += abs_error
                     cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["sum_errors"] += error
                     cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["count"] += 1
+                    if _is_precip_var(var):
+                        weight = _precip_weight(obs_val)
+                        cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["sum_weighted_abs_errors"] += abs_error * weight
+                        cumulative_by_lt_by_vh[model][var][lt_str][vh_str]["sum_weights"] += weight
                     # Note: lt_str stored here may be non-canonical; _snap_to_canonical_lt() in
                     # precompute_verification_cache() remaps it to the correct canonical bucket.
 
@@ -890,10 +1072,22 @@ def accumulate_stats_from_run(
                     if lt_str not in cumulative_time_series[model][var]:
                         cumulative_time_series[model][var][lt_str] = {}
                     if date_key not in cumulative_time_series[model][var][lt_str]:
-                        cumulative_time_series[model][var][lt_str][date_key] = []
+                        cumulative_time_series[model][var][lt_str][date_key] = {
+                            "sum_abs_errors": 0.0,
+                            "sum_errors": 0.0,
+                            "count": 0,
+                            "sum_weighted_abs_errors": 0.0,
+                            "sum_weights": 0.0,
+                        }
 
-                    # Append error to this date's list
-                    cumulative_time_series[model][var][lt_str][date_key].append(error)
+                    stats = cumulative_time_series[model][var][lt_str][date_key]
+                    stats["sum_abs_errors"] += abs(error)
+                    stats["sum_errors"] += error
+                    stats["count"] += 1
+                    if _is_precip_var(var):
+                        weight = _precip_weight(obs_val)
+                        stats["sum_weighted_abs_errors"] += abs(error) * weight
+                        stats["sum_weights"] += weight
 
 
 def cleanup_old_runs(data: dict) -> dict:
@@ -1302,6 +1496,80 @@ def get_stored_observation(db: dict, station_id: str, target_time: datetime, max
     return None
 
 
+def get_composite_observation(
+    db: dict,
+    station_id: str,
+    target_time: datetime,
+    max_delta_minutes: int = 30
+) -> Optional[dict]:
+    """
+    Composite observation lookup: nearest value per variable within tolerance.
+
+    Unlike get_stored_observation(), this does not require one observation timestamp
+    to contain all variables; temp/dewpoint/mslp/precip are selected independently.
+    """
+    observations_data = db.get("observations", {})
+    station_obs = observations_data.get(station_id, {})
+    if not station_obs:
+        return None
+
+    tol = timedelta(minutes=max_delta_minutes)
+    best_temp = (None, tol + timedelta(seconds=1))
+    best_mslp = (None, tol + timedelta(seconds=1))
+    best_precip = (None, tol + timedelta(seconds=1))
+    best_dew = (None, tol + timedelta(seconds=1))
+
+    for obs_time_str, obs_data in station_obs.items():
+        try:
+            obs_time = datetime.fromisoformat(obs_time_str)
+            if obs_time.tzinfo is None:
+                obs_time = obs_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        delta = abs(obs_time - target_time)
+        if delta > tol:
+            continue
+
+        t = obs_data.get("temp")
+        if t is not None and delta < best_temp[1]:
+            best_temp = (t, delta)
+
+        p = obs_data.get("mslp")
+        if p is not None and delta < best_mslp[1]:
+            best_mslp = (p, delta)
+
+        pr = obs_data.get("precip")
+        if pr is not None and delta < best_precip[1]:
+            best_precip = (pr, delta)
+
+        d = obs_data.get("dewpoint")
+        if d is not None and delta < best_dew[1]:
+            best_dew = (d, delta)
+
+    if all(v[0] is None for v in (best_temp, best_mslp, best_precip, best_dew)):
+        return None
+
+    composite = {
+        "temp": best_temp[0],
+        "mslp": best_mslp[0],
+        "precip": best_precip[0],
+        "dewpoint": best_dew[0],
+    }
+
+    if target_time.hour % 6 == 0:
+        composite["precip_6hr"] = calculate_6hr_precip_total(db, station_id, target_time)
+    else:
+        composite["precip_6hr"] = None
+
+    if target_time.hour == 12:
+        composite["precip_24hr"] = calculate_24hr_precip_total(db, station_id, target_time)
+    else:
+        composite["precip_24hr"] = None
+
+    return composite
+
+
 def store_asos_forecasts(
     init_time: datetime,
     forecast_hours: List[int],
@@ -1358,7 +1626,8 @@ def store_asos_forecasts_batch(
 def get_verification_data(
     model: str,
     variable: str,
-    lead_time_hours: int
+    lead_time_hours: int,
+    valid_hour: Optional[int] = None
 ) -> Dict[str, dict]:
     """
     Get verification data for all stations at a specific lead time.
@@ -1384,7 +1653,12 @@ def get_verification_data(
             }
         }
     """
+    source_model = _source_model_for_verification(model)
     db = load_asos_forecasts_db()
+    if _is_kenny_bias_corrected_var(model, variable):
+        kenny_station_hour_biases, kenny_global_hour_biases = _compute_kenny_station_hour_biases(db, variable)
+    else:
+        kenny_station_hour_biases, kenny_global_hour_biases = None, None
     stations = db.get("stations", {})
     runs = db.get("runs", {})
     cumulative_by_station = db.get("cumulative_stats", {}).get("by_station", {})
@@ -1413,17 +1687,20 @@ def get_verification_data(
     station_stats = {}  # station_id -> {sum_abs_errors, sum_errors, count}
 
     # Load cumulative stats
-    for station_id in stations:
-        if station_id in cumulative_by_station:
-            model_stats = cumulative_by_station[station_id].get(model.lower(), {})
-            var_stats = model_stats.get(variable, {})
-            lt_stats = var_stats.get(lt_str)
-            if lt_stats:
-                station_stats[station_id] = {
-                    'sum_abs_errors': lt_stats.get('sum_abs_errors', 0.0),
-                    'sum_errors': lt_stats.get('sum_errors', 0.0),
-                    'count': lt_stats.get('count', 0)
-                }
+    if not _is_kenny_bias_corrected_var(model, variable):
+        for station_id in stations:
+            if station_id in cumulative_by_station:
+                model_stats = cumulative_by_station[station_id].get(source_model, {})
+                var_stats = model_stats.get(variable, {})
+                lt_stats = var_stats.get(lt_str)
+                if lt_stats:
+                    station_stats[station_id] = {
+                        'sum_abs_errors': lt_stats.get('sum_abs_errors', 0.0),
+                        'sum_errors': lt_stats.get('sum_errors', 0.0),
+                        'count': lt_stats.get('count', 0),
+                        'sum_weighted_abs_errors': lt_stats.get('sum_weighted_abs_errors', 0.0),
+                        'sum_weights': lt_stats.get('sum_weights', 0.0),
+                    }
 
     # Add fresh calculations from current runs
     for run_key, run_data in runs.items():
@@ -1435,7 +1712,7 @@ def get_verification_data(
             continue
 
         forecast_hours = run_data.get("forecast_hours", [])
-        model_data = run_data.get(model.lower())
+        model_data = run_data.get(source_model)
 
         if not model_data:
             continue
@@ -1451,6 +1728,8 @@ def get_verification_data(
         # Only include past valid times
         if valid_time >= now:
             continue
+        if valid_hour is not None and valid_time.hour != valid_hour:
+            continue
 
         # Match forecasts with stored observations
         for station_id, fcst_data in model_data.items():
@@ -1461,10 +1740,17 @@ def get_verification_data(
             fcst_values = fcst_data.get(fcst_key, [])
             if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
                 continue
-            fcst_val = fcst_values[fcst_idx]
+            fcst_val = _apply_model_value_adjustment(
+                model, variable, station_id, valid_time, fcst_values[fcst_idx],
+                kenny_station_hour_biases, kenny_global_hour_biases
+            )
 
             # Get stored observation
-            obs = get_stored_observation(db, station_id, valid_time)
+            obs = (
+                get_composite_observation(db, station_id, valid_time)
+                if _is_kenny_bias_corrected_var(model, variable)
+                else get_stored_observation(db, station_id, valid_time)
+            )
 
             if obs is None or obs.get(obs_key) is None:
                 continue
@@ -1480,11 +1766,17 @@ def get_verification_data(
                 station_stats[station_id] = {
                     'sum_abs_errors': 0.0,
                     'sum_errors': 0.0,
-                    'count': 0
+                    'count': 0,
+                    'sum_weighted_abs_errors': 0.0,
+                    'sum_weights': 0.0,
                 }
             station_stats[station_id]['sum_abs_errors'] += abs(error)
             station_stats[station_id]['sum_errors'] += error
             station_stats[station_id]['count'] += 1
+            if _is_precip_var(variable):
+                weight = _precip_weight(obs_val)
+                station_stats[station_id]['sum_weighted_abs_errors'] += abs(error) * weight
+                station_stats[station_id]['sum_weights'] += weight
 
     # Calculate final metrics per station
     results = {}
@@ -1497,10 +1789,12 @@ def get_verification_data(
 
         mae = stats['sum_abs_errors'] / stats['count']
         bias = stats['sum_errors'] / stats['count']
+        wmae = _stats_wmae(stats, fallback_mae=mae) if _is_precip_var(variable) else None
 
         results[station_id] = {
             'mae': round(mae, 2),
-            'bias': round(bias, 2),
+            'bias': _bias_corrected_metric_value(model, f"{variable}_bias", round(mae, 2), round(bias, 2)),
+            'wmae': round(wmae, 2) if wmae is not None else None,
             'count': stats['count'],
             'lat': station.get('lat'),
             'lon': station.get('lon'),
@@ -1515,13 +1809,19 @@ def get_verification_data_recent(
     model: str,
     variable: str,
     lead_time_hours: int,
-    days_back: int = 30
+    days_back: int = 30,
+    valid_hour: Optional[int] = None
 ) -> Dict[str, dict]:
     """
     Get verification data for all stations within a recent window.
     Uses run data + stored observations only (no cumulative stats).
     """
+    source_model = _source_model_for_verification(model)
     db = load_asos_forecasts_db()
+    if _is_kenny_bias_corrected_var(model, variable):
+        kenny_station_hour_biases, kenny_global_hour_biases = _compute_kenny_station_hour_biases(db, variable)
+    else:
+        kenny_station_hour_biases, kenny_global_hour_biases = None, None
     stations = db.get("stations", {})
     runs = db.get("runs", {})
 
@@ -1554,7 +1854,7 @@ def get_verification_data_recent(
             continue
 
         forecast_hours = run_data.get("forecast_hours", [])
-        model_data = run_data.get(model.lower())
+        model_data = run_data.get(source_model)
         if not model_data:
             continue
 
@@ -1565,6 +1865,8 @@ def get_verification_data_recent(
         valid_time = init_time + timedelta(hours=lead_time_hours)
         if valid_time >= now or valid_time < cutoff:
             continue
+        if valid_hour is not None and valid_time.hour != valid_hour:
+            continue
 
         for station_id, fcst_data in model_data.items():
             if station_id not in stations:
@@ -1573,9 +1875,16 @@ def get_verification_data_recent(
             fcst_values = fcst_data.get(fcst_key, [])
             if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
                 continue
-            fcst_val = fcst_values[fcst_idx]
+            fcst_val = _apply_model_value_adjustment(
+                model, variable, station_id, valid_time, fcst_values[fcst_idx],
+                kenny_station_hour_biases, kenny_global_hour_biases
+            )
 
-            obs = get_stored_observation(db, station_id, valid_time)
+            obs = (
+                get_composite_observation(db, station_id, valid_time)
+                if _is_kenny_bias_corrected_var(model, variable)
+                else get_stored_observation(db, station_id, valid_time)
+            )
             if obs is None or obs.get(obs_key) is None:
                 continue
             obs_val = obs[obs_key]
@@ -1587,11 +1896,17 @@ def get_verification_data_recent(
                 station_stats[station_id] = {
                     'sum_abs_errors': 0.0,
                     'sum_errors': 0.0,
-                    'count': 0
+                    'count': 0,
+                    'sum_weighted_abs_errors': 0.0,
+                    'sum_weights': 0.0,
                 }
             station_stats[station_id]['sum_abs_errors'] += abs(error)
             station_stats[station_id]['sum_errors'] += error
             station_stats[station_id]['count'] += 1
+            if _is_precip_var(variable):
+                weight = _precip_weight(obs_val)
+                station_stats[station_id]['sum_weighted_abs_errors'] += abs(error) * weight
+                station_stats[station_id]['sum_weights'] += weight
 
     results = {}
     for station_id, stats in station_stats.items():
@@ -1600,9 +1915,11 @@ def get_verification_data_recent(
         station = stations.get(station_id, {})
         mae = stats['sum_abs_errors'] / stats['count']
         bias = stats['sum_errors'] / stats['count']
+        wmae = _stats_wmae(stats, fallback_mae=mae) if _is_precip_var(variable) else None
         results[station_id] = {
             'mae': round(mae, 2),
-            'bias': round(bias, 2),
+            'bias': _bias_corrected_metric_value(model, f"{variable}_bias", round(mae, 2), round(bias, 2)),
+            'wmae': round(wmae, 2) if wmae is not None else None,
             'count': stats['count'],
             'lat': station.get('lat'),
             'lon': station.get('lon'),
@@ -1638,6 +1955,12 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
 
     now = datetime.now(timezone.utc)
     models = [model.lower()] if model else ['gfs', 'aifs', 'ifs', 'nws']
+    if model and model.lower() == "kenny":
+        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = _compute_kenny_station_hour_biases(db, "temp")
+        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = _compute_kenny_station_hour_biases(db, "dewpoint")
+    else:
+        kenny_temp_station_hour_biases = kenny_temp_global_hour_biases = None
+        kenny_dew_station_hour_biases = kenny_dew_global_hour_biases = None
 
     # Collect all forecast hours (from current runs and cumulative stats)
     all_forecast_hours = set()
@@ -1682,8 +2005,11 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
 
     # Start with cumulative stats
     for m in models:
-        model_cumulative = station_cumulative.get(m, {})
+        source_model = _source_model_for_verification(m)
+        model_cumulative = station_cumulative.get(source_model, {})
         for var in ['temp', 'mslp', 'precip', 'dewpoint']:
+            if _is_kenny_bias_corrected_var(m, var):
+                continue
             var_cumulative = model_cumulative.get(var, {})
             for lt_str, stats in var_cumulative.items():
                 lt = int(lt_str)
@@ -1702,9 +2028,11 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
             continue
 
         forecast_hours = run_data.get("forecast_hours", [])
+        qualifying_precip, _ = _qualifying_precip_sets(run_data, stations)
 
         for m in models:
-            model_data = run_data.get(m, {})
+            source_model = _source_model_for_verification(m)
+            model_data = run_data.get(source_model, {})
             fcst_data = model_data.get(station_id)
 
             if not fcst_data:
@@ -1716,14 +2044,18 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
                     continue
 
                 # Get stored observation
-                obs = get_stored_observation(db, station_id, valid_time)
+                obs = get_composite_observation(db, station_id, valid_time)
                 if not obs:
                     continue
 
                 # Temperature
                 fcst_temps = fcst_data.get('temps', [])
                 if i < len(fcst_temps) and fcst_temps[i] is not None and obs.get('temp') is not None:
-                    error = fcst_temps[i] - obs['temp']
+                    fcst_temp = _apply_model_value_adjustment(
+                        m, "temp", station_id, valid_time, fcst_temps[i],
+                        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases
+                    )
+                    error = fcst_temp - obs['temp']
                     stats_by_lt[lt][m]['temp']['sum_abs_errors'] += abs(error)
                     stats_by_lt[lt][m]['temp']['sum_errors'] += error
                     stats_by_lt[lt][m]['temp']['count'] += 1
@@ -1736,14 +2068,14 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
                     stats_by_lt[lt][m]['mslp']['sum_errors'] += error
                     stats_by_lt[lt][m]['mslp']['count'] += 1
 
-                # Precip (6-hour accumulated)
+                # Precip (6-hour accumulated) — union-based qualifying (same as cache)
                 fcst_precips = fcst_data.get('precips', [])
                 if i < len(fcst_precips):
                     fcst_val = fcst_precips[i]
                     obs_val = obs.get('precip_6hr')
-                    if should_include_precip(fcst_val, obs_val):
-                        if var == 'precip' and not should_include_precip(fcst_val, obs_val):
-                            continue
+                    if fcst_val is not None and obs_val is not None and (
+                        (station_id, i) in qualifying_precip or obs_val >= 0.01
+                    ):
                         error = fcst_val - obs_val
                         stats_by_lt[lt][m]['precip']['sum_abs_errors'] += abs(error)
                         stats_by_lt[lt][m]['precip']['sum_errors'] += error
@@ -1752,7 +2084,11 @@ def get_station_detail(station_id: str, model: str = None) -> dict:
                 # Dewpoint
                 fcst_dewpoints = fcst_data.get('dewpoints', [])
                 if i < len(fcst_dewpoints) and fcst_dewpoints[i] is not None and obs.get('dewpoint') is not None:
-                    error = fcst_dewpoints[i] - obs['dewpoint']
+                    fcst_dew = _apply_model_value_adjustment(
+                        m, "dewpoint", station_id, valid_time, fcst_dewpoints[i],
+                        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases
+                    )
+                    error = fcst_dew - obs['dewpoint']
                     stats_by_lt[lt][m]['dewpoint']['sum_abs_errors'] += abs(error)
                     stats_by_lt[lt][m]['dewpoint']['sum_errors'] += error
                     stats_by_lt[lt][m]['dewpoint']['count'] += 1
@@ -1793,6 +2129,43 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
 
     Returns a flat structure with lead_times, temp_mae, temp_bias, mslp_mae, mslp_bias lists.
     """
+    if (model or "").lower() == "kenny":
+        # Kenny temperature applies cycle-dependent forecast adjustment; compute directly.
+        detailed = get_station_detail(station_id, model)
+        if "data" not in detailed:
+            return {"error": "No verification data for this station"}
+        lead_times = detailed.get("lead_times", [])
+        temp_mae, temp_bias, temp_count = [], [], []
+        precip_mae, precip_bias, precip_count = [], [], []
+        dew_mae, dew_bias, dew_count = [], [], []
+        for lt in lead_times:
+            mdata = detailed.get("data", {}).get(lt, {}).get("kenny", {})
+            t = mdata.get("temp")
+            p = mdata.get("precip")
+            d = mdata.get("dewpoint")
+            temp_mae.append(t.get("mae") if t else None)
+            temp_bias.append(t.get("bias") if t else None)
+            temp_count.append(t.get("count", 0) if t else 0)
+            precip_mae.append(p.get("mae") if p else None)
+            precip_bias.append(p.get("bias") if p else None)
+            precip_count.append(p.get("count", 0) if p else 0)
+            dew_mae.append(d.get("mae") if d else None)
+            dew_bias.append(d.get("bias") if d else None)
+            dew_count.append(d.get("count", 0) if d else 0)
+        return {
+            "station": detailed.get("station", {}),
+            "lead_times": lead_times,
+            "temp_mae": temp_mae,
+            "temp_bias": temp_bias,
+            "temp_count": temp_count,
+            "precip_mae": precip_mae,
+            "precip_bias": precip_bias,
+            "precip_count": precip_count,
+            "dewpoint_mae": dew_mae,
+            "dewpoint_bias": dew_bias,
+            "dewpoint_count": dew_count,
+        }
+
     cache = load_verification_cache()
     if cache is None:
         return {"error": "Verification cache not available. Run a sync to rebuild it."}
@@ -1806,8 +2179,9 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
     if not station:
         return {"error": "Station not found"}
 
+    source_model = _source_model_for_verification(model)
     station_data = cache.get("by_station", {}).get(station_id, {})
-    model_data = station_data.get(model.lower(), {})
+    model_data = station_data.get(source_model, {})
 
     if not model_data:
         return {"error": "No verification data for this station"}
@@ -1831,17 +2205,17 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
 
         temp = lt_data.get('temp')
         temp_mae.append(temp['mae'] if temp else None)
-        temp_bias.append(temp['bias'] if temp else None)
+        temp_bias.append(_bias_corrected_metric_value(model, "temp_bias", temp['mae'] if temp else None, temp['bias'] if temp else None) if temp else None)
         temp_count.append(temp['count'] if temp else 0)
 
         precip = lt_data.get('precip')
         precip_mae.append(precip['mae'] if precip else None)
-        precip_bias.append(precip['bias'] if precip else None)
+        precip_bias.append(_bias_corrected_metric_value(model, "precip_bias", precip['mae'] if precip else None, precip['bias'] if precip else None) if precip else None)
         precip_count.append(precip['count'] if precip else 0)
 
         dewpoint = lt_data.get('dewpoint')
         dewpoint_mae.append(dewpoint['mae'] if dewpoint else None)
-        dewpoint_bias.append(dewpoint['bias'] if dewpoint else None)
+        dewpoint_bias.append(_bias_corrected_metric_value(model, "dewpoint_bias", dewpoint['mae'] if dewpoint else None, dewpoint['bias'] if dewpoint else None) if dewpoint else None)
         dewpoint_count.append(dewpoint['count'] if dewpoint else 0)
 
     return {
@@ -1927,7 +2301,12 @@ def get_verification_time_series(
             "counts": [150, 145, ...]
         }
     """
+    source_model = _source_model_for_verification(model)
     db = load_asos_forecasts_db()
+    if _is_kenny_bias_corrected_var(model, variable):
+        kenny_station_hour_biases, kenny_global_hour_biases = _compute_kenny_station_hour_biases(db, variable)
+    else:
+        kenny_station_hour_biases, kenny_global_hour_biases = None, None
     stations = db.get("stations", {})
     runs = db.get("runs", {})
 
@@ -1981,10 +2360,16 @@ def get_verification_time_series(
         date_key = valid_time.date().isoformat()
 
         if date_key not in errors_by_date:
-            errors_by_date[date_key] = []
+            errors_by_date[date_key] = {
+                "sum_abs_errors": 0.0,
+                "sum_errors": 0.0,
+                "count": 0,
+                "sum_weighted_abs_errors": 0.0,
+                "sum_weights": 0.0,
+            }
 
         # Get model data
-        model_data = run_data.get(model.lower())
+        model_data = run_data.get(source_model)
         if not model_data:
             continue
 
@@ -1997,7 +2382,10 @@ def get_verification_time_series(
             if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
                 continue
 
-            fcst_val = fcst_values[fcst_idx]
+            fcst_val = _apply_model_value_adjustment(
+                model, variable, station_id, valid_time, fcst_values[fcst_idx],
+                kenny_station_hour_biases, kenny_global_hour_biases
+            )
 
             # Get observation
             obs = get_stored_observation(db, station_id, valid_time)
@@ -2005,37 +2393,59 @@ def get_verification_time_series(
                 continue
 
             obs_val = obs[obs_key]
+            if variable == 'precip' and not should_include_precip(fcst_val, obs_val):
+                continue
+            if variable == 'precip_24hr' and not should_include_precip(fcst_val, obs_val):
+                continue
             error = fcst_val - obs_val
-            errors_by_date[date_key].append(error)
+            stats = errors_by_date[date_key]
+            stats["sum_abs_errors"] += abs(error)
+            stats["sum_errors"] += error
+            stats["count"] += 1
+            if _is_precip_var(variable):
+                weight = _precip_weight(obs_val)
+                stats["sum_weighted_abs_errors"] += abs(error) * weight
+                stats["sum_weights"] += weight
 
     # Calculate daily MAE and Bias
     dates = sorted(errors_by_date.keys())
     daily_mae = []
+    daily_wmae = []
     daily_bias = []
     daily_counts = []
 
     for date in dates:
-        errors = errors_by_date[date]
-        if errors:
-            mae = sum(abs(e) for e in errors) / len(errors)
-            bias = sum(errors) / len(errors)
+        stats = errors_by_date[date]
+        count = stats.get("count", 0)
+        if count > 0:
+            mae = stats["sum_abs_errors"] / count
+            bias = stats["sum_errors"] / count
+            wmae = _stats_wmae(stats, fallback_mae=mae) if _is_precip_var(variable) else None
             daily_mae.append(mae)
+            daily_wmae.append(wmae)
             daily_bias.append(bias)
-            daily_counts.append(len(errors))
+            daily_counts.append(count)
         else:
             daily_mae.append(None)
+            daily_wmae.append(None)
             daily_bias.append(None)
             daily_counts.append(0)
 
-    return {
+    result = {
         "dates": dates,
         "mae": [round(m, 2) if m is not None else None for m in daily_mae],
+        "wmae": [round(m, 2) if m is not None else None for m in daily_wmae],
         "bias": [round(b, 2) if b is not None else None for b in daily_bias],
         "counts": daily_counts
     }
+    return result
 
 
-def get_mean_verification_by_lead_time(model: str) -> dict:
+def get_mean_verification_by_lead_time(
+    model: str,
+    valid_hour: Optional[int] = None,
+    days_back: Optional[int] = None
+) -> dict:
     """
     Get mean verification (MAE and Bias) across all stations by lead time for a given model.
 
@@ -2056,7 +2466,14 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
         }
     """
     try:
+        source_model = _source_model_for_verification(model)
         db = load_asos_forecasts_db()
+        if _is_kenny_bias_corrected_var(model, "temp"):
+            kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = _compute_kenny_station_hour_biases(db, "temp")
+            kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = _compute_kenny_station_hour_biases(db, "dewpoint")
+        else:
+            kenny_temp_station_hour_biases = kenny_temp_global_hour_biases = None
+            kenny_dew_station_hour_biases = kenny_dew_global_hour_biases = None
         stations = db.get("stations", {})
         runs = db.get("runs", {})
         cumulative_by_lead_time = db.get("cumulative_stats", {}).get("by_lead_time", {})
@@ -2065,6 +2482,7 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             raise ValueError("No ASOS stations available.")
 
         now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=days_back)) if days_back is not None else None
 
         # Collect all forecast hours (from current runs and cumulative stats)
         all_forecast_hours = set()
@@ -2072,7 +2490,7 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             all_forecast_hours.update(run_data.get("forecast_hours", []))
 
         # Also include lead times from cumulative stats
-        model_cumulative = cumulative_by_lead_time.get(model.lower(), {})
+        model_cumulative = cumulative_by_lead_time.get(source_model, {})
         for var in ['temp', 'mslp', 'precip', 'dewpoint']:
             var_stats = model_cumulative.get(var, {})
             all_forecast_hours.update(int(lt) for lt in var_stats.keys())
@@ -2092,15 +2510,18 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             lt: {
                 'temp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
                 'mslp': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
-                'precip': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
-                'precip_24hr': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
+                'precip': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0, 'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0},
+                'precip_24hr': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0, 'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0},
                 'dewpoint': {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0},
             }
             for lt in lead_times
         }
 
         # Start with cumulative stats
+        include_cumulative = (valid_hour is None and cutoff is None)
         for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+            if _is_kenny_bias_corrected_var(model, var) or not include_cumulative:
+                continue
             var_cumulative = model_cumulative.get(var, {})
             for lt_str, stats in var_cumulative.items():
                 lt = int(lt_str)
@@ -2108,6 +2529,9 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
                     aggregated_stats[lt][var]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
                     aggregated_stats[lt][var]['sum_errors'] += stats.get('sum_errors', 0.0)
                     aggregated_stats[lt][var]['count'] += stats.get('count', 0)
+                    if _is_precip_var(var):
+                        aggregated_stats[lt][var]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
+                        aggregated_stats[lt][var]['sum_weights'] += stats.get('sum_weights', 0.0)
 
         # Add fresh calculations from current runs
         for run_key, run_data in runs.items():
@@ -2119,10 +2543,12 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
                 continue
 
             forecast_hours = run_data.get("forecast_hours", [])
-            model_data = run_data.get(model.lower())
+            model_data = run_data.get(source_model)
 
             if not model_data:
                 continue
+
+            qualifying_precip, qualifying_precip_24hr = _qualifying_precip_sets(run_data, stations)
 
             for station_id, fcst_data in model_data.items():
                 if station_id not in stations:
@@ -2132,15 +2558,23 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
                     valid_time = init_time + timedelta(hours=lt)
                     if valid_time >= now:
                         continue
+                    if cutoff is not None and valid_time < cutoff:
+                        continue
+                    if valid_hour is not None and valid_time.hour != valid_hour:
+                        continue
 
-                    obs = get_cached_observation(station_id, valid_time)
+                    obs = get_composite_observation(db, station_id, valid_time)
                     if not obs:
                         continue
 
                     # Temperature
                     fcst_temps = fcst_data.get('temps', [])
                     if i < len(fcst_temps) and fcst_temps[i] is not None and obs.get('temp') is not None:
-                        error = fcst_temps[i] - obs['temp']
+                        fcst_temp = _apply_model_value_adjustment(
+                            model, "temp", station_id, valid_time, fcst_temps[i],
+                            kenny_temp_station_hour_biases, kenny_temp_global_hour_biases
+                        )
+                        error = fcst_temp - obs['temp']
                         aggregated_stats[lt]['temp']['sum_abs_errors'] += abs(error)
                         aggregated_stats[lt]['temp']['sum_errors'] += error
                         aggregated_stats[lt]['temp']['count'] += 1
@@ -2153,32 +2587,46 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
                         aggregated_stats[lt]['mslp']['sum_errors'] += error
                         aggregated_stats[lt]['mslp']['count'] += 1
 
-                    # Precipitation (6-hour accumulated)
+                    # Precipitation (6-hour accumulated) — union-based qualifying (same as cache)
                     fcst_precips = fcst_data.get('precips', [])
                     if i < len(fcst_precips):
                         fcst_val = fcst_precips[i]
                         obs_val = obs.get('precip_6hr')
-                        if should_include_precip(fcst_val, obs_val):
+                        if fcst_val is not None and obs_val is not None and (
+                            (station_id, i) in qualifying_precip or obs_val >= 0.01
+                        ):
                             error = fcst_val - obs_val
                             aggregated_stats[lt]['precip']['sum_abs_errors'] += abs(error)
                             aggregated_stats[lt]['precip']['sum_errors'] += error
                             aggregated_stats[lt]['precip']['count'] += 1
+                            weight = _precip_weight(obs_val)
+                            aggregated_stats[lt]['precip']['sum_weighted_abs_errors'] += abs(error) * weight
+                            aggregated_stats[lt]['precip']['sum_weights'] += weight
 
-                    # Precipitation (24-hour accumulated)
+                    # Precipitation (24-hour accumulated) — union-based qualifying (same as cache)
                     fcst_precips_24hr = fcst_data.get('precips_24hr', [])
                     if i < len(fcst_precips_24hr):
                         fcst_val = fcst_precips_24hr[i]
                         obs_val = obs.get('precip_24hr')
-                        if should_include_precip(fcst_val, obs_val):
+                        if fcst_val is not None and obs_val is not None and (
+                            (station_id, i) in qualifying_precip_24hr or obs_val >= 0.01
+                        ):
                             error = fcst_val - obs_val
                             aggregated_stats[lt]['precip_24hr']['sum_abs_errors'] += abs(error)
                             aggregated_stats[lt]['precip_24hr']['sum_errors'] += error
                             aggregated_stats[lt]['precip_24hr']['count'] += 1
+                            weight = _precip_weight(obs_val)
+                            aggregated_stats[lt]['precip_24hr']['sum_weighted_abs_errors'] += abs(error) * weight
+                            aggregated_stats[lt]['precip_24hr']['sum_weights'] += weight
 
                     # Dewpoint
                     fcst_dewpoints = fcst_data.get('dewpoints', [])
                     if i < len(fcst_dewpoints) and fcst_dewpoints[i] is not None and obs.get('dewpoint') is not None:
-                        error = fcst_dewpoints[i] - obs['dewpoint']
+                        fcst_dew = _apply_model_value_adjustment(
+                            model, "dewpoint", station_id, valid_time, fcst_dewpoints[i],
+                            kenny_dew_station_hour_biases, kenny_dew_global_hour_biases
+                        )
+                        error = fcst_dew - obs['dewpoint']
                         aggregated_stats[lt]['dewpoint']['sum_abs_errors'] += abs(error)
                         aggregated_stats[lt]['dewpoint']['sum_errors'] += error
                         aggregated_stats[lt]['dewpoint']['count'] += 1
@@ -2192,8 +2640,10 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             "mslp_bias": [],
             "precip_mae": [],
             "precip_bias": [],
+            "precip_wmae": [],
             "precip_24hr_mae": [],
             "precip_24hr_bias": [],
+            "precip_24hr_wmae": [],
             "dewpoint_mae": [],
             "dewpoint_bias": [],
         }
@@ -2203,7 +2653,7 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             temp_stats = aggregated_stats[lt]['temp']
             if temp_stats['count'] > 0:
                 result["temp_mae"].append(round(temp_stats['sum_abs_errors'] / temp_stats['count'], 2))
-                result["temp_bias"].append(round(temp_stats['sum_errors'] / temp_stats['count'], 2))
+                result["temp_bias"].append(_bias_corrected_metric_value(model, "temp_bias", round(temp_stats['sum_abs_errors'] / temp_stats['count'], 2), round(temp_stats['sum_errors'] / temp_stats['count'], 2)))
             else:
                 result["temp_mae"].append(None)
                 result["temp_bias"].append(None)
@@ -2212,7 +2662,7 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             mslp_stats = aggregated_stats[lt]['mslp']
             if mslp_stats['count'] > 0:
                 result["mslp_mae"].append(round(mslp_stats['sum_abs_errors'] / mslp_stats['count'], 2))
-                result["mslp_bias"].append(round(mslp_stats['sum_errors'] / mslp_stats['count'], 2))
+                result["mslp_bias"].append(_bias_corrected_metric_value(model, "mslp_bias", round(mslp_stats['sum_abs_errors'] / mslp_stats['count'], 2), round(mslp_stats['sum_errors'] / mslp_stats['count'], 2)))
             else:
                 result["mslp_mae"].append(None)
                 result["mslp_bias"].append(None)
@@ -2220,26 +2670,32 @@ def get_mean_verification_by_lead_time(model: str) -> dict:
             # Precipitation (6-hour)
             precip_stats = aggregated_stats[lt]['precip']
             if precip_stats['count'] > 0:
-                result["precip_mae"].append(round(precip_stats['sum_abs_errors'] / precip_stats['count'], 2))
-                result["precip_bias"].append(round(precip_stats['sum_errors'] / precip_stats['count'], 2))
+                precip_mae = precip_stats['sum_abs_errors'] / precip_stats['count']
+                result["precip_mae"].append(round(precip_mae, 2))
+                result["precip_bias"].append(_bias_corrected_metric_value(model, "precip_bias", round(precip_mae, 2), round(precip_stats['sum_errors'] / precip_stats['count'], 2)))
+                result["precip_wmae"].append(round(_stats_wmae(precip_stats, fallback_mae=precip_mae), 2))
             else:
                 result["precip_mae"].append(None)
                 result["precip_bias"].append(None)
+                result["precip_wmae"].append(None)
 
             # Precipitation (24-hour)
             p24_stats = aggregated_stats[lt]['precip_24hr']
             if p24_stats['count'] > 0:
-                result["precip_24hr_mae"].append(round(p24_stats['sum_abs_errors'] / p24_stats['count'], 2))
-                result["precip_24hr_bias"].append(round(p24_stats['sum_errors'] / p24_stats['count'], 2))
+                p24_mae = p24_stats['sum_abs_errors'] / p24_stats['count']
+                result["precip_24hr_mae"].append(round(p24_mae, 2))
+                result["precip_24hr_bias"].append(_bias_corrected_metric_value(model, "precip_24hr_bias", round(p24_mae, 2), round(p24_stats['sum_errors'] / p24_stats['count'], 2)))
+                result["precip_24hr_wmae"].append(round(_stats_wmae(p24_stats, fallback_mae=p24_mae), 2))
             else:
                 result["precip_24hr_mae"].append(None)
                 result["precip_24hr_bias"].append(None)
+                result["precip_24hr_wmae"].append(None)
 
             # Dewpoint
             dewpoint_stats = aggregated_stats[lt]['dewpoint']
             if dewpoint_stats['count'] > 0:
                 result["dewpoint_mae"].append(round(dewpoint_stats['sum_abs_errors'] / dewpoint_stats['count'], 2))
-                result["dewpoint_bias"].append(round(dewpoint_stats['sum_errors'] / dewpoint_stats['count'], 2))
+                result["dewpoint_bias"].append(_bias_corrected_metric_value(model, "dewpoint_bias", round(dewpoint_stats['sum_abs_errors'] / dewpoint_stats['count'], 2), round(dewpoint_stats['sum_errors'] / dewpoint_stats['count'], 2)))
             else:
                 result["dewpoint_mae"].append(None)
                 result["dewpoint_bias"].append(None)
@@ -2667,14 +3123,18 @@ def precompute_verification_cache() -> dict:
                 aggregated_stats[model][var][lt_str] = {
                     'sum_abs_errors': 0.0,
                     'sum_errors': 0.0,
-                    'count': 0
+                    'count': 0,
+                    'sum_weighted_abs_errors': 0.0,
+                    'sum_weights': 0.0,
                 }
                 hourly_aggregated_stats[model][var][lt_str] = {}
                 for station_id in stations:
                     station_stats[station_id][model][var][lt_str] = {
                         'sum_abs_errors': 0.0,
                         'sum_errors': 0.0,
-                        'count': 0
+                        'count': 0,
+                        'sum_weighted_abs_errors': 0.0,
+                        'sum_weights': 0.0,
                     }
 
     logger.info(f"Loading cumulative stats for {len(stations)} stations...")
@@ -2691,6 +3151,8 @@ def precompute_verification_cache() -> dict:
                             station_stats[station_id][model][var][lt_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
                             station_stats[station_id][model][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
                             station_stats[station_id][model][var][lt_str]['count'] += stats.get('count', 0)
+                            station_stats[station_id][model][var][lt_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
+                            station_stats[station_id][model][var][lt_str]['sum_weights'] += stats.get('sum_weights', 0.0)
 
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_cumulative = cumulative_by_lead_time.get(model, {})
@@ -2701,6 +3163,8 @@ def precompute_verification_cache() -> dict:
                     aggregated_stats[model][var][lt_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
                     aggregated_stats[model][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
                     aggregated_stats[model][var][lt_str]['count'] += stats.get('count', 0)
+                    aggregated_stats[model][var][lt_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
+                    aggregated_stats[model][var][lt_str]['sum_weights'] += stats.get('sum_weights', 0.0)
 
     # Load cumulative hourly breakdown (snap any non-canonical LT to nearest canonical)
     cumulative_by_lt_by_vh = db.get("cumulative_stats", {}).get("by_lead_time_by_valid_hour", {})
@@ -2716,11 +3180,14 @@ def precompute_verification_cache() -> dict:
                 for vh_str, stats in vh_data.items():
                     if vh_str not in hourly_aggregated_stats[model][var][snapped_lt_str]:
                         hourly_aggregated_stats[model][var][snapped_lt_str][vh_str] = {
-                            'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0
+                            'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                            'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0
                         }
                     hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
                     hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_errors'] += stats.get('sum_errors', 0.0)
                     hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['count'] += stats.get('count', 0)
+                    hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
+                    hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_weights'] += stats.get('sum_weights', 0.0)
 
     fresh_run_count = sum(1 for k in runs if k not in accumulated_run_keys)
     logger.info(f"Computing fresh stats from {fresh_run_count} current runs (skipping {len(accumulated_run_keys)} accumulated)...")
@@ -2793,20 +3260,33 @@ def precompute_verification_cache() -> dict:
                             station_stats[station_id][model][var][lt_str]['sum_abs_errors'] += abs_error
                             station_stats[station_id][model][var][lt_str]['sum_errors'] += error
                             station_stats[station_id][model][var][lt_str]['count'] += 1
+                            if _is_precip_var(var):
+                                weight = _precip_weight(obs_val)
+                                station_stats[station_id][model][var][lt_str]['sum_weighted_abs_errors'] += abs_error * weight
+                                station_stats[station_id][model][var][lt_str]['sum_weights'] += weight
 
                             aggregated_stats[model][var][lt_str]['sum_abs_errors'] += abs_error
                             aggregated_stats[model][var][lt_str]['sum_errors'] += error
                             aggregated_stats[model][var][lt_str]['count'] += 1
+                            if _is_precip_var(var):
+                                weight = _precip_weight(obs_val)
+                                aggregated_stats[model][var][lt_str]['sum_weighted_abs_errors'] += abs_error * weight
+                                aggregated_stats[model][var][lt_str]['sum_weights'] += weight
 
                         # Update hourly aggregated stats for all lead times, snapped to nearest canonical
                         vh_str = str(valid_time.hour)
                         if vh_str not in hourly_aggregated_stats[model][var][snapped_lt_str]:
                             hourly_aggregated_stats[model][var][snapped_lt_str][vh_str] = {
-                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0
                             }
                         hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_abs_errors'] += abs_error
                         hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_errors'] += error
                         hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['count'] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_weighted_abs_errors'] += abs_error * weight
+                            hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_weights'] += weight
 
                         # Update per-station hourly stats (for by_station_by_valid_hour in cache)
                         s_h_station = (station_hourly_stats
@@ -2815,10 +3295,17 @@ def precompute_verification_cache() -> dict:
                                        .setdefault(var, {})
                                        .setdefault(snapped_lt_str, {}))
                         if vh_str not in s_h_station:
-                            s_h_station[vh_str] = {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+                            s_h_station[vh_str] = {
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0
+                            }
                         s_h_station[vh_str]['sum_abs_errors'] += abs_error
                         s_h_station[vh_str]['sum_errors'] += error
                         s_h_station[vh_str]['count'] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            s_h_station[vh_str]['sum_weighted_abs_errors'] += abs_error * weight
+                            s_h_station[vh_str]['sum_weights'] += weight
 
     logger.info("Finalizing cache data...")
 
@@ -2837,10 +3324,16 @@ def precompute_verification_cache() -> dict:
                 for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
                     stats = station_stats[station_id][model][var][lt_str]
                     if stats['count'] > 0:
-                        cache_data["by_station"][station_id][model][lt_str][var] = {
-                            'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                        mae = stats['sum_abs_errors'] / stats['count']
+                        entry = {
+                            'mae': round(mae, 2),
                             'bias': round(stats['sum_errors'] / stats['count'], 2),
                             'count': stats['count']
+                        }
+                        if _is_precip_var(var):
+                            entry['wmae'] = round(_stats_wmae(stats, fallback_mae=mae), 2)
+                        cache_data["by_station"][station_id][model][lt_str][var] = {
+                            **entry
                         }
                     else:
                         cache_data["by_station"][station_id][model][lt_str][var] = None
@@ -2854,14 +3347,21 @@ def precompute_verification_cache() -> dict:
             for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
                 stats = aggregated_stats[model][var][lt_str]
                 if stats['count'] > 0:
-                    cache_data["by_lead_time"][model][lt_str][var] = {
-                        'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                    mae = stats['sum_abs_errors'] / stats['count']
+                    entry = {
+                        'mae': round(mae, 2),
                         'bias': round(stats['sum_errors'] / stats['count'], 2)
+                    }
+                    if _is_precip_var(var):
+                        entry['wmae'] = round(_stats_wmae(stats, fallback_mae=mae), 2)
+                    cache_data["by_lead_time"][model][lt_str][var] = {
+                        **entry
                     }
                 else:
                     cache_data["by_lead_time"][model][lt_str][var] = {
                         'mae': None,
-                        'bias': None
+                        'bias': None,
+                        **({'wmae': None} if _is_precip_var(var) else {}),
                     }
 
     # Convert hourly_aggregated_stats to final format
@@ -2877,12 +3377,18 @@ def precompute_verification_cache() -> dict:
                         cache_data["by_lead_time_by_valid_hour"][model][lt_str][vh_str] = {}
                     entry = cache_data["by_lead_time_by_valid_hour"][model][lt_str][vh_str]
                     if stats['count'] > 0:
-                        entry[var] = {
-                            'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                        mae = stats['sum_abs_errors'] / stats['count']
+                        var_entry = {
+                            'mae': round(mae, 2),
                             'bias': round(stats['sum_errors'] / stats['count'], 2)
                         }
+                        if _is_precip_var(var):
+                            var_entry['wmae'] = round(_stats_wmae(stats, fallback_mae=mae), 2)
+                        entry[var] = {
+                            **var_entry
+                        }
                     else:
-                        entry[var] = {'mae': None, 'bias': None}
+                        entry[var] = {'mae': None, 'bias': None, **({'wmae': None} if _is_precip_var(var) else {})}
 
     # Convert station_hourly_stats to final format - by_station_by_valid_hour
     # (covers fresh/non-accumulated runs; grows over time as runs remain unaccumulated)
@@ -2898,10 +3404,16 @@ def precompute_verification_cache() -> dict:
                                      .setdefault(model, {})
                                      .setdefault(lt_str, {})
                                      .setdefault(vh_str, {}))
-                            entry[var] = {
-                                'mae': round(stats['sum_abs_errors'] / stats['count'], 2),
+                            mae = stats['sum_abs_errors'] / stats['count']
+                            var_entry = {
+                                'mae': round(mae, 2),
                                 'bias': round(stats['sum_errors'] / stats['count'], 2),
                                 'count': stats['count']
+                            }
+                            if _is_precip_var(var):
+                                var_entry['wmae'] = round(_stats_wmae(stats, fallback_mae=mae), 2)
+                            entry[var] = {
+                                **var_entry
                             }
 
     # Add time series data to cache
@@ -2988,7 +3500,7 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
         'dewpoint': ('dewpoints', 'dewpoint'),
     }
 
-    # Structure: time_series[model][var][lt][date] = [errors]
+    # Structure: time_series[model][var][lt][date] = daily stats dict
     time_series = {
         'gfs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
@@ -3011,8 +3523,27 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
             for lt_str, date_errors in var_cumulative.items():
                 lt = int(lt_str)
                 if lt in lead_times:
-                    # Copy the historical date->errors mapping
-                    time_series[model][var][lt] = dict(date_errors)
+                    merged = {}
+                    for date_key, payload in date_errors.items():
+                        if isinstance(payload, dict):
+                            merged[date_key] = {
+                                "sum_abs_errors": float(payload.get("sum_abs_errors", 0.0)),
+                                "sum_errors": float(payload.get("sum_errors", 0.0)),
+                                "count": int(payload.get("count", 0)),
+                                "sum_weighted_abs_errors": float(payload.get("sum_weighted_abs_errors", 0.0)),
+                                "sum_weights": float(payload.get("sum_weights", 0.0)),
+                            }
+                        else:
+                            # Backward-compatible path for older caches that stored per-day error lists.
+                            errs = payload if isinstance(payload, list) else []
+                            merged[date_key] = {
+                                "sum_abs_errors": float(sum(abs(e) for e in errs)),
+                                "sum_errors": float(sum(errs)),
+                                "count": len(errs),
+                                "sum_weighted_abs_errors": 0.0,
+                                "sum_weights": 0.0,
+                            }
+                    time_series[model][var][lt] = merged
 
     # Collect errors by date from current runs (skip mature runs already in cumulative)
     for run_key, run_data in runs.items():
@@ -3081,10 +3612,23 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
                             continue
                         error = fcst_val - obs_val
 
-                        # Store error by date (append to any existing cumulative data)
+                        # Store daily aggregated stats (merging with cumulative historical data)
                         if date_key not in time_series[model][var][lt]:
-                            time_series[model][var][lt][date_key] = []
-                        time_series[model][var][lt][date_key].append(error)
+                            time_series[model][var][lt][date_key] = {
+                                "sum_abs_errors": 0.0,
+                                "sum_errors": 0.0,
+                                "count": 0,
+                                "sum_weighted_abs_errors": 0.0,
+                                "sum_weights": 0.0,
+                            }
+                        daily = time_series[model][var][lt][date_key]
+                        daily["sum_abs_errors"] += abs(error)
+                        daily["sum_errors"] += error
+                        daily["count"] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            daily["sum_weighted_abs_errors"] += abs(error) * weight
+                            daily["sum_weights"] += weight
 
     # Convert to final format with MAE/bias per day
     result = {
@@ -3104,25 +3648,33 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
 
                 dates = sorted(errors_by_date.keys())
                 daily_mae = []
+                daily_wmae = []
                 daily_bias = []
                 daily_counts = []
 
                 for date in dates:
-                    errors = errors_by_date[date]
-                    if errors:
-                        mae = sum(abs(e) for e in errors) / len(errors)
-                        bias = sum(errors) / len(errors)
+                    stats = errors_by_date[date]
+                    count = int(stats.get("count", 0)) if isinstance(stats, dict) else 0
+                    if count > 0:
+                        mae = stats["sum_abs_errors"] / count
+                        bias = stats["sum_errors"] / count
+                        wmae = None
+                        if _is_precip_var(var):
+                            wmae = _stats_wmae(stats, fallback_mae=mae)
                         daily_mae.append(round(mae, 2))
+                        daily_wmae.append(round(wmae, 2) if wmae is not None else None)
                         daily_bias.append(round(bias, 2))
-                        daily_counts.append(len(errors))
+                        daily_counts.append(count)
                     else:
                         daily_mae.append(None)
+                        daily_wmae.append(None)
                         daily_bias.append(None)
                         daily_counts.append(0)
 
                 result[model][var][lt] = {
                     'dates': dates,
                     'mae': daily_mae,
+                    'wmae': daily_wmae,
                     'bias': daily_bias,
                     'counts': daily_counts
                 }
@@ -3134,6 +3686,131 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
     """
     Get detailed verification for a single station using the monthly cache.
     """
+    if (model or "").lower() == "kenny":
+        db = load_asos_forecasts_db()
+        station = db.get("stations", {}).get(station_id)
+        if not station:
+            return {"error": "Station not found"}
+
+        runs = db.get("runs", {})
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=days_back)
+        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases = _compute_kenny_station_hour_biases(db, "temp")
+        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases = _compute_kenny_station_hour_biases(db, "dewpoint")
+
+        lead_times_set = set()
+        for run_data in runs.values():
+            lead_times_set.update(run_data.get("forecast_hours", []))
+        lead_times = sorted(int(lt) for lt in lead_times_set)
+        if not lead_times:
+            return {"error": "No monthly data for this station"}
+
+        stats = {
+            lt: {
+                "temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "precip": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "dewpoint": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+            }
+            for lt in lead_times
+        }
+
+        for run_key, run_data in runs.items():
+            try:
+                init_time = datetime.fromisoformat(run_key)
+                if init_time.tzinfo is None:
+                    init_time = init_time.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            forecast_hours = run_data.get("forecast_hours", [])
+            fcst_data = (run_data.get("aifs") or {}).get(station_id)
+            if not fcst_data:
+                continue
+
+            for i, lt in enumerate(forecast_hours):
+                lt = int(lt)
+                valid_time = init_time + timedelta(hours=lt)
+                if valid_time >= now or valid_time < cutoff or lt not in stats:
+                    continue
+
+                obs = get_stored_observation(db, station_id, valid_time)
+                if not obs:
+                    continue
+
+                temps = fcst_data.get("temps", [])
+                if i < len(temps) and temps[i] is not None and obs.get("temp") is not None:
+                    fcst_temp = _apply_model_value_adjustment(
+                        "kenny", "temp", station_id, valid_time, temps[i],
+                        kenny_temp_station_hour_biases, kenny_temp_global_hour_biases
+                    )
+                    err = fcst_temp - obs["temp"]
+                    stats[lt]["temp"]["sum_abs"] += abs(err)
+                    stats[lt]["temp"]["sum"] += err
+                    stats[lt]["temp"]["count"] += 1
+
+                mslps = fcst_data.get("mslps", [])
+                if i < len(mslps) and mslps[i] is not None and obs.get("mslp") is not None:
+                    err = mslps[i] - obs["mslp"]
+                    stats[lt]["mslp"]["sum_abs"] += abs(err)
+                    stats[lt]["mslp"]["sum"] += err
+                    stats[lt]["mslp"]["count"] += 1
+
+                precips = fcst_data.get("precips", [])
+                if i < len(precips):
+                    fv = precips[i]
+                    ov = obs.get("precip_6hr")
+                    if should_include_precip(fv, ov):
+                        err = fv - ov
+                        stats[lt]["precip"]["sum_abs"] += abs(err)
+                        stats[lt]["precip"]["sum"] += err
+                        stats[lt]["precip"]["count"] += 1
+
+                dewpoints = fcst_data.get("dewpoints", [])
+                if i < len(dewpoints) and dewpoints[i] is not None and obs.get("dewpoint") is not None:
+                    fcst_dew = _apply_model_value_adjustment(
+                        "kenny", "dewpoint", station_id, valid_time, dewpoints[i],
+                        kenny_dew_station_hour_biases, kenny_dew_global_hour_biases
+                    )
+                    err = fcst_dew - obs["dewpoint"]
+                    stats[lt]["dewpoint"]["sum_abs"] += abs(err)
+                    stats[lt]["dewpoint"]["sum"] += err
+                    stats[lt]["dewpoint"]["count"] += 1
+
+        temp_mae, temp_bias = [], []
+        mslp_mae, mslp_bias = [], []
+        precip_mae, precip_bias = [], []
+        dewpoint_mae, dewpoint_bias = [], []
+
+        for lt in lead_times:
+            for var, mae_out, bias_out in [
+                ("temp", temp_mae, temp_bias),
+                ("mslp", mslp_mae, mslp_bias),
+                ("precip", precip_mae, precip_bias),
+                ("dewpoint", dewpoint_mae, dewpoint_bias),
+            ]:
+                c = stats[lt][var]["count"]
+                if c > 0:
+                    mae_out.append(round(stats[lt][var]["sum_abs"] / c, 2))
+                    bias_out.append(round(stats[lt][var]["sum"] / c, 2))
+                else:
+                    mae_out.append(None)
+                    bias_out.append(None)
+
+        return {
+            "station": station,
+            "lead_times": lead_times,
+            "temp_mae": temp_mae,
+            "temp_bias": temp_bias,
+            "mslp_mae": mslp_mae,
+            "mslp_bias": mslp_bias,
+            "precip_mae": precip_mae,
+            "precip_bias": precip_bias,
+            "dewpoint_mae": dewpoint_mae,
+            "dewpoint_bias": dewpoint_bias,
+            "period_days": days_back
+        }
+
     monthly = load_monthly_stats_cache().get("by_station_monthly", {})
     db = load_asos_forecasts_db()
 
@@ -3141,7 +3818,8 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
     if not station:
         return {"error": "Station not found"}
 
-    model_data = monthly.get(station_id, {}).get(model, {})
+    source_model = _source_model_for_verification(model)
+    model_data = monthly.get(station_id, {}).get(source_model, {})
     if not model_data:
         return {"error": "No monthly data for this station"}
 
@@ -3169,7 +3847,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
         if temp_stats and temp_stats.get("count", 0) > 0:
             count = temp_stats["count"]
             temp_mae.append(round(temp_stats["sum_abs_errors"] / count, 2))
-            temp_bias.append(round(temp_stats["sum_errors"] / count, 2))
+            temp_bias.append(_bias_corrected_metric_value(model, "temp_bias", temp_mae[-1], round(temp_stats["sum_errors"] / count, 2)))
         else:
             temp_mae.append(None)
             temp_bias.append(None)
@@ -3178,7 +3856,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
         if mslp_stats and mslp_stats.get("count", 0) > 0:
             count = mslp_stats["count"]
             mslp_mae.append(round(mslp_stats["sum_abs_errors"] / count, 2))
-            mslp_bias.append(round(mslp_stats["sum_errors"] / count, 2))
+            mslp_bias.append(_bias_corrected_metric_value(model, "mslp_bias", mslp_mae[-1], round(mslp_stats["sum_errors"] / count, 2)))
         else:
             mslp_mae.append(None)
             mslp_bias.append(None)
@@ -3187,7 +3865,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
         if precip_stats and precip_stats.get("count", 0) > 0:
             count = precip_stats["count"]
             precip_mae.append(round(precip_stats["sum_abs_errors"] / count, 2))
-            precip_bias.append(round(precip_stats["sum_errors"] / count, 2))
+            precip_bias.append(_bias_corrected_metric_value(model, "precip_bias", precip_mae[-1], round(precip_stats["sum_errors"] / count, 2)))
         else:
             precip_mae.append(None)
             precip_bias.append(None)
@@ -3196,7 +3874,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
         if dewpoint_stats and dewpoint_stats.get("count", 0) > 0:
             count = dewpoint_stats["count"]
             dewpoint_mae.append(round(dewpoint_stats["sum_abs_errors"] / count, 2))
-            dewpoint_bias.append(round(dewpoint_stats["sum_errors"] / count, 2))
+            dewpoint_bias.append(_bias_corrected_metric_value(model, "dewpoint_bias", dewpoint_mae[-1], round(dewpoint_stats["sum_errors"] / count, 2)))
         else:
             dewpoint_mae.append(None)
             dewpoint_bias.append(None)
@@ -3250,8 +3928,9 @@ def get_run_counts_by_lead_time(model: str, period: str = "all", valid_hour: Opt
                 best = verification_lead_times[lo - 1]
         return best
 
+    source_model = _source_model_for_verification(model)
     counts_by_lt: dict[int, int] = {}
-    nws_max_lead = 168 if model.lower() == 'nws' else None
+    nws_max_lead = 168 if source_model == 'nws' else None
 
     for run_key, run_data in runs.items():
         try:
@@ -3264,7 +3943,7 @@ def get_run_counts_by_lead_time(model: str, period: str = "all", valid_hour: Opt
         if cutoff is not None and init_time < cutoff:
             continue
 
-        model_data = run_data.get(model.lower())
+        model_data = run_data.get(source_model)
         if not model_data:
             continue
 
@@ -3318,7 +3997,10 @@ def get_verification_data_from_cache(
     Returns:
         Dict mapping station_id to verification data (same format as get_verification_data)
     """
-    if model.lower() == 'nws' and lead_time_hours > 168:
+    source_model = _source_model_for_verification(model)
+    if _is_kenny_bias_corrected_var(model, variable):
+        return get_verification_data(model, variable, lead_time_hours, valid_hour=valid_hour)
+    if source_model == 'nws' and lead_time_hours > 168:
         return {}
 
     cache = load_verification_cache()
@@ -3334,12 +4016,18 @@ def get_verification_data_from_cache(
     if valid_hour is not None:
         vh_str = str(valid_hour)
         for station_id, model_data in cache.get("by_station_by_valid_hour", {}).items():
-            var_data = model_data.get(model.lower(), {}).get(lt_str, {}).get(vh_str, {}).get(variable)
+            var_data = model_data.get(source_model, {}).get(lt_str, {}).get(vh_str, {}).get(variable)
             if var_data:
                 station_info = stations_info.get(station_id, {})
+                wmae = var_data.get('wmae')
+                if wmae is None and _is_precip_var(variable):
+                    wmae = var_data.get('mae')
+                mae = var_data.get('mae')
+                raw_bias = var_data.get('bias')
                 results[station_id] = {
-                    'mae': var_data['mae'],
-                    'bias': var_data['bias'],
+                    'mae': mae,
+                    'bias': _bias_corrected_metric_value(model, f"{variable}_bias", mae, raw_bias),
+                    'wmae': wmae if _is_precip_var(variable) else None,
                     'count': var_data['count'],
                     'lat': station_info.get('lat'),
                     'lon': station_info.get('lon'),
@@ -3348,15 +4036,21 @@ def get_verification_data_from_cache(
                 }
     else:
         for station_id, station_data in cache.get("by_station", {}).items():
-            model_data = station_data.get(model.lower(), {})
+            model_data = station_data.get(source_model, {})
             lt_data = model_data.get(lt_str, {})
             var_data = lt_data.get(variable)
 
             if var_data:
                 station_info = stations_info.get(station_id, {})
+                wmae = var_data.get('wmae')
+                if wmae is None and _is_precip_var(variable):
+                    wmae = var_data.get('mae')
+                mae = var_data.get('mae')
+                raw_bias = var_data.get('bias')
                 results[station_id] = {
-                    'mae': var_data['mae'],
-                    'bias': var_data['bias'],
+                    'mae': mae,
+                    'bias': _bias_corrected_metric_value(model, f"{variable}_bias", mae, raw_bias),
+                    'wmae': wmae if _is_precip_var(variable) else None,
                     'count': var_data['count'],
                     'lat': station_info.get('lat'),
                     'lon': station_info.get('lon'),
@@ -3382,7 +4076,10 @@ def get_verification_data_from_monthly_cache(
         lead_time_hours: Lead time in hours
         valid_hour: If set (0, 6, 12, or 18), filter to that UTC valid hour only.
     """
-    if model.lower() == 'nws' and lead_time_hours > 168:
+    source_model = _source_model_for_verification(model)
+    if _is_kenny_bias_corrected_var(model, variable):
+        return get_verification_data_recent(model, variable, lead_time_hours, days_back=MONTHLY_WINDOW_DAYS, valid_hour=valid_hour)
+    if source_model == 'nws' and lead_time_hours > 168:
         return {}
 
     monthly_cache = load_monthly_stats_cache()
@@ -3412,16 +4109,22 @@ def get_verification_data_from_monthly_cache(
 
         lt_str = str(snapped_lt)
         for station_id, station_data in monthly_vh.items():
-            vh_stats = station_data.get(model.lower(), {}).get(variable, {}).get(lt_str, {}).get(vh_str)
+            vh_stats = station_data.get(source_model, {}).get(variable, {}).get(lt_str, {}).get(vh_str)
             if not vh_stats:
                 continue
             count = vh_stats.get("count", 0)
             if count <= 0:
                 continue
             station_info = stations_info.get(station_id, {})
+            mae = round(vh_stats["sum_abs_errors"] / count, 2)
+            raw_bias = round(vh_stats["sum_errors"] / count, 2)
             results[station_id] = {
-                'mae': round(vh_stats["sum_abs_errors"] / count, 2),
-                'bias': round(vh_stats["sum_errors"] / count, 2),
+                'mae': mae,
+                'bias': _bias_corrected_metric_value(model, f"{variable}_bias", mae, raw_bias),
+                'wmae': (
+                    round(_stats_wmae(vh_stats, fallback_mae=(vh_stats["sum_abs_errors"] / count)), 2)
+                    if _is_precip_var(variable) else None
+                ),
                 'count': count,
                 'lat': station_info.get('lat'),
                 'lon': station_info.get('lon'),
@@ -3433,7 +4136,7 @@ def get_verification_data_from_monthly_cache(
         lt_str = str(lead_time_hours)
 
         for station_id, station_data in monthly.items():
-            model_data = station_data.get(model.lower(), {})
+            model_data = station_data.get(source_model, {})
             var_data = model_data.get(variable, {})
             lt_stats = var_data.get(lt_str)
             if not lt_stats:
@@ -3449,7 +4152,8 @@ def get_verification_data_from_monthly_cache(
 
             results[station_id] = {
                 'mae': round(mae, 2),
-                'bias': round(bias, 2),
+                'bias': _bias_corrected_metric_value(model, f"{variable}_bias", round(mae, 2), round(bias, 2)),
+                'wmae': round(_stats_wmae(lt_stats, fallback_mae=mae), 2) if _is_precip_var(variable) else None,
                 'count': count,
                 'lat': station_info.get('lat'),
                 'lon': station_info.get('lon'),
@@ -3741,12 +4445,19 @@ def rebuild_monthly_station_cache(days_back: int = 20) -> None:
                         error = fcst_val - obs_val
 
                         monthly.setdefault(station_id, {}).setdefault(model, {}).setdefault(var, {}).setdefault(
-                            lt_str, {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+                            lt_str, {
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0
+                            }
                         )
                         stats = monthly[station_id][model][var][lt_str]
                         stats['sum_abs_errors'] += abs(error)
                         stats['sum_errors'] += error
                         stats['count'] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            stats['sum_weighted_abs_errors'] += abs(error) * weight
+                            stats['sum_weights'] += weight
 
                         # Also accumulate by valid hour, snapping to nearest canonical lt
                         snapped_lt = _snap_lt(lead_time_hours)
@@ -3754,11 +4465,18 @@ def rebuild_monthly_station_cache(days_back: int = 20) -> None:
                             vh_str = str(valid_time.hour)
                             snapped_lt_str = str(snapped_lt)
                             monthly_vh.setdefault(station_id, {}).setdefault(model, {}).setdefault(var, {}).setdefault(
-                                snapped_lt_str, {}).setdefault(vh_str, {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0})
+                                snapped_lt_str, {}).setdefault(vh_str, {
+                                    'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                    'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0
+                                })
                             vh_stats = monthly_vh[station_id][model][var][snapped_lt_str][vh_str]
                             vh_stats['sum_abs_errors'] += abs(error)
                             vh_stats['sum_errors'] += error
                             vh_stats['count'] += 1
+                            if _is_precip_var(var):
+                                weight = _precip_weight(obs_val)
+                                vh_stats['sum_weighted_abs_errors'] += abs(error) * weight
+                                vh_stats['sum_weights'] += weight
 
     save_monthly_stats_cache({
         "by_station_monthly": monthly,
@@ -3786,8 +4504,11 @@ def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = Non
         logger.warning("Cache not available, computing verification on-the-fly")
         return get_mean_verification_by_lead_time(model)
 
+    source_model = _source_model_for_verification(model)
+    if (model or "").lower() == "kenny":
+        return get_mean_verification_by_lead_time(model, valid_hour=valid_hour)
     lead_times = cache.get("lead_times", [])
-    nws_max_lead = 168 if model.lower() == 'nws' else None
+    nws_max_lead = 168 if source_model == 'nws' else None
 
     result = {
         "lead_times": lead_times,
@@ -3797,39 +4518,49 @@ def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = Non
         "mslp_bias": [],
         "precip_mae": [],
         "precip_bias": [],
+        "precip_wmae": [],
         "precip_24hr_mae": [],
         "precip_24hr_bias": [],
+        "precip_24hr_wmae": [],
         "dewpoint_mae": [],
         "dewpoint_bias": [],
     }
 
     if valid_hour is not None:
         vh_str = str(valid_hour)
-        model_vh_data = cache.get("by_lead_time_by_valid_hour", {}).get(model.lower(), {})
+        model_vh_data = cache.get("by_lead_time_by_valid_hour", {}).get(source_model, {})
         for lt in lead_times:
             lt_str = str(lt)
             if nws_max_lead is not None and lt > nws_max_lead:
                 result["temp_mae"].append(None); result["temp_bias"].append(None)
                 result["mslp_mae"].append(None); result["mslp_bias"].append(None)
-                result["precip_mae"].append(None); result["precip_bias"].append(None)
-                result["precip_24hr_mae"].append(None); result["precip_24hr_bias"].append(None)
+                result["precip_mae"].append(None); result["precip_bias"].append(None); result["precip_wmae"].append(None)
+                result["precip_24hr_mae"].append(None); result["precip_24hr_bias"].append(None); result["precip_24hr_wmae"].append(None)
                 result["dewpoint_mae"].append(None); result["dewpoint_bias"].append(None)
                 continue
             lt_data = model_vh_data.get(lt_str, {}).get(vh_str, {})
-            result["temp_mae"].append(lt_data.get("temp", {}).get("mae"))
-            result["temp_bias"].append(lt_data.get("temp", {}).get("bias"))
-            result["mslp_mae"].append(lt_data.get("mslp", {}).get("mae"))
-            result["mslp_bias"].append(lt_data.get("mslp", {}).get("bias"))
-            result["precip_mae"].append(lt_data.get("precip", {}).get("mae"))
-            result["precip_bias"].append(lt_data.get("precip", {}).get("bias"))
-            result["precip_24hr_mae"].append(lt_data.get("precip_24hr", {}).get("mae"))
-            result["precip_24hr_bias"].append(lt_data.get("precip_24hr", {}).get("bias"))
-            result["dewpoint_mae"].append(lt_data.get("dewpoint", {}).get("mae"))
-            result["dewpoint_bias"].append(lt_data.get("dewpoint", {}).get("bias"))
+            temp_mae = lt_data.get("temp", {}).get("mae")
+            mslp_mae = lt_data.get("mslp", {}).get("mae")
+            precip_mae = lt_data.get("precip", {}).get("mae")
+            p24_mae = lt_data.get("precip_24hr", {}).get("mae")
+            dew_mae = lt_data.get("dewpoint", {}).get("mae")
+
+            result["temp_mae"].append(temp_mae)
+            result["temp_bias"].append(_bias_corrected_metric_value(model, "temp_bias", temp_mae, lt_data.get("temp", {}).get("bias")))
+            result["mslp_mae"].append(mslp_mae)
+            result["mslp_bias"].append(_bias_corrected_metric_value(model, "mslp_bias", mslp_mae, lt_data.get("mslp", {}).get("bias")))
+            result["precip_mae"].append(precip_mae)
+            result["precip_bias"].append(_bias_corrected_metric_value(model, "precip_bias", precip_mae, lt_data.get("precip", {}).get("bias")))
+            result["precip_wmae"].append(lt_data.get("precip", {}).get("wmae", precip_mae))
+            result["precip_24hr_mae"].append(p24_mae)
+            result["precip_24hr_bias"].append(_bias_corrected_metric_value(model, "precip_24hr_bias", p24_mae, lt_data.get("precip_24hr", {}).get("bias")))
+            result["precip_24hr_wmae"].append(lt_data.get("precip_24hr", {}).get("wmae", p24_mae))
+            result["dewpoint_mae"].append(dew_mae)
+            result["dewpoint_bias"].append(_bias_corrected_metric_value(model, "dewpoint_bias", dew_mae, lt_data.get("dewpoint", {}).get("bias")))
         return result
 
     # All hours — use existing by_lead_time data
-    model_data = cache.get("by_lead_time", {}).get(model.lower(), {})
+    model_data = cache.get("by_lead_time", {}).get(source_model, {})
     for lt in lead_times:
         lt_str = str(lt)
         lt_data = model_data.get(lt_str, {})
@@ -3837,21 +4568,29 @@ def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = Non
         if nws_max_lead is not None and lt > nws_max_lead:
             result["temp_mae"].append(None); result["temp_bias"].append(None)
             result["mslp_mae"].append(None); result["mslp_bias"].append(None)
-            result["precip_mae"].append(None); result["precip_bias"].append(None)
-            result["precip_24hr_mae"].append(None); result["precip_24hr_bias"].append(None)
+            result["precip_mae"].append(None); result["precip_bias"].append(None); result["precip_wmae"].append(None)
+            result["precip_24hr_mae"].append(None); result["precip_24hr_bias"].append(None); result["precip_24hr_wmae"].append(None)
             result["dewpoint_mae"].append(None); result["dewpoint_bias"].append(None)
             continue
 
-        result["temp_mae"].append(lt_data.get("temp", {}).get("mae"))
-        result["temp_bias"].append(lt_data.get("temp", {}).get("bias"))
-        result["mslp_mae"].append(lt_data.get("mslp", {}).get("mae"))
-        result["mslp_bias"].append(lt_data.get("mslp", {}).get("bias"))
-        result["precip_mae"].append(lt_data.get("precip", {}).get("mae"))
-        result["precip_bias"].append(lt_data.get("precip", {}).get("bias"))
-        result["precip_24hr_mae"].append(lt_data.get("precip_24hr", {}).get("mae"))
-        result["precip_24hr_bias"].append(lt_data.get("precip_24hr", {}).get("bias"))
-        result["dewpoint_mae"].append(lt_data.get("dewpoint", {}).get("mae"))
-        result["dewpoint_bias"].append(lt_data.get("dewpoint", {}).get("bias"))
+        temp_mae = lt_data.get("temp", {}).get("mae")
+        mslp_mae = lt_data.get("mslp", {}).get("mae")
+        precip_mae = lt_data.get("precip", {}).get("mae")
+        p24_mae = lt_data.get("precip_24hr", {}).get("mae")
+        dew_mae = lt_data.get("dewpoint", {}).get("mae")
+
+        result["temp_mae"].append(temp_mae)
+        result["temp_bias"].append(_bias_corrected_metric_value(model, "temp_bias", temp_mae, lt_data.get("temp", {}).get("bias")))
+        result["mslp_mae"].append(mslp_mae)
+        result["mslp_bias"].append(_bias_corrected_metric_value(model, "mslp_bias", mslp_mae, lt_data.get("mslp", {}).get("bias")))
+        result["precip_mae"].append(precip_mae)
+        result["precip_bias"].append(_bias_corrected_metric_value(model, "precip_bias", precip_mae, lt_data.get("precip", {}).get("bias")))
+        result["precip_wmae"].append(lt_data.get("precip", {}).get("wmae", precip_mae))
+        result["precip_24hr_mae"].append(p24_mae)
+        result["precip_24hr_bias"].append(_bias_corrected_metric_value(model, "precip_24hr_bias", p24_mae, lt_data.get("precip_24hr", {}).get("bias")))
+        result["precip_24hr_wmae"].append(lt_data.get("precip_24hr", {}).get("wmae", p24_mae))
+        result["dewpoint_mae"].append(dew_mae)
+        result["dewpoint_bias"].append(_bias_corrected_metric_value(model, "dewpoint_bias", dew_mae, lt_data.get("dewpoint", {}).get("bias")))
 
     return result
 
@@ -3864,8 +4603,11 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         model: Model name ('gfs', 'aifs', 'ifs', 'nws')
         valid_hour: Optional UTC hour filter (0, 6, 12, 18). None = all hours.
     """
+    source_model = _source_model_for_verification(model)
+    if (model or "").lower() == "kenny":
+        return get_mean_verification_by_lead_time(model, valid_hour=valid_hour, days_back=MONTHLY_WINDOW_DAYS)
     monthly_cache = load_monthly_stats_cache()
-    nws_max_lead = 168 if model.lower() == 'nws' else None
+    nws_max_lead = 168 if source_model == 'nws' else None
 
     canonical_lead_times = set(list(range(6, 25, 6)) + list(range(48, 361, 24)))
 
@@ -3876,7 +4618,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         # Collect lead times that have data for this model and valid hour
         lead_times = set()
         for station_data in monthly_vh_all.values():
-            model_data = station_data.get(model.lower(), {})
+            model_data = station_data.get(source_model, {})
             for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
                 for lt_str, vh_data in model_data.get(var, {}).items():
                     if vh_str in vh_data:
@@ -3888,14 +4630,16 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         lead_times = sorted(lead_times)
 
         def _init_acc():
-            return {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+            return {"sum_abs": 0.0, "sum": 0.0, "count": 0, "sum_weighted_abs": 0.0, "sum_weights": 0.0}
 
         result = {
             "lead_times": lead_times,
             "temp_mae": [], "temp_bias": [],
             "mslp_mae": [], "mslp_bias": [],
             "precip_mae": [], "precip_bias": [],
+            "precip_wmae": [],
             "precip_24hr_mae": [], "precip_24hr_bias": [],
+            "precip_24hr_wmae": [],
             "dewpoint_mae": [], "dewpoint_bias": [],
         }
 
@@ -3904,7 +4648,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
             acc = {"temp": _init_acc(), "mslp": _init_acc(), "precip": _init_acc(), "precip_24hr": _init_acc(), "dewpoint": _init_acc()}
 
             for station_data in monthly_vh_all.values():
-                model_data = station_data.get(model.lower(), {})
+                model_data = station_data.get(source_model, {})
                 for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
                     stats = model_data.get(var, {}).get(lt_str, {}).get(vh_str)
                     if not stats or stats.get("count", 0) <= 0:
@@ -3912,20 +4656,31 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
                     acc[var]["sum_abs"] += stats.get("sum_abs_errors", 0.0)
                     acc[var]["sum"] += stats.get("sum_errors", 0.0)
                     acc[var]["count"] += stats.get("count", 0)
+                    if _is_precip_var(var):
+                        acc[var]["sum_weighted_abs"] += stats.get("sum_weighted_abs_errors", 0.0)
+                        acc[var]["sum_weights"] += stats.get("sum_weights", 0.0)
 
-            for var, mae_key, bias_key in [
-                ("temp", "temp_mae", "temp_bias"),
-                ("mslp", "mslp_mae", "mslp_bias"),
-                ("precip", "precip_mae", "precip_bias"),
-                ("precip_24hr", "precip_24hr_mae", "precip_24hr_bias"),
-                ("dewpoint", "dewpoint_mae", "dewpoint_bias"),
+            for var, mae_key, bias_key, wmae_key in [
+                ("temp", "temp_mae", "temp_bias", None),
+                ("mslp", "mslp_mae", "mslp_bias", None),
+                ("precip", "precip_mae", "precip_bias", "precip_wmae"),
+                ("precip_24hr", "precip_24hr_mae", "precip_24hr_bias", "precip_24hr_wmae"),
+                ("dewpoint", "dewpoint_mae", "dewpoint_bias", None),
             ]:
                 if acc[var]["count"] > 0:
-                    result[mae_key].append(round(acc[var]["sum_abs"] / acc[var]["count"], 2))
-                    result[bias_key].append(round(acc[var]["sum"] / acc[var]["count"], 2))
+                    mae = acc[var]["sum_abs"] / acc[var]["count"]
+                    rounded_mae = round(mae, 2)
+                    raw_bias = round(acc[var]["sum"] / acc[var]["count"], 2)
+                    result[mae_key].append(rounded_mae)
+                    result[bias_key].append(_bias_corrected_metric_value(model, bias_key, rounded_mae, raw_bias))
+                    if wmae_key is not None:
+                        wmae = (acc[var]["sum_weighted_abs"] / acc[var]["sum_weights"]) if acc[var]["sum_weights"] > 0 else mae
+                        result[wmae_key].append(round(wmae, 2))
                 else:
                     result[mae_key].append(None)
                     result[bias_key].append(None)
+                    if wmae_key is not None:
+                        result[wmae_key].append(None)
 
         return result
 
@@ -3935,7 +4690,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
     # Collect lead times available for this model, restricted to canonical set
     lead_times = set()
     for station_data in monthly.values():
-        model_data = station_data.get(model.lower(), {})
+        model_data = station_data.get(source_model, {})
         for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
             lead_times.update({int(k) for k in model_data.get(var, {}).keys()})
 
@@ -3945,7 +4700,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
     lead_times = sorted(lead_times)
 
     def _init_acc():
-        return {"sum_abs": 0.0, "sum": 0.0, "count": 0}
+        return {"sum_abs": 0.0, "sum": 0.0, "count": 0, "sum_weighted_abs": 0.0, "sum_weights": 0.0}
 
     result = {
         "lead_times": lead_times,
@@ -3955,8 +4710,10 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         "mslp_bias": [],
         "precip_mae": [],
         "precip_bias": [],
+        "precip_wmae": [],
         "precip_24hr_mae": [],
         "precip_24hr_bias": [],
+        "precip_24hr_wmae": [],
         "dewpoint_mae": [],
         "dewpoint_bias": [],
     }
@@ -3972,7 +4729,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         }
 
         for station_data in monthly.values():
-            model_data = station_data.get(model.lower(), {})
+            model_data = station_data.get(source_model, {})
             for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
                 stats = model_data.get(var, {}).get(lt_str)
                 if not stats or stats.get("count", 0) <= 0:
@@ -3980,20 +4737,31 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
                 acc[var]["sum_abs"] += stats.get("sum_abs_errors", 0.0)
                 acc[var]["sum"] += stats.get("sum_errors", 0.0)
                 acc[var]["count"] += stats.get("count", 0)
+                if _is_precip_var(var):
+                    acc[var]["sum_weighted_abs"] += stats.get("sum_weighted_abs_errors", 0.0)
+                    acc[var]["sum_weights"] += stats.get("sum_weights", 0.0)
 
-        for var, mae_key, bias_key in [
-            ("temp", "temp_mae", "temp_bias"),
-            ("mslp", "mslp_mae", "mslp_bias"),
-            ("precip", "precip_mae", "precip_bias"),
-            ("precip_24hr", "precip_24hr_mae", "precip_24hr_bias"),
-            ("dewpoint", "dewpoint_mae", "dewpoint_bias"),
+        for var, mae_key, bias_key, wmae_key in [
+            ("temp", "temp_mae", "temp_bias", None),
+            ("mslp", "mslp_mae", "mslp_bias", None),
+            ("precip", "precip_mae", "precip_bias", "precip_wmae"),
+            ("precip_24hr", "precip_24hr_mae", "precip_24hr_bias", "precip_24hr_wmae"),
+            ("dewpoint", "dewpoint_mae", "dewpoint_bias", None),
         ]:
             if acc[var]["count"] > 0:
-                result[mae_key].append(round(acc[var]["sum_abs"] / acc[var]["count"], 2))
-                result[bias_key].append(round(acc[var]["sum"] / acc[var]["count"], 2))
+                mae = acc[var]["sum_abs"] / acc[var]["count"]
+                rounded_mae = round(mae, 2)
+                raw_bias = round(acc[var]["sum"] / acc[var]["count"], 2)
+                result[mae_key].append(rounded_mae)
+                result[bias_key].append(_bias_corrected_metric_value(model, bias_key, rounded_mae, raw_bias))
+                if wmae_key is not None:
+                    wmae = (acc[var]["sum_weighted_abs"] / acc[var]["sum_weights"]) if acc[var]["sum_weights"] > 0 else mae
+                    result[wmae_key].append(round(wmae, 2))
             else:
                 result[mae_key].append(None)
                 result[bias_key].append(None)
+                if wmae_key is not None:
+                    result[wmae_key].append(None)
 
     return result
 
@@ -4024,9 +4792,13 @@ def get_verification_time_series_from_cache(
         logger.warning("Cache not available, computing time series on-the-fly")
         return get_verification_time_series(model, variable, lead_time_hours, days_back)
 
+    source_model = _source_model_for_verification(model)
+    if _is_kenny_bias_corrected_var(model, variable):
+        return get_verification_time_series(model, variable, lead_time_hours, days_back)
+
     # Extract from cache
     time_series = cache.get("time_series", {})
-    model_data = time_series.get(model.lower(), {})
+    model_data = time_series.get(source_model, {})
     var_data = model_data.get(variable, {})
     lt_data = var_data.get(str(lead_time_hours))
 
@@ -4035,6 +4807,7 @@ def get_verification_time_series_from_cache(
         return {
             "dates": [],
             "mae": [],
+            "wmae": [],
             "bias": [],
             "counts": []
         }
@@ -4042,6 +4815,7 @@ def get_verification_time_series_from_cache(
     # Get all dates and slice to requested days_back
     all_dates = lt_data.get('dates', [])
     all_mae = lt_data.get('mae', [])
+    all_wmae = lt_data.get('wmae', [])
     all_bias = lt_data.get('bias', [])
     all_counts = lt_data.get('counts', [])
 
@@ -4049,6 +4823,7 @@ def get_verification_time_series_from_cache(
         return {
             "dates": [],
             "mae": [],
+            "wmae": [],
             "bias": [],
             "counts": []
         }
@@ -4064,20 +4839,30 @@ def get_verification_time_series_from_cache(
                 start_idx = i
                 break
 
-        return {
+        if _is_precip_var(variable):
+            if not all_wmae:
+                all_wmae = list(all_mae)
+        else:
+            all_wmae = [None] * len(all_dates)
+
+        result = {
             "dates": all_dates[start_idx:],
             "mae": all_mae[start_idx:],
+            "wmae": all_wmae[start_idx:],
             "bias": all_bias[start_idx:],
             "counts": all_counts[start_idx:]
         }
+        return result
     except Exception as e:
         logger.error(f"Error filtering time series data: {e}")
-        return {
+        result = {
             "dates": all_dates,
             "mae": all_mae,
+            "wmae": all_wmae if all_wmae else (list(all_mae) if _is_precip_var(variable) else [None] * len(all_dates)),
             "bias": all_bias,
             "counts": all_counts
         }
+        return result
 
 
 def _calculate_asos_mean_mae(

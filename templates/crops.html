@@ -182,24 +182,24 @@ let stormMarkers = { torn: [], hail: [], wind: [] };
 let stormData    = null;
 
 function tornRadius(mag) {
-    // EF0=5 EF1=6 EF2=7 EF3=9 EF4=11 EF5=13  unknown=5
+    // EF0=2.5 EF1=3 EF2=3.5 EF3=4.5 EF4=5.5 EF5=6.5  unknown=2.5
     const m = mag ? mag.replace(/[^0-9]/g, '') : '';
     const n = parseInt(m);
-    if (isNaN(n)) return 5;
-    return [5, 6, 7, 9, 11, 13][Math.min(n, 5)];
+    if (isNaN(n)) return 2.5;
+    return [2.5, 3, 3.5, 4.5, 5.5, 6.5][Math.min(n, 5)];
 }
 function hailRadius(mag) {
     // size in inches (may be decimal like "0.75")
     const s = parseFloat(mag);
-    if (isNaN(s)) return 4;
-    if (s < 1.0) return 4;
-    if (s < 2.0) return 6;
-    return 8;
+    if (isNaN(s)) return 2;
+    if (s < 1.0) return 2;
+    if (s < 2.0) return 3;
+    return 4;
 }
 function windRadius(mag) {
     const s = parseInt(mag);
-    if (isNaN(s)) return 4;
-    return s >= 75 ? 8 : 5;
+    if (isNaN(s)) return 2;
+    return s >= 75 ? 4 : 2.5;
 }
 
 function buildPopup(r) {

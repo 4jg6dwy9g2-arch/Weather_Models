@@ -289,6 +289,81 @@ def get_observations_for_forecast_times(forecast_times: list[str]) -> dict:
     return get_observations(times, times_are_utc=True)
 
 
+HISTORY_VARIABLE_COLS = {
+    'temp':             5,
+    'dew_point':        6,
+    'heat_index':       11,
+    'barometer':        4,
+    'wind_speed':       8,
+    'wind_gust':        10,
+    'solar_rad':        14,
+    'rain':             12,
+    'rain_rate':        13,
+    'aqi':              28,
+    'pm25':             30,
+    'inside_temp':      1,
+    'inside_humidity':  2,
+    'soil_temp_5':      16,
+    'soil_temp_10':     18,
+    'soil_temp_20':     20,
+    'soil_moisture_5':  17,
+    'soil_moisture_10': 19,
+    'soil_moisture_20': 21,
+}
+
+
+def read_csv_data_full(start_date: datetime, end_date: datetime, variable: str) -> list[dict]:
+    """
+    Read a single variable from WeatherLink CSV files for a date range.
+
+    Args:
+        start_date: Start of date range (Eastern local time)
+        end_date: End of date range (Eastern local time)
+        variable: Variable key from HISTORY_VARIABLE_COLS
+
+    Returns:
+        List of dicts with keys: t (ISO string in Eastern time), v (float or None)
+    """
+    col_idx = HISTORY_VARIABLE_COLS.get(variable)
+    if col_idx is None:
+        logger.warning(f"Unknown history variable: {variable}")
+        return []
+
+    results = []
+    current = datetime(start_date.year, start_date.month, 1)
+    end_month = datetime(end_date.year, end_date.month, 1)
+
+    while current <= end_month:
+        csv_path = get_csv_path(current)
+
+        if csv_path.exists():
+            try:
+                with open(csv_path, 'r', encoding='mac_roman') as f:
+                    reader = csv.reader(f)
+                    for _ in range(6):
+                        next(reader, None)
+                    for row in reader:
+                        if not row or len(row) <= col_idx:
+                            continue
+                        try:
+                            obs_time = parse_datetime(row[COL_DATETIME])
+                            if start_date <= obs_time <= end_date:
+                                val_str = row[col_idx].strip('"')
+                                val = float(val_str) if val_str and val_str != '--' else None
+                                results.append({'t': obs_time.isoformat(), 'v': val})
+                        except (ValueError, IndexError):
+                            continue
+            except Exception as e:
+                logger.warning(f"Error reading {csv_path}: {e}")
+
+        if current.month == 12:
+            current = datetime(current.year + 1, 1, 1)
+        else:
+            current = datetime(current.year, current.month + 1, 1)
+
+    return results
+
+
 def fetch_missing_data(silent: bool = True) -> int:
     """
     Fetch any missing WeatherLink data by calling the fetch script.

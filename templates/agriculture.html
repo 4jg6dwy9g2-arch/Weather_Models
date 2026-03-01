@@ -45,6 +45,10 @@
         <input class="form-check-input" type="checkbox" id="sr-showWind" checked>
         <label class="form-check-label small fw-semibold" for="sr-showWind" style="color:#60a5fa">&#x25CF; Wind (<span id="sr-windCount">–</span>)</label>
     </div>
+    <div class="form-check form-check-inline mb-0">
+        <input class="form-check-input" type="checkbox" id="sr-showFire" checked>
+        <label class="form-check-label small fw-semibold" for="sr-showFire" style="color:#f97316">&#x25CF; Fire (<span id="sr-fireCount">–</span>)</label>
+    </div>
     <select class="form-select form-select-sm" id="sr-hours" style="width:auto;background:#1e293b;color:#e2e8f0;border-color:#334155;">
         <option value="24">Last 24 h</option>
         <option value="48" selected>Last 48 h</option>
@@ -52,7 +56,7 @@
         <option value="0">All available</option>
     </select>
     <div class="form-check form-check-inline mb-0 ms-2">
-        <input class="form-check-input" type="checkbox" id="showDroughtOverlay" checked>
+        <input class="form-check-input" type="checkbox" id="showDroughtOverlay">
         <label class="form-check-label small fw-semibold" for="showDroughtOverlay">Drought Overlay</label>
     </div>
     <span class="small text-muted" id="droughtOverlayUpdated"></span>
@@ -74,10 +78,52 @@
     <span><span style="background:#E8FFBF;padding:0 6px;border:1px solid #ccc">&nbsp;</span> Pasture</span>
 </div>
 
+<!-- ── Storm Crop Impact Card ─────────────────────────────────────────────── -->
 <div class="card mt-3 shadow-sm">
     <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-        <span><i class="bi bi-bar-chart-line"></i> Land Exposed to Drought <span class="text-muted fw-normal small" id="droughtChartTotalLabel"></span></span>
+        <span><i class="bi bi-cloud-lightning-rain"></i> Crop Acreage Exposed to Storm Events</span>
         <div class="d-flex gap-2 align-items-center flex-wrap">
+            <div class="btn-group btn-group-sm" id="hazardToggle" role="group">
+                <button type="button" class="btn btn-outline-danger   active" data-haz="torn">&#x1F32A; Tornado <span class="ms-1 badge bg-danger"   id="sc-tornCount">–</span></button>
+                <button type="button" class="btn btn-outline-success"         data-haz="hail">&#x1F9CA; Hail    <span class="ms-1 badge bg-success" id="sc-hailCount">–</span></button>
+                <button type="button" class="btn btn-outline-primary"         data-haz="wind">&#x1F4A8; Wind    <span class="ms-1 badge bg-primary" id="sc-windCount">–</span></button>
+                <button type="button" class="btn btn-outline-warning text-dark" data-haz="drought">&#x2600;&#xFE0F; Drought</button>
+                <button type="button" class="btn btn-outline-secondary"         data-haz="fire">&#x1F525; Fire <span class="ms-1 badge bg-secondary" id="sc-fireCount">–</span></button>
+            </div>
+            <span class="text-muted small" id="scRadiusNote" style="font-style:italic;"></span>
+        </div>
+    </div>
+    <div class="card-body">
+        <div id="scPlaceholder" class="text-center text-muted py-4 small">
+            <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+            Computing storm impact acreage...
+        </div>
+        <div id="scError" class="alert alert-warning small py-2 d-none"></div>
+        <div id="scChartWrap" style="display:none">
+            <p class="text-muted small mb-1" id="scSubtitle"></p>
+            <div style="height:320px;position:relative">
+                <canvas id="stormCropChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ── Crop Exposure History Card ─────────────────────────────────────────── -->
+<div class="card mt-3 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span>
+            <i class="bi bi-bar-chart-line"></i> Crop Exposure History
+            <span class="text-muted fw-normal small" id="droughtChartTotalLabel"></span>
+            <span class="text-muted fw-normal small ms-1" id="scHistRadiiNote"></span>
+        </span>
+        <div class="d-flex gap-2 align-items-center flex-wrap">
+            <div class="btn-group btn-group-sm" id="histHazToggle" role="group">
+                <button type="button" class="btn btn-outline-warning text-dark active" data-haz="drought">&#x2600;&#xFE0F; Drought</button>
+                <button type="button" class="btn btn-outline-danger"                   data-haz="torn">&#x1F32A; Tornado</button>
+                <button type="button" class="btn btn-outline-success"                  data-haz="hail">&#x1F9CA; Hail</button>
+                <button type="button" class="btn btn-outline-primary"                  data-haz="wind">&#x1F4A8; Wind</button>
+                <button type="button" class="btn btn-outline-secondary"                data-haz="fire">&#x1F525; Fire</button>
+            </div>
             <input type="search" id="droughtCategorySearch" class="form-control form-control-sm" placeholder="Filter categories..." style="width:160px" autocomplete="off">
             <select class="form-select form-select-sm" id="droughtCategorySelect" style="width:220px">
                 <option value="Total">— Total Cropland —</option>
@@ -92,7 +138,7 @@
         </div>
     </div>
     <div class="card-body">
-        <div id="droughtChartPlaceholder" class="text-center text-muted py-4 small">Loading drought exposure data...</div>
+        <div id="droughtChartPlaceholder" class="text-center text-muted py-4 small">Loading exposure data...</div>
         <div id="droughtChartWrap" style="display:none">
             <p class="text-muted small mb-1" id="droughtChartSubtitle"></p>
             <div style="height:300px;position:relative">
@@ -106,14 +152,14 @@
 {% block extra_js %}
 <script>
 (function() {
-    let srMap = null, cdlLayer = null, srData = null;
-    let srMarkers = { torn: [], hail: [], wind: [] };
+    let srMap = null, cdlLayer = null, srData = null, fireData = null;
+    let srMarkers = { torn: [], hail: [], wind: [], fire: [] };
     let livestockLayer = null, countyGeoJSON = null, countyLivestockData = null;
     let droughtLayer = null, droughtGeoJSON = null;
     let livestockForceReloadTried = false;
 
-    const STORM_COLOR = { torn: '#b91c1c', hail: '#15803d', wind: '#1d4ed8' };
-    const STORM_FILL  = { torn: '#ef4444', hail: '#22c55e', wind: '#3b82f6' };
+    const STORM_COLOR = { torn: '#b91c1c', hail: '#15803d', wind: '#1d4ed8', fire: '#c2410c' };
+    const STORM_FILL  = { torn: '#ef4444', hail: '#22c55e', wind: '#3b82f6', fire: '#f97316' };
     const LIVESTOCK_COLORS = {
         'Cattle': '#92400e', 'Dairy Cows': '#0369a1', 'Hogs': '#be185d',
         'Chickens, Layers': '#b45309', 'Chickens, Broilers': '#7c3aed',
@@ -125,9 +171,9 @@
         'Layers': 'Chickens, Layers',
     };
 
-    function tornRadius(m) { const n = parseInt((m || '').replace(/\D/g, '')); return isNaN(n) ? 5 : [5,6,7,9,11,13][Math.min(n,5)]; }
-    function hailRadius(m) { const s = parseFloat(m); return isNaN(s) ? 4 : s < 1 ? 4 : s < 2 ? 6 : 8; }
-    function windRadius(m) { const s = parseInt(m); return isNaN(s) ? 4 : s >= 75 ? 8 : 5; }
+    function tornRadius(m) { const n = parseInt((m || '').replace(/\D/g, '')); return isNaN(n) ? 2.5 : [2.5,3,3.5,4.5,5.5,6.5][Math.min(n,5)]; }
+    function hailRadius(m) { const s = parseFloat(m); return isNaN(s) ? 2 : s < 1 ? 2 : s < 2 ? 3 : 4; }
+    function windRadius(m) { const s = parseInt(m); return isNaN(s) ? 2 : s >= 75 ? 4 : 2.5; }
     function clearMarkers(type) { srMarkers[type].forEach(m => srMap.removeLayer(m)); srMarkers[type] = []; }
     function lerpColor(t, hex) {
         const r2 = parseInt(hex.slice(1,3),16), g2 = parseInt(hex.slice(3,5),16), b2 = parseInt(hex.slice(5,7),16);
@@ -323,6 +369,9 @@
         cdlLayer.setOpacity(parseInt(document.getElementById('sr-opacity').value, 10) / 100);
     }
 
+    // Geographic impact radii (metres) — must match STORM_IMPACT_RADII_KM in Python
+    const IMPACT_RADIUS_M = { torn: 2500, hail: 5000, wind: 8750 };
+
     function renderSR() {
         if (!srData || !srMap) return;
         const hoursBack = parseInt(document.getElementById('sr-hours').value, 10);
@@ -348,6 +397,17 @@
             for (const r of reports) {
                 const timeStr = r.time ? r.time.slice(0,2)+':'+r.time.slice(2)+' UTC' : '';
                 const popup = `<strong>${typeLabel[type]}</strong><br>${timeStr} ${r.date}<br>${r.location}, ${r.county} Co., ${r.state}<br><em>${magLabel[type]}:</em> ${r.magnitude || '–'}<br>${r.comments ? '<small>'+r.comments+'</small>' : ''}`;
+
+                // Geographic impact radius circle (scales with zoom)
+                const ring = L.circle([r.lat, r.lon], {
+                    radius: IMPACT_RADIUS_M[type],
+                    color: STORM_COLOR[type], weight: 1, opacity: 0.5,
+                    fillColor: STORM_FILL[type], fillOpacity: 0.06,
+                    interactive: false,
+                }).addTo(srMap);
+                srMarkers[type].push(ring);
+
+                // Centre dot with popup
                 const m = L.circleMarker([r.lat, r.lon], {
                     radius: radiusFn[type](r.magnitude), color: STORM_COLOR[type], weight: 1.5,
                     fillColor: STORM_FILL[type], fillOpacity: 0.8,
@@ -358,6 +418,33 @@
         document.getElementById('sr-tornCount').textContent = counts.torn;
         document.getElementById('sr-hailCount').textContent = counts.hail;
         document.getElementById('sr-windCount').textContent = counts.wind;
+    }
+
+    function renderFire() {
+        if (!srMap) return;
+        clearMarkers('fire');
+        if (!document.getElementById('sr-showFire').checked) {
+            document.getElementById('sr-fireCount').textContent = '0';
+            return;
+        }
+        if (!fireData) return;
+        const detections = fireData.detections ?? [];
+        detections.forEach(d => {
+            // Dot size 3-7 px scaled by FRP (Fire Radiative Power, MW)
+            const r = d.frp >= 100 ? 7 : d.frp >= 20 ? 5 : 3;
+            const conf = d.confidence === 'high' ? 'High' : 'Nominal';
+            const popup = `<strong>&#x1F525; Fire Detection</strong><br>`
+                + `${d.acq_date} ${d.acq_time ? d.acq_time.slice(0,2)+':'+d.acq_time.slice(2)+' UTC' : ''}`
+                + ` (${d.daynight === 'D' ? 'Day' : 'Night'})<br>`
+                + `FRP: ${d.frp.toFixed(1)} MW &nbsp; Confidence: ${conf}`;
+            const m = L.circleMarker([d.lat, d.lon], {
+                radius: r,
+                color: STORM_COLOR.fire, weight: 1,
+                fillColor: STORM_FILL.fire, fillOpacity: 0.75,
+            }).bindPopup(popup).addTo(srMap);
+            srMarkers.fire.push(m);
+        });
+        document.getElementById('sr-fireCount').textContent = detections.length;
     }
 
     function droughtStyle(feature) {
@@ -426,11 +513,18 @@
         document.getElementById('sr-opacity').addEventListener('input', function() { cdlLayer.setOpacity(parseInt(this.value, 10) / 100); });
         document.getElementById('showDroughtOverlay').addEventListener('change', applyDroughtOverlayVisibility);
         ['sr-showTorn','sr-showHail','sr-showWind','sr-hours'].forEach(id => document.getElementById(id).addEventListener('change', renderSR));
+        document.getElementById('sr-showFire').addEventListener('change', renderFire);
 
         try {
             const resp = await fetch('/api/storm-reports');
             if (resp.ok) { srData = await resp.json(); renderSR(); }
         } catch(e) { console.warn('[agriculture] storm report fetch failed:', e); }
+
+        try {
+            const resp = await fetch('/api/fire-reports');
+            if (resp.ok) { fireData = await resp.json(); renderFire(); }
+        } catch(e) { console.warn('[agriculture] fire report fetch failed:', e); }
+
         await initDroughtOverlay();
 
         const hoverBox = document.getElementById('cdlHoverBox');
@@ -542,7 +636,7 @@
         });
     }
     async function loadDroughtCropData() {
-        if (droughtCropData) { renderDroughtCropChart(); return; }
+        if (droughtCropData) { renderHistChart(); return; }
         try {
             const r = await fetch('/api/drought-crops/timeseries');
             if (!r.ok) { document.getElementById('droughtChartPlaceholder').textContent = 'Drought exposure data not yet computed.'; return; }
@@ -550,7 +644,7 @@
             if (droughtCropData.computed_at) document.getElementById('droughtChartUpdated').textContent = 'Updated ' + droughtCropData.computed_at.slice(0, 10);
             if (droughtCropData.total_cropland_acres) document.getElementById('droughtChartTotalLabel').textContent = `(${(droughtCropData.total_cropland_acres / 1e6).toFixed(0)}M cropland acres tracked)`;
             if (droughtCropData.code_info) buildCropDropdown(droughtCropData.code_info);
-            renderDroughtCropChart();
+            renderHistChart();
         } catch(_) {
             document.getElementById('droughtChartPlaceholder').textContent = 'Failed to load drought exposure data.';
         }
@@ -570,20 +664,390 @@
             showLivestockChoropleth(code.slice(8));
         } else {
             hideLivestockChoropleth();
-            if (cdlLayer) cdlLayer.setUrl('/api/cdl/tile/{z}/{x}/{y}.png?code=' + (code || 'all'));
+            // 'Total' = chart aggregation mode; show all CDL types on the map
+            const mapCode = (code === 'Total' || !code) ? 'all' : code;
+            if (cdlLayer) cdlLayer.setUrl('/api/cdl/tile/{z}/{x}/{y}.png?code=' + mapCode);
         }
     }
 
-    document.getElementById('droughtChartLevel').addEventListener('change', renderDroughtCropChart);
+    document.getElementById('droughtChartLevel').addEventListener('change', renderHistChart);
     document.getElementById('droughtCategorySelect').addEventListener('change', function() {
-        renderDroughtCropChart();
+        renderHistChart();
         syncMapToSelection();
     });
-    document.getElementById('droughtCategorySearch').addEventListener('input', function() { applyDropdownFilter(); renderDroughtCropChart(); });
+    document.getElementById('droughtCategorySearch').addEventListener('input', function() { applyDropdownFilter(); renderHistChart(); });
+
+    // ── Storm Crop Impact chart ───────────────────────────────────────────────
+
+    let stormCropChart = null;
+    let scImpactData   = null;   // last /api/storm-crop-impact response
+    let scCurrentHaz   = 'torn'; // active hazard tab
+
+    const HAZ_COLOR = {
+        torn:    '#ef4444',
+        hail:    '#22c55e',
+        wind:    '#3b82f6',
+        drought: '#f59e0b',
+        fire:    '#f97316',
+    };
+    const HAZ_RADIUS_LABEL = {
+        torn:    'Assumed radius: 2.5 km per tornado report',
+        hail:    'Assumed radius: 5 km per hail report',
+        wind:    'Assumed radius: 8.75 km per wind report',
+        drought: 'Current D2+ drought exposure (latest week)',
+        fire:    'Assumed radius: 0.5 km per VIIRS fire detection (375 m pixel)',
+    };
+
+    function setHazard(haz) {
+        scCurrentHaz = haz;
+        document.querySelectorAll('#hazardToggle .btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.haz === haz);
+        });
+        document.getElementById('scRadiusNote').textContent = HAZ_RADIUS_LABEL[haz] || '';
+        renderStormCropChart();
+    }
+
+    function fmtTotalAc(code) {
+        const ac = droughtCropData?.code_info?.[code]?.total_acres;
+        if (!ac) return '';
+        return ac >= 1e6 ? `(${(ac / 1e6).toFixed(0)}M ac)` : `(${Math.round(ac / 1e3)}k ac)`;
+    }
+
+    function renderStormCropChart() {
+        const haz = scCurrentHaz;
+        const placeholder = document.getElementById('scPlaceholder');
+        const wrap = document.getElementById('scChartWrap');
+        const subtitle = document.getElementById('scSubtitle');
+
+        // ── Drought mode: pull latest week from existing drought data ──────────
+        if (haz === 'drought') {
+            if (!droughtCropData) { return; }
+            const dates   = droughtCropData.dates ?? [];
+            const byDate  = droughtCropData.by_date ?? {};
+            const codeInfo = droughtCropData.code_info ?? {};
+            const lastDate = dates[dates.length - 1];
+            if (!lastDate) return;
+
+            const d2data = byDate[lastDate]?.D2 ?? {};
+            const entries = Object.entries(d2data)
+                .filter(([code]) => code !== 'Total' && codeInfo[code])
+                .map(([code, ac]) => ({ code, name: codeInfo[code].name, acres: ac }))
+                .filter(e => e.acres > 0)
+                .sort((a, b) => b.acres - a.acres)
+                .slice(0, 20);
+
+            if (!entries.length) {
+                subtitle.textContent = 'No D2+ drought exposure data for latest week.';
+                placeholder.style.display = 'none';
+                wrap.style.display = 'block';
+                return;
+            }
+            subtitle.textContent = `D2+ drought exposure as of ${lastDate} — top crops by acreage`;
+            _drawStormCropChart(
+                entries.map(e => `${e.name} ${fmtTotalAc(e.code)}`),
+                entries.map(e => e.acres / 1e3),
+                HAZ_COLOR.drought,
+                'Thousand acres (D2+)',
+            );
+            return;
+        }
+
+        // ── Storm / Fire hazard modes ──────────────────────────────────────────
+        if (!scImpactData) return;
+
+        const impactByCode = scImpactData.impact?.[haz] ?? {};
+        const codeInfo     = scImpactData.code_info   ?? {};
+        const counts       = scImpactData.report_counts ?? {};
+
+        const entries = Object.entries(impactByCode)
+            .filter(([code]) => codeInfo[code])
+            .map(([code, acres]) => ({ code, name: codeInfo[code].name, acres }))
+            .filter(e => e.acres > 0)
+            .sort((a, b) => b.acres - a.acres)
+            .slice(0, 20);
+
+        const hazLabel = { torn: 'Tornado', hail: 'Hail', wind: 'Wind', fire: 'Fire' };
+        const hazUnit  = haz === 'fire' ? 'detections' : 'reports';
+        const n = counts[haz] ?? '?';
+        subtitle.textContent =
+            `${hazLabel[haz] ?? haz} (${n} ${hazUnit}, last ${scImpactData.hours}h) — top crops by estimated exposed acreage`;
+
+        if (!entries.length) {
+            subtitle.textContent += ' — no data';
+            placeholder.style.display = 'none';
+            wrap.style.display = 'block';
+            return;
+        }
+
+        _drawStormCropChart(
+            entries.map(e => `${e.name} ${fmtTotalAc(e.code)}`),
+            entries.map(e => e.acres / 1e3),
+            HAZ_COLOR[haz],
+            'Thousand acres (estimated exposed)',
+        );
+    }
+
+    function _drawStormCropChart(labels, values, color, yLabel) {
+        const placeholder = document.getElementById('scPlaceholder');
+        const wrap = document.getElementById('scChartWrap');
+        placeholder.style.display = 'none';
+        wrap.style.display = 'block';
+
+        // Size height so every bar gets enough room for its label
+        const canvas = document.getElementById('stormCropChart');
+        canvas.parentElement.style.height = Math.max(200, labels.length * 30 + 40) + 'px';
+
+        const ctx = canvas.getContext('2d');
+        if (stormCropChart) { stormCropChart.destroy(); stormCropChart = null; }
+
+        stormCropChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels,
+                datasets: [{
+                    label: yLabel,
+                    data: values,
+                    backgroundColor: color + 'bb',
+                    borderColor: color,
+                    borderWidth: 1,
+                }],
+            },
+            options: {
+                indexAxis: 'y',   // horizontal bars
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: ctx => {
+                                const v = ctx.parsed.x;
+                                return v >= 1000
+                                    ? `${(v / 1000).toFixed(2)}M acres`
+                                    : `${v.toFixed(1)}k acres`;
+                            },
+                        },
+                    },
+                },
+                scales: {
+                    x: {
+                        title: { display: true, text: yLabel, font: { size: 11 } },
+                        ticks: { font: { size: 10 } },
+                        grid:  { color: 'rgba(0,0,0,0.07)' },
+                    },
+                    y: {
+                        ticks: { font: { size: 11 } },
+                        grid:  { display: false },
+                    },
+                },
+            },
+        });
+    }
+
+    // ── Unified Crop Exposure History ──────────────────────────────────────────
+
+    let histHaz    = 'drought';  // 'drought' | 'torn' | 'hail' | 'wind'
+    let scHistData = null;
+
+    const HAZ_HIST_COLOR = { torn: '#ef4444', hail: '#22c55e', wind: '#3b82f6', fire: '#f97316' };
+
+    function setHistHaz(haz) {
+        histHaz = haz;
+        document.querySelectorAll('#histHazToggle .btn').forEach(b =>
+            b.classList.toggle('active', b.dataset.haz === haz));
+        // Drought-level selector only relevant for drought mode
+        document.getElementById('droughtChartLevel').style.display =
+            haz === 'drought' ? '' : 'none';
+        renderHistChart();
+    }
+
+    function renderHistChart() {
+        if (histHaz === 'drought') {
+            renderDroughtCropChart();
+        } else {
+            renderStormCropHistOnUnifiedChart();
+        }
+    }
+
+    function renderStormCropHistOnUnifiedChart() {
+        const haz         = histHaz;
+        const selCode     = document.getElementById('droughtCategorySelect').value;
+        const placeholder = document.getElementById('droughtChartPlaceholder');
+        const wrap        = document.getElementById('droughtChartWrap');
+
+        function showMsg(msg) {
+            placeholder.textContent = msg;
+            placeholder.style.display = 'block';
+            wrap.style.display = 'none';
+            if (droughtCropChart) { droughtCropChart.destroy(); droughtCropChart = null; }
+        }
+
+        if (!scHistData) {
+            showMsg('Storm crop history not yet computed — run a sync first.');
+            return;
+        }
+
+        // Livestock categories have no storm impact data
+        if (selCode.startsWith('__live__')) {
+            showMsg('Storm impact data is not available for livestock categories.');
+            return;
+        }
+
+        const dates    = scHistData.dates ?? [];
+        const byDate   = scHistData.by_date ?? {};
+        const codeInfo = scHistData.code_info ?? {};
+
+        if (!dates.length) {
+            showMsg('Storm crop history not yet available — run a sync first.');
+            return;
+        }
+
+        const cropLabel = selCode === 'Total'
+            ? 'Total Cropland'
+            : (codeInfo[selCode]?.name ?? selCode);
+        const hazLabel = { torn: 'Tornado', hail: 'Hail', wind: 'Wind', fire: 'Fire' }[haz] ?? haz;
+        const hazNoun  = haz === 'fire' ? 'detections' : 'reports';
+
+        const values = dates.map(d => (byDate[d]?.[haz]?.[selCode] ?? 0) / 1e3);
+
+        if (values.every(v => v === 0)) {
+            showMsg(`No ${hazLabel} impact data for ${cropLabel} in this period.`);
+            return;
+        }
+
+        placeholder.style.display = 'none';
+        wrap.style.display = 'block';
+
+        document.getElementById('droughtChartSubtitle').textContent =
+            `Daily ${hazLabel} impact on ${cropLabel} — each day's ${hazNoun} counted once`;
+        const color  = HAZ_HIST_COLOR[haz] ?? '#6b7280';
+        const ctx    = document.getElementById('droughtCropChart').getContext('2d');
+        if (droughtCropChart) { droughtCropChart.destroy(); droughtCropChart = null; }
+
+        droughtCropChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: dates,
+                datasets: [{
+                    label: `${hazLabel} — ${cropLabel}`,
+                    data: values,
+                    backgroundColor: color + 'aa',
+                    borderColor: color,
+                    borderWidth: 1,
+                    barPercentage: 0.9,
+                    categoryPercentage: 1.0,
+                }],
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            title: items => items[0]?.label ?? '',
+                            label: ctx => {
+                                const v = ctx.parsed.y;
+                                return v >= 1000
+                                    ? `${(v / 1000).toFixed(2)}M acres`
+                                    : `${v.toFixed(1)}k acres`;
+                            },
+                        },
+                    },
+                },
+                scales: {
+                    x: {
+                        type: 'time',
+                        time: { unit: 'week', tooltipFormat: 'MMM d, yyyy',
+                                displayFormats: { week: 'MMM d' } },
+                        ticks: { color: '#374151', font: { size: 10 }, maxTicksLimit: 13 },
+                        grid:  { color: 'rgba(0,0,0,0.05)' },
+                    },
+                    y: {
+                        title: { display: true, text: 'Thousand acres (estimated exposed)', font: { size: 11 } },
+                        min: 0,
+                        ticks: { color: '#374151', font: { size: 11 } },
+                        grid:  { color: 'rgba(0,0,0,0.07)' },
+                    },
+                },
+            },
+        });
+    }
+
+    async function loadScHistData() {
+        try {
+            const resp = await fetch('/api/storm-crops/timeseries');
+            if (!resp.ok) {
+                // Only show error if storm mode is already active
+                if (histHaz !== 'drought') {
+                    document.getElementById('droughtChartPlaceholder').textContent =
+                        resp.status === 404
+                            ? 'Storm crop history not yet computed — run a sync first.'
+                            : `Failed to load (HTTP ${resp.status})`;
+                }
+                return;
+            }
+            scHistData = await resp.json();
+            const radii = scHistData.radii_km ?? {};
+            document.getElementById('scHistRadiiNote').textContent =
+                `(torn ${radii.torn ?? 2.5} km · hail ${radii.hail ?? 5} km · wind ${radii.wind ?? 8.75} km · fire ${radii.fire ?? 0.5} km radius)`;
+            if (histHaz !== 'drought') renderHistChart();
+        } catch (e) {
+            if (histHaz !== 'drought') {
+                document.getElementById('droughtChartPlaceholder').textContent =
+                    `Storm crop history unavailable: ${e.message}`;
+            }
+        }
+    }
+
+    // Wire hazard history toggle buttons
+    document.querySelectorAll('#histHazToggle .btn').forEach(btn => {
+        btn.addEventListener('click', () => setHistHaz(btn.dataset.haz));
+    });
+
+    async function loadStormCropImpact() {
+        const hours = parseInt(document.getElementById('sr-hours').value, 10) || 48;
+        document.getElementById('scPlaceholder').style.display = 'block';
+        document.getElementById('scChartWrap').style.display = 'none';
+        document.getElementById('scError').classList.add('d-none');
+
+        try {
+            const resp = await fetch(`/api/storm-crop-impact?hours=${hours}`);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            scImpactData = await resp.json();
+            if (!scImpactData.success) throw new Error(scImpactData.error ?? 'Unknown error');
+
+            // Update report count badges
+            const rc = scImpactData.report_counts ?? {};
+            document.getElementById('sc-tornCount').textContent = rc.torn ?? '–';
+            document.getElementById('sc-hailCount').textContent = rc.hail ?? '–';
+            document.getElementById('sc-windCount').textContent = rc.wind ?? '–';
+            document.getElementById('sc-fireCount').textContent = rc.fire ?? '–';
+
+            renderStormCropChart();
+        } catch (e) {
+            document.getElementById('scPlaceholder').style.display = 'none';
+            const err = document.getElementById('scError');
+            err.textContent = `Storm crop impact unavailable: ${e.message}`;
+            err.classList.remove('d-none');
+        }
+    }
+
+    // Wire hazard toggle buttons (inside IIFE so setHazard is in scope)
+    document.querySelectorAll('#hazardToggle .btn').forEach(btn => {
+        btn.addEventListener('click', () => setHazard(btn.dataset.haz));
+    });
+
+    // Re-compute when hours filter changes (also triggers renderSR)
+    document.getElementById('sr-hours').addEventListener('change', loadStormCropImpact);
+
+    // Initialise radius note for default tab
+    document.getElementById('scRadiusNote').textContent = HAZ_RADIUS_LABEL[scCurrentHaz];
 
     document.addEventListener('DOMContentLoaded', async function() {
         await initStormMap();
-        await loadDroughtCropData();
+        await Promise.all([loadDroughtCropData(), loadStormCropImpact(), loadScHistData()]);
     });
 })();
 </script>
