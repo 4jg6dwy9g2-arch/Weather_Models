@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-03-01 18:36 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-03-01 18:47 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -353,6 +353,7 @@ thead tr:nth-child(2) th { background: white; }
       </select>
       <select class="form-select form-select-sm" id="tsMetric" style="width:auto">
         <option value="mae">MAE</option>
+        <option value="wmae">WMAE (Precip)</option>
         <option value="bias">Bias</option>
       </select>
       <select class="form-select form-select-sm" id="tsLt" style="width:auto">
@@ -491,7 +492,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-03-01_18:36_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-03-01_18:47_UTC').then(r => r.json()).catch(() => null),
     fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
@@ -1007,6 +1008,8 @@ function renderTable() {
 function renderTs() {
   const variable = document.getElementById('tsVar').value;
   const metric   = document.getElementById('tsMetric').value;
+  const isPrecipVar = variable === 'precip' || variable === 'precip_24hr';
+  const resolvedMetric = (metric === 'wmae' && !isPrecipVar) ? 'mae' : metric;
   const lt       = document.getElementById('tsLt').value;
   const span     = parseInt(document.getElementById('tsSpan').value, 10);
   const combo    = TS_DATA?.[variable]?.[lt];
@@ -1039,7 +1042,11 @@ function renderTs() {
     .filter(m => combo[m])
     .map(m => ({
       label: m.toUpperCase(),
-      data: combo[m][metric].slice(startIdx),
+      data: (
+        resolvedMetric === 'bias'
+          ? combo[m].bias
+          : (resolvedMetric === 'wmae' ? (combo[m].wmae || combo[m].mae) : combo[m].mae)
+      ).slice(startIdx),
       borderColor: mColors[m].border,
       backgroundColor: mColors[m].bg,
       borderWidth: 2,
@@ -1050,14 +1057,14 @@ function renderTs() {
 
   // Daily winners tally (MAE only)
   const tallyEl = document.getElementById('tsWinnerTally');
-  if (metric === 'mae') {
+  if (resolvedMetric === 'mae') {
     const wins = {gfs:0, aifs:0, ifs:0, nws:0, tie:0};
     for (let i = 0; i < dates.length; i++) {
       const idx = startIdx + i;
       const candidates = [];
       for (const m of ['gfs','aifs','ifs','nws']) {
         if (!combo[m]) continue;
-        const v = combo[m].mae[idx];
+        const v = (resolvedMetric === 'wmae' ? (combo[m].wmae || combo[m].mae) : combo[m].mae)[idx];
         if (v != null) candidates.push({key: m, val: v});
       }
       if (!candidates.length) continue;
@@ -1093,7 +1100,7 @@ function renderTs() {
         }
       },
       scales: {
-        y: {grid:{color:'#e0e0e0'}, title:{display:true, text:`${metric.toUpperCase()} (${unit})`}},
+        y: {grid:{color:'#e0e0e0'}, title:{display:true, text:`${resolvedMetric.toUpperCase()} (${unit})`}},
         x: {grid:{display:false}, title:{display:true, text:'Date'},
              ticks:{maxRotation:45, minRotation:45}}
       }
