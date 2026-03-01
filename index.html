@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-03-01 14:34 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-03-01 16:31 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -403,10 +403,9 @@ thead tr:nth-child(2) th { background: white; }
   <div class="card-body" id="pmChartSection" style="display:none;background:#f5f3ff;">
     <div class="d-flex align-items-center justify-content-between mb-2">
       <p id="pmMaeDesc" class="text-muted mb-0" style="font-size:0.8rem;">
-        Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.
+        Average absolute error across all cities for snapshots in the &lt;6h lead window vs. ASOS observed high.
       </p>
       <select class="form-select form-select-sm ms-2" id="pmMaeBucketSelect" style="width:auto;flex-shrink:0;">
-        <option value="final">Final snap</option>
         <option value="0">&lt;6h</option>
         <option value="6">6&ndash;12h</option>
         <option value="12">12&ndash;18h</option>
@@ -489,7 +488,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-03-01_14:34_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-03-01_16:31_UTC').then(r => r.json()).catch(() => null),
     fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
@@ -516,7 +515,7 @@ async function loadAll() {
     const cities = PM_DATA._cities || [];
     buildPmTabs(cities);
     buildPmAllCitiesChart();
-    if (cities.length > 0) renderPmCity(cities[0].key);
+    if (cities.length > 0) renderPmCity('__all__');
   }
 }
 
@@ -1125,16 +1124,14 @@ function pmBucketLabel(b) {
 
 function buildPmAllCitiesChart(selectedBucket) {
   if (selectedBucket === undefined)
-    selectedBucket = document.getElementById('pmMaeBucketSelect')?.value ?? 'final';
+    selectedBucket = document.getElementById('pmMaeBucketSelect')?.value ?? '0';
   const el = document.getElementById('pmMaeChart');
   if (!el || !PM_DATA) return;
-  const isFinal  = selectedBucket === 'final';
-  const bucketNum = isFinal ? null : Number(selectedBucket);
+  const bucketNum = Number(selectedBucket);
 
   const descEl = document.getElementById('pmMaeDesc');
-  if (descEl) descEl.textContent = isFinal
-    ? 'Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.'
-    : 'Average absolute error across all cities for snapshots in the ' + pmBucketLabel(bucketNum) + ' lead window vs. ASOS observed high.';
+  if (descEl) descEl.textContent =
+    'Average absolute error across all cities for snapshots in the ' + pmBucketLabel(bucketNum) + ' lead window vs. ASOS observed high.';
 
   const cities = PM_DATA._cities || [];
   const byDate = {};
@@ -1145,13 +1142,7 @@ function buildPmAllCitiesChart(selectedBucket) {
       if (!entry.resolved || entry.observed_high == null) return;
       const obs   = entry.observed_high;
       const snaps = (entry.snapshots || []).filter(s => s.lead_hours != null && s.lead_hours >= 0);
-      let selected;
-      if (isFinal) {
-        const fin = snaps.reduce((b,s) => b === null || s.lead_hours < b.lead_hours ? s : b, null);
-        selected = fin ? [fin] : [];
-      } else {
-        selected = snaps.filter(s => pmGetBucket(s.lead_hours) === bucketNum);
-      }
+      const selected = snaps.filter(s => pmGetBucket(s.lead_hours) === bucketNum);
       if (!selected.length) return;
       if (!byDate[d]) byDate[d] = {mErrs:[], nErrs:[]};
       selected.forEach(s => {
@@ -1237,15 +1228,32 @@ function buildPmLeadTimeTable(resolvedDates, markets) {
 
 function renderPmCity(cityKey) {
   const pane = document.getElementById('pmPane');
-  const cityData = PM_DATA?.[cityKey];
-  if (!cityData) {
-    pane.innerHTML = '<div class="text-center text-muted p-4 small">No data for this city yet.</div>';
-    return;
+  let markets = {};
+  let resolvedWithObs = [];
+
+  if (cityKey === '__all__') {
+    const cities = PM_DATA?._cities || [];
+    cities.forEach(c => {
+      const cityData = PM_DATA?.[c.key];
+      if (!cityData || !cityData.markets) return;
+      Object.entries(cityData.markets).forEach(([dateKey, entry]) => {
+        if (!entry || !entry.resolved || entry.observed_high == null) return;
+        const compositeKey = c.key + '__' + dateKey;
+        markets[compositeKey] = entry;
+        resolvedWithObs.push(compositeKey);
+      });
+    });
+  } else {
+    const cityData = PM_DATA?.[cityKey];
+    if (!cityData) {
+      pane.innerHTML = '<div class="text-center text-muted p-4 small">No data for this city yet.</div>';
+      return;
+    }
+    markets = cityData.markets || {};
+    const allDates = Object.keys(markets).sort();
+    const resolved = allDates.filter(d => markets[d].resolved).reverse();
+    resolvedWithObs = resolved.filter(d => markets[d].observed_high != null);
   }
-  const markets  = cityData.markets || {};
-  const allDates = Object.keys(markets).sort();
-  const resolved = allDates.filter(d => markets[d].resolved).reverse();
-  const resolvedWithObs = resolved.filter(d => markets[d].observed_high != null);
   const html = buildPmLeadTimeTable(resolvedWithObs, markets);
   pane.innerHTML = html || '<div class="text-center text-muted p-4 small">Collecting sync snapshots — verification will appear once markets resolve.</div>';
 }
@@ -1253,10 +1261,12 @@ function renderPmCity(cityKey) {
 function buildPmTabs(cities) {
   const tabBar = document.getElementById('pmCityTabs');
   tabBar.innerHTML = '';
-  cities.forEach((c, i) => {
+  const tabCities = [{key:'__all__', display:'All'}, ...cities];
+  tabCities.forEach((c, i) => {
     const li  = document.createElement('li');
     li.className = 'nav-item';
     const btn = document.createElement('button');
+    btn.dataset.cityKey = c.key;
     btn.className = 'nav-link' + (i === 0 ? ' active' : '');
     btn.style.fontSize = '0.8rem';
     btn.style.padding  = '0.25rem 0.7rem';
@@ -1264,7 +1274,7 @@ function buildPmTabs(cities) {
     btn.addEventListener('click', () => {
       tabBar.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      renderPmCity(c.key);
+      renderPmCity(btn.dataset.cityKey);
     });
     li.appendChild(btn);
     tabBar.appendChild(li);
