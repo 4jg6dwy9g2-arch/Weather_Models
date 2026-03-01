@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-03-01 14:12 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-03-01 14:34 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -401,9 +401,20 @@ thead tr:nth-child(2) th { background: white; }
     </div>
   </div>
   <div class="card-body" id="pmChartSection" style="display:none;background:#f5f3ff;">
-    <p class="text-muted mb-2" style="font-size:0.8rem;">
-      Average absolute error across all cities (NYC, Miami, Atlanta, Chicago, Seattle, Dallas) using the final sync before each market resolved vs. ASOS observed high.
-    </p>
+    <div class="d-flex align-items-center justify-content-between mb-2">
+      <p id="pmMaeDesc" class="text-muted mb-0" style="font-size:0.8rem;">
+        Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.
+      </p>
+      <select class="form-select form-select-sm ms-2" id="pmMaeBucketSelect" style="width:auto;flex-shrink:0;">
+        <option value="final">Final snap</option>
+        <option value="0">&lt;6h</option>
+        <option value="6">6&ndash;12h</option>
+        <option value="12">12&ndash;18h</option>
+        <option value="18">18&ndash;24h</option>
+        <option value="24">24&ndash;48h</option>
+        <option value="48">48h+</option>
+      </select>
+    </div>
     <div style="position:relative;height:260px"><canvas id="pmMaeChart"></canvas></div>
   </div>
   <div class="card-header border-top d-flex align-items-center gap-2 py-1" style="background:#eef2ff;">
@@ -478,7 +489,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-03-01_14:12_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-03-01_14:34_UTC').then(r => r.json()).catch(() => null),
     fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
@@ -1100,9 +1111,31 @@ function fmtPmDate(isoStr) {
     {weekday:'short', month:'short', day:'numeric'});
 }
 
-function buildPmAllCitiesChart() {
+const PM_BUCKET_EDGES = [0, 6, 12, 18, 24, 48];
+function pmGetBucket(lead_hours) {
+  for (let i = PM_BUCKET_EDGES.length - 1; i >= 0; i--)
+    if (lead_hours >= PM_BUCKET_EDGES[i]) return PM_BUCKET_EDGES[i];
+  return PM_BUCKET_EDGES[0];
+}
+function pmBucketLabel(b) {
+  const idx = PM_BUCKET_EDGES.indexOf(b);
+  if (idx === PM_BUCKET_EDGES.length - 1) return b + 'h+';
+  return (b === 0 ? '<' : b + '–') + PM_BUCKET_EDGES[idx + 1] + 'h';
+}
+
+function buildPmAllCitiesChart(selectedBucket) {
+  if (selectedBucket === undefined)
+    selectedBucket = document.getElementById('pmMaeBucketSelect')?.value ?? 'final';
   const el = document.getElementById('pmMaeChart');
   if (!el || !PM_DATA) return;
+  const isFinal  = selectedBucket === 'final';
+  const bucketNum = isFinal ? null : Number(selectedBucket);
+
+  const descEl = document.getElementById('pmMaeDesc');
+  if (descEl) descEl.textContent = isFinal
+    ? 'Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.'
+    : 'Average absolute error across all cities for snapshots in the ' + pmBucketLabel(bucketNum) + ' lead window vs. ASOS observed high.';
+
   const cities = PM_DATA._cities || [];
   const byDate = {};
   cities.forEach(c => {
@@ -1111,13 +1144,20 @@ function buildPmAllCitiesChart() {
     Object.entries(cityData.markets || {}).forEach(([d, entry]) => {
       if (!entry.resolved || entry.observed_high == null) return;
       const obs   = entry.observed_high;
-      const snaps = entry.snapshots || [];
-      const fin   = snaps.reduce((b,s) =>
-        Math.abs(s.lead_hours ?? 999) < Math.abs((b ?? {lead_hours:9999}).lead_hours) ? s : b, null);
-      if (!fin) return;
+      const snaps = (entry.snapshots || []).filter(s => s.lead_hours != null && s.lead_hours >= 0);
+      let selected;
+      if (isFinal) {
+        const fin = snaps.reduce((b,s) => b === null || s.lead_hours < b.lead_hours ? s : b, null);
+        selected = fin ? [fin] : [];
+      } else {
+        selected = snaps.filter(s => pmGetBucket(s.lead_hours) === bucketNum);
+      }
+      if (!selected.length) return;
       if (!byDate[d]) byDate[d] = {mErrs:[], nErrs:[]};
-      if (fin.market_implied_temp != null) byDate[d].mErrs.push(Math.abs(fin.market_implied_temp - obs));
-      if (fin.nws_high != null)            byDate[d].nErrs.push(Math.abs(fin.nws_high - obs));
+      selected.forEach(s => {
+        if (s.market_implied_temp != null) byDate[d].mErrs.push(Math.abs(s.market_implied_temp - obs));
+        if (s.nws_high != null)            byDate[d].nErrs.push(Math.abs(s.nws_high - obs));
+      });
     });
   });
   const avg    = arr => arr.length ? arr.reduce((s,v)=>s+v,0)/arr.length : null;
@@ -1158,13 +1198,13 @@ function buildPmAllCitiesChart() {
 }
 
 function buildPmLeadTimeTable(resolvedDates, markets) {
-  const BUCKET = 24;
   const byBucket = {};
   resolvedDates.forEach(d => {
     const obs = markets[d].observed_high;
     if (obs == null) return;
     (markets[d].snapshots || []).forEach(s => {
-      const b = Math.floor((s.lead_hours ?? 0) / BUCKET) * BUCKET;
+      if (s.lead_hours == null || s.lead_hours < 0) return;
+      const b = pmGetBucket(s.lead_hours);
       if (!byBucket[b]) byBucket[b] = {mErrs:[], nErrs:[]};
       if (s.market_implied_temp != null) byBucket[b].mErrs.push(s.market_implied_temp - obs);
       if (s.nws_high != null)            byBucket[b].nErrs.push(s.nws_high - obs);
@@ -1179,8 +1219,7 @@ function buildPmLeadTimeTable(resolvedDates, markets) {
     const mBias = avg(byBucket[b].mErrs);
     const nBias = avg(byBucket[b].nErrs);
     const n     = Math.max(byBucket[b].mErrs.length, byBucket[b].nErrs.length);
-    const label = b === 0 ? '<24h' : b + '–' + (b + BUCKET) + 'h';
-    rows += '<tr><td class="ps-2">' + label + '</td>' +
+    rows += '<tr><td class="ps-2">' + pmBucketLabel(b) + '</td>' +
       '<td>' + (mMAE != null ? mMAE.toFixed(1) + '°F' : '—') + '</td>' +
       '<td>' + (nMAE != null ? nMAE.toFixed(1) + '°F' : '—') + '</td>' +
       '<td class="' + pmDiffClass(mBias) + '">' + pmSignedStr(mBias) + '</td>' +
@@ -1246,6 +1285,8 @@ document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventL
 
 ['tsVar','tsMetric','tsLt','tsSpan'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderTs));
+
+document.getElementById('pmMaeBucketSelect').addEventListener('change', () => buildPmAllCitiesChart());
 
 document.getElementById('obsLtSelect').addEventListener('change', () => {
   if (obsSid && OBS_DATA?.[obsSid]) {
