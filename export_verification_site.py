@@ -28,7 +28,7 @@ PAGES_WORKTREE = Path('/Users/kennypratt/weather-pages')
 # Lead times to publish (matches the map dropdown)
 PUBLISH_LEAD_TIMES = [6, 12, 24, 48, 72, 120, 168, 240, 288, 360]
 MODELS = ['gfs', 'aifs', 'ifs', 'nws']
-VARIABLES = ['temp', 'precip', 'dewpoint', 'mslp']
+VARIABLES = ['temp', 'precip', 'dewpoint', 'mslp', 'precip_24hr']
 TS_LEAD_TIMES = [6, 24, 72, 168]   # pre-bake these for the time series chart
 SPOTLIGHT_STATIONS = ['IAD', 'BWI']
 SPOTLIGHT_LEAD_TIMES = [24, 72, 168]
@@ -102,18 +102,61 @@ def extract_station_data() -> dict:
             'd': model_arr
         }
 
+    # Extract by-valid-hour station data (fresh/non-accumulated runs only)
+    by_vh_raw = cache.get('by_station_by_valid_hour', {})
+    for vh in [0, 6, 12, 18]:
+        vh_str = str(vh)
+        vh_stations = {}
+        for station_id, station_vh_data in by_vh_raw.items():
+            meta = stations_meta.get(station_id, {})
+            lat = meta.get('lat')
+            lon = meta.get('lon')
+            if lat is None or lon is None:
+                continue
+            model_arr = []
+            has_any = False
+            for model in MODELS:
+                m_data = station_vh_data.get(model, {})
+                var_arr = []
+                for var in VARIABLES:
+                    lt_arr = []
+                    for lt in available_lts:
+                        if model == 'nws' and lt > 168:
+                            lt_arr.append(None)
+                            continue
+                        v = m_data.get(str(lt), {}).get(vh_str, {}).get(var)
+                        if v and v.get('count', 0) > 0:
+                            lt_arr.append([v['mae'], v['bias']])
+                            has_any = True
+                        else:
+                            lt_arr.append(None)
+                    var_arr.append(lt_arr)
+                model_arr.append(var_arr)
+            if not has_any:
+                continue
+            vh_stations[station_id] = {
+                'name': meta.get('name', station_id),
+                'lat': round(lat, 4),
+                'lon': round(lon, 4),
+                'd': model_arr
+            }
+        result[f'vh_{vh}'] = vh_stations
+
     return result
 
 
-def extract_monthly_station_data(available_lts: list) -> dict:
+def extract_monthly_station_data(available_lts: list) -> tuple:
     """
     Extract per-station MAE/bias from the monthly stats cache (last 20 days).
 
-    Uses the same compact d[model_idx][var_idx][lt_idx] = [mae, bias] format
-    so the frontend can switch between all-time and monthly with one flag.
+    Returns (stations_dict, vh_dict) where vh_dict maps 'vh_N' → stations_dict
+    for each valid hour (0, 6, 12, 18).
+    Uses the same compact d[model_idx][var_idx][lt_idx] = [mae, bias] format.
     Requires the all-time cache for lat/lon metadata.
     """
-    monthly = asos.load_monthly_stats_cache().get('by_station_monthly', {})
+    monthly_cache = asos.load_monthly_stats_cache()
+    monthly = monthly_cache.get('by_station_monthly', {})
+    monthly_vh_raw = monthly_cache.get('by_station_monthly_by_valid_hour', {})
     # Get lat/lon from the verification cache (already loaded by caller)
     cache = asos.load_verification_cache()
     stations_meta = cache.get('stations', {}) if cache else {}
@@ -160,7 +203,52 @@ def extract_monthly_station_data(available_lts: list) -> dict:
             'd': model_arr
         }
 
-    return result
+    # Extract by-valid-hour monthly data
+    # Structure: by_station_monthly_by_valid_hour[sid][model][var][lt_str][vh_str]
+    vh_results = {}
+    for vh in [0, 6, 12, 18]:
+        vh_str = str(vh)
+        vh_stations = {}
+        for station_id, station_data in monthly_vh_raw.items():
+            meta = stations_meta.get(station_id, {})
+            lat = meta.get('lat')
+            lon = meta.get('lon')
+            if lat is None or lon is None:
+                continue
+            model_arr = []
+            has_any = False
+            for model in MODELS:
+                m_data = station_data.get(model, {})
+                var_arr = []
+                for var in VARIABLES:
+                    lt_arr = []
+                    var_data = m_data.get(var, {})
+                    for lt in available_lts:
+                        if model == 'nws' and lt > 168:
+                            lt_arr.append(None)
+                            continue
+                        lt_stats = var_data.get(str(lt), {}).get(vh_str)
+                        if lt_stats and lt_stats.get('count', 0) > 0:
+                            count = lt_stats['count']
+                            mae = round(lt_stats['sum_abs_errors'] / count, 2)
+                            bias = round(lt_stats['sum_errors'] / count, 2)
+                            lt_arr.append([mae, bias])
+                            has_any = True
+                        else:
+                            lt_arr.append(None)
+                    var_arr.append(lt_arr)
+                model_arr.append(var_arr)
+            if not has_any:
+                continue
+            vh_stations[station_id] = {
+                'name': meta.get('name', station_id),
+                'lat': round(lat, 4),
+                'lon': round(lon, 4),
+                'd': model_arr
+            }
+        vh_results[f'vh_{vh}'] = vh_stations
+
+    return result, vh_results
 
 
 def extract_timeseries_data() -> dict:
@@ -173,7 +261,7 @@ def extract_timeseries_data() -> dict:
                 gfs = asos.get_verification_time_series_from_cache('gfs', var, lt, days_back=365)
                 aifs_d = asos.get_verification_time_series_from_cache('aifs', var, lt, days_back=365)
                 ifs_d = asos.get_verification_time_series_from_cache('ifs', var, lt, days_back=365)
-                include_nws = var in ('temp', 'precip', 'dewpoint')
+                include_nws = var in ('temp', 'precip', 'precip_24hr', 'dewpoint')
                 nws_d = asos.get_verification_time_series_from_cache('nws', var, lt, days_back=365) if include_nws else {}
 
                 if 'error' in gfs:
@@ -389,7 +477,8 @@ thead tr:nth-child(2) th {{ background: white; }}
         <ul>
           <li><strong>Temperature</strong> &mdash; 2-meter air temperature (°F). Matched to hourly METAR observations.</li>
           <li><strong>Dew Point</strong> &mdash; 2-meter dew point temperature (°F). Matched to hourly METAR observations.</li>
-          <li><strong>Precipitation</strong> &mdash; 6-hour accumulated precipitation (in). Requires at least 4 of 6 hourly reports to be present; computed from the final per-hour METAR accumulation total.</li>
+          <li><strong>Precipitation (6hr)</strong> &mdash; 6-hour accumulated precipitation (in). Requires at least 4 of 6 hourly reports to be present; computed from the final per-hour METAR accumulation total.</li>
+          <li><strong>Precipitation (24hr)</strong> &mdash; 24-hour (12Z&ndash;12Z) accumulated precipitation (in). Sum of four consecutive 6-hour periods ending at 12Z. Requires at least 20 of 24 hourly reports; shown only at lead times where the valid time falls on 12Z.</li>
           <li><strong>Pressure</strong> &mdash; Altimeter setting (mb). Matched to automated 5-minute ASOS pressure observations.</li>
         </ul>
 
@@ -440,7 +529,8 @@ thead tr:nth-child(2) th {{ background: white; }}
       <select class="form-select form-select-sm" id="selVar" style="width:auto">
         <option value="temp">Temperature</option>
         <option value="mslp">Pressure</option>
-        <option value="precip">Precipitation</option>
+        <option value="precip">Precipitation (6hr)</option>
+        <option value="precip_24hr">Precipitation (24hr)</option>
         <option value="dewpoint">Dew Point</option>
       </select>
       <select class="form-select form-select-sm" id="selMetric" style="width:auto">
@@ -454,6 +544,18 @@ thead tr:nth-child(2) th {{ background: white; }}
         <option value="nws">NWS</option>
       </select>
       <select class="form-select form-select-sm" id="selLt" style="width:auto"></select>
+      <div class="btn-group btn-group-sm" role="group" id="mapVhFilter">
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-all" value="" autocomplete="off" checked>
+        <label class="btn btn-outline-secondary" for="mvh-all">All</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-00" value="0" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-00">00Z</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-06" value="6" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-06">06Z</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-12" value="12" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-12">12Z</label>
+        <input type="radio" class="btn-check" name="mapVh" id="mvh-18" value="18" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="mvh-18">18Z</label>
+      </div>
     </div>
   </div>
   <div class="card-body p-0">
@@ -502,8 +604,14 @@ thead tr:nth-child(2) th {{ background: white; }}
       </div>
       <div class="col-lg-6">
         <div class="card h-100">
-          <div class="card-header"><i class="bi bi-cloud-rain"></i> Precipitation</div>
+          <div class="card-header"><i class="bi bi-cloud-rain"></i> Precipitation (6hr)</div>
           <div class="card-body"><div class="chart-wrap"><canvas id="dtPrecipChart"></canvas></div></div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-cloud-rain-heavy"></i> Precipitation (24hr)</div>
+          <div class="card-body"><div class="chart-wrap"><canvas id="dtPrecip24hrChart"></canvas></div></div>
         </div>
       </div>
       <div class="col-lg-6">
@@ -587,6 +695,12 @@ thead tr:nth-child(2) th {{ background: white; }}
         <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
         <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
       </div>
+      <div class="btn-group btn-group-sm" id="precipPeriodToggle">
+        <input type="radio" class="btn-check" name="precipPeriod" id="pp-6hr" value="precip" autocomplete="off" checked>
+        <label class="btn btn-outline-secondary" for="pp-6hr">Precip 6hr</label>
+        <input type="radio" class="btn-check" name="precipPeriod" id="pp-24hr" value="precip_24hr" autocomplete="off">
+        <label class="btn btn-outline-secondary" for="pp-24hr">24hr</label>
+      </div>
       <div class="btn-group btn-group-sm" id="validHourFilter">
         <input type="radio" class="btn-check" name="validHour" id="vh-all" value="" autocomplete="off" checked>
         <label class="btn btn-outline-secondary" for="vh-all">All</label>
@@ -608,7 +722,7 @@ thead tr:nth-child(2) th {{ background: white; }}
           <tr>
             <th rowspan="2">Lead</th><th rowspan="2">Runs</th>
             <th colspan="5" class="text-center border-start">Temp (°F)</th>
-            <th colspan="5" class="text-center border-start">Precip (in)</th>
+            <th colspan="5" class="text-center border-start" id="precipTableHeader">Precip 6hr (in)</th>
             <th colspan="5" class="text-center border-start">Dew Point (°F)</th>
             <th colspan="3" class="text-center border-start">Pressure (mb)</th>
           </tr>
@@ -647,7 +761,8 @@ thead tr:nth-child(2) th {{ background: white; }}
       <select class="form-select form-select-sm" id="tsVar" style="width:auto">
         <option value="temp">Temperature</option>
         <option value="mslp">Pressure</option>
-        <option value="precip">Precipitation</option>
+        <option value="precip">Precipitation (6hr)</option>
+        <option value="precip_24hr">Precipitation (24hr)</option>
         <option value="dewpoint">Dew Point</option>
       </select>
       <select class="form-select form-select-sm" id="tsMetric" style="width:auto">
@@ -703,9 +818,20 @@ thead tr:nth-child(2) th {{ background: white; }}
     </div>
   </div>
   <div class="card-body" id="pmChartSection" style="display:none;background:#f5f3ff;">
-    <p class="text-muted mb-2" style="font-size:0.8rem;">
-      Average absolute error across all cities (NYC, Miami, Atlanta, Chicago, Seattle, Dallas) using the final sync before each market resolved vs. ASOS observed high.
-    </p>
+    <div class="d-flex align-items-center justify-content-between mb-2">
+      <p id="pmMaeDesc" class="text-muted mb-0" style="font-size:0.8rem;">
+        Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.
+      </p>
+      <select class="form-select form-select-sm ms-2" id="pmMaeBucketSelect" style="width:auto;flex-shrink:0;">
+        <option value="final">Final snap</option>
+        <option value="0">&lt;6h</option>
+        <option value="6">6&ndash;12h</option>
+        <option value="12">12&ndash;18h</option>
+        <option value="18">18&ndash;24h</option>
+        <option value="24">24&ndash;48h</option>
+        <option value="48">48h+</option>
+      </select>
+    </div>
     <div style="position:relative;height:260px"><canvas id="pmMaeChart"></canvas></div>
   </div>
   <div class="card-header border-top d-flex align-items-center gap-2 py-1" style="background:#eef2ff;">
@@ -725,8 +851,8 @@ thead tr:nth-child(2) th {{ background: white; }}
 // ============================================================
 const MODELS    = ['gfs','aifs','ifs','nws'];
 const MODEL_IDX = {{gfs:0,aifs:1,ifs:2,nws:3}};
-const VAR_IDX   = {{temp:0,precip:1,dewpoint:2,mslp:3}};
-const VAR_UNITS = {{temp:'°F',precip:'in',dewpoint:'°F',mslp:'mb'}};
+const VAR_IDX   = {{temp:0,precip:1,dewpoint:2,mslp:3,precip_24hr:4}};
+const VAR_UNITS = {{temp:'°F',precip:'in',dewpoint:'°F',mslp:'mb',precip_24hr:'in'}};
 const VAR_PRECIP = 'precip';
 const SPOTLIGHT_STATIONS = new Set(['IAD','BWI']);
 
@@ -747,7 +873,7 @@ const DROUGHT_COLORS = {{0:'#FFFF00',1:'#FCD37F',2:'#FFAA00',3:'#E60000',4:'#730
 async function loadDroughtOverlay() {{
   const variable = document.getElementById('selVar').value;
   const periodToggle = document.getElementById('periodToggle').checked;
-  const showDrought = (variable === 'dewpoint' || variable === 'precip') && periodToggle;
+  const showDrought = (variable === 'dewpoint' || variable === 'precip' || variable === 'precip_24hr') && periodToggle;
 
   if (droughtLayer) {{ asosMap.removeLayer(droughtLayer); droughtLayer = null; }}
   document.getElementById('droughtLegend').style.display = 'none';
@@ -822,7 +948,7 @@ function initMap() {{
 }}
 
 function getMaeColor(value, variable) {{
-  const max = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+  const max = variable === 'precip_24hr' ? 1.0 : variable === VAR_PRECIP ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
   const r = Math.max(0, Math.min(1, value / max));
   if (r < 0.5) {{
     const t = r * 2;
@@ -833,9 +959,9 @@ function getMaeColor(value, variable) {{
   }}
 }}
 function getBiasColor(value, variable) {{
-  const max = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+  const max = variable === 'precip_24hr' ? 1.0 : variable === VAR_PRECIP ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
   const r = Math.max(-1, Math.min(1, value / max));
-  if (variable === VAR_PRECIP) {{
+  if (variable === VAR_PRECIP || variable === 'precip_24hr') {{
     const g = (r+1)/2;
     if (g < 0.5) {{
       const t=g*2; return `rgb(${{Math.round(139+t*116)}},${{Math.round(69+t*186)}},${{Math.round(19+t*236)}})`;
@@ -858,13 +984,13 @@ function getBiasColor(value, variable) {{
 }}
 
 function updateColorScale(variable, metric) {{
-  const isP = variable === VAR_PRECIP;
+  const isP = variable === VAR_PRECIP || variable === 'precip_24hr';
   const bar = document.getElementById('scaleBar');
   const mn  = document.getElementById('scaleMin');
   const mx  = document.getElementById('scaleMax');
   document.getElementById('scaleUnits').textContent = VAR_UNITS[variable] || '';
   const isTD = variable === 'temp' || variable === 'dewpoint';
-  const scaleMax = isP ? '1.0' : isTD ? '20.0' : '10.0';
+  const scaleMax = variable === 'precip_24hr' ? '1.0' : variable === VAR_PRECIP ? '0.3' : isTD ? '20.0' : '10.0';
   if (metric === 'bias') {{
     mn.textContent = '-' + scaleMax;
     mx.textContent = scaleMax;
@@ -887,8 +1013,18 @@ function renderMap() {{
   const model    = document.getElementById('selModel').value;
   const lt       = parseInt(document.getElementById('selLt').value, 10);
   const useMonthly = document.getElementById('periodToggle').checked && MAP_DATA.monthly;
+  const mapVh = document.querySelector('input[name="mapVh"]:checked')?.value ?? '';
 
-  const stationSet = useMonthly ? MAP_DATA.monthly : MAP_DATA.stations;
+  let stationSet;
+  if (useMonthly) {{
+    stationSet = mapVh !== '' && MAP_DATA[`monthly_vh_${{mapVh}}`]
+      ? MAP_DATA[`monthly_vh_${{mapVh}}`]
+      : MAP_DATA.monthly;
+  }} else {{
+    stationSet = mapVh !== '' && MAP_DATA[`vh_${{mapVh}}`]
+      ? MAP_DATA[`vh_${{mapVh}}`]
+      : MAP_DATA.stations;
+  }}
 
   const mi = MODEL_IDX[model] ?? 0;
   const vi = VAR_IDX[variable] ?? 0;
@@ -899,7 +1035,7 @@ function renderMap() {{
   markers.forEach(m => asosMap.removeLayer(m));
   markers = [];
 
-  const maxScale = variable === VAR_PRECIP ? 1 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+  const maxScale = variable === 'precip_24hr' ? 1.0 : variable === VAR_PRECIP ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
 
   for (const [sid, st] of Object.entries(stationSet)) {{
     const entry = st.d?.[mi]?.[vi]?.[ltIdx];
@@ -1008,10 +1144,11 @@ function buildVarChart(canvasId, varKey, unit, metric) {{
 function renderDetailCharts() {{
   if (!detailSt) return;
   const metric = document.querySelector('input[name="detailMetric"]:checked').value;
-  buildVarChart('dtTempChart',  'temp',     '°F', metric);
-  buildVarChart('dtPrecipChart','precip',   'in',  metric);
-  buildVarChart('dtDewChart',   'dewpoint', '°F', metric);
-  buildVarChart('dtMslpChart',  'mslp',    'mb',  metric);
+  buildVarChart('dtTempChart',     'temp',       '°F', metric);
+  buildVarChart('dtPrecipChart',   'precip',     'in',  metric);
+  buildVarChart('dtPrecip24hrChart','precip_24hr','in',  metric);
+  buildVarChart('dtDewChart',      'dewpoint',   '°F', metric);
+  buildVarChart('dtMslpChart',     'mslp',      'mb',  metric);
 }}
 
 function renderObsCharts(sid, lt) {{
@@ -1207,6 +1344,11 @@ function renderTable() {{
   const tbody   = document.getElementById('tbody');
   tbody.innerHTML = '';
 
+  const precipVar = document.querySelector('input[name="precipPeriod"]:checked')?.value ?? 'precip';
+  const precipLabel = precipVar === 'precip_24hr' ? 'Precip 24hr (in)' : 'Precip 6hr (in)';
+  const precipHeader = document.getElementById('precipTableHeader');
+  if (precipHeader) precipHeader.textContent = precipLabel;
+
   if (!v?.lead_times?.length) {{
     tbody.innerHTML = '<tr><td colspan="20" class="text-center text-muted">No data</td></tr>';
     return;
@@ -1224,10 +1366,11 @@ function renderTable() {{
     const aTm=v.aifs_temp_mae?.[i], aTb=v.aifs_temp_bias?.[i];
     const iTm=v.ifs_temp_mae?.[i],  iTb=v.ifs_temp_bias?.[i];
     const nTm=v.nws_temp_mae?.[i],  nTb=v.nws_temp_bias?.[i];
-    const gRm=v.gfs_precip_mae?.[i],   gRb=v.gfs_precip_bias?.[i];
-    const aRm=v.aifs_precip_mae?.[i],  aRb=v.aifs_precip_bias?.[i];
-    const iRm=v.ifs_precip_mae?.[i],   iRb=v.ifs_precip_bias?.[i];
-    const nRm=v.nws_precip_mae?.[i],   nRb=v.nws_precip_bias?.[i];
+    const pfx = precipVar === 'precip_24hr' ? 'precip_24hr' : 'precip';
+    const gRm=v[`gfs_${{pfx}}_mae`]?.[i],   gRb=v[`gfs_${{pfx}}_bias`]?.[i];
+    const aRm=v[`aifs_${{pfx}}_mae`]?.[i],  aRb=v[`aifs_${{pfx}}_bias`]?.[i];
+    const iRm=v[`ifs_${{pfx}}_mae`]?.[i],   iRb=v[`ifs_${{pfx}}_bias`]?.[i];
+    const nRm=v[`nws_${{pfx}}_mae`]?.[i],   nRb=v[`nws_${{pfx}}_bias`]?.[i];
     const gDm=v.gfs_dewpoint_mae?.[i], gDb=v.gfs_dewpoint_bias?.[i];
     const aDm=v.aifs_dewpoint_mae?.[i],aDb=v.aifs_dewpoint_bias?.[i];
     const iDm=v.ifs_dewpoint_mae?.[i], iDb=v.ifs_dewpoint_bias?.[i];
@@ -1248,10 +1391,10 @@ function renderTable() {{
       <td class="text-center">${{isMae?f1(iTm,a?.ifs_temp_mae?.[i]):sg(iTb)}}</td>
       <td class="text-center">${{isMae?f1(nTm,a?.nws_temp_mae?.[i]):sg(nTb)}}</td>
       <td><span class="${{tC}}">${{tW}}</span></td>
-      <td class="text-center border-start">${{isMae?f2(gRm,a?.gfs_precip_mae?.[i]):sg(gRb,2)}}</td>
-      <td class="text-center">${{isMae?f2(aRm,a?.aifs_precip_mae?.[i]):sg(aRb,2)}}</td>
-      <td class="text-center">${{isMae?f2(iRm,a?.ifs_precip_mae?.[i]):sg(iRb,2)}}</td>
-      <td class="text-center">${{isMae?f2(nRm,a?.nws_precip_mae?.[i]):sg(nRb,2)}}</td>
+      <td class="text-center border-start">${{isMae?f2(gRm,a?.[`gfs_${{pfx}}_mae`]?.[i]):sg(gRb,2)}}</td>
+      <td class="text-center">${{isMae?f2(aRm,a?.[`aifs_${{pfx}}_mae`]?.[i]):sg(aRb,2)}}</td>
+      <td class="text-center">${{isMae?f2(iRm,a?.[`ifs_${{pfx}}_mae`]?.[i]):sg(iRb,2)}}</td>
+      <td class="text-center">${{isMae?f2(nRm,a?.[`nws_${{pfx}}_mae`]?.[i]):sg(nRb,2)}}</td>
       <td><span class="${{rC}}">${{rW}}</span></td>
       <td class="text-center border-start">${{isMae?f1(gDm,a?.gfs_dewpoint_mae?.[i]):sg(gDb)}}</td>
       <td class="text-center">${{isMae?f1(aDm,a?.aifs_dewpoint_mae?.[i]):sg(aDb)}}</td>
@@ -1385,9 +1528,31 @@ function fmtPmDate(isoStr) {{
     {{weekday:'short', month:'short', day:'numeric'}});
 }}
 
-function buildPmAllCitiesChart() {{
+const PM_BUCKET_EDGES = [0, 6, 12, 18, 24, 48];
+function pmGetBucket(lead_hours) {{
+  for (let i = PM_BUCKET_EDGES.length - 1; i >= 0; i--)
+    if (lead_hours >= PM_BUCKET_EDGES[i]) return PM_BUCKET_EDGES[i];
+  return PM_BUCKET_EDGES[0];
+}}
+function pmBucketLabel(b) {{
+  const idx = PM_BUCKET_EDGES.indexOf(b);
+  if (idx === PM_BUCKET_EDGES.length - 1) return b + 'h+';
+  return (b === 0 ? '<' : b + '\u2013') + PM_BUCKET_EDGES[idx + 1] + 'h';
+}}
+
+function buildPmAllCitiesChart(selectedBucket) {{
+  if (selectedBucket === undefined)
+    selectedBucket = document.getElementById('pmMaeBucketSelect')?.value ?? 'final';
   const el = document.getElementById('pmMaeChart');
   if (!el || !PM_DATA) return;
+  const isFinal  = selectedBucket === 'final';
+  const bucketNum = isFinal ? null : Number(selectedBucket);
+
+  const descEl = document.getElementById('pmMaeDesc');
+  if (descEl) descEl.textContent = isFinal
+    ? 'Average absolute error across all cities using the final sync before each market resolved vs. ASOS observed high.'
+    : 'Average absolute error across all cities for snapshots in the ' + pmBucketLabel(bucketNum) + ' lead window vs. ASOS observed high.';
+
   const cities = PM_DATA._cities || [];
   const byDate = {{}};
   cities.forEach(c => {{
@@ -1396,13 +1561,20 @@ function buildPmAllCitiesChart() {{
     Object.entries(cityData.markets || {{}}).forEach(([d, entry]) => {{
       if (!entry.resolved || entry.observed_high == null) return;
       const obs   = entry.observed_high;
-      const snaps = entry.snapshots || [];
-      const fin   = snaps.reduce((b,s) =>
-        Math.abs(s.lead_hours ?? 999) < Math.abs((b ?? {{lead_hours:9999}}).lead_hours) ? s : b, null);
-      if (!fin) return;
+      const snaps = (entry.snapshots || []).filter(s => s.lead_hours != null && s.lead_hours >= 0);
+      let selected;
+      if (isFinal) {{
+        const fin = snaps.reduce((b,s) => b === null || s.lead_hours < b.lead_hours ? s : b, null);
+        selected = fin ? [fin] : [];
+      }} else {{
+        selected = snaps.filter(s => pmGetBucket(s.lead_hours) === bucketNum);
+      }}
+      if (!selected.length) return;
       if (!byDate[d]) byDate[d] = {{mErrs:[], nErrs:[]}};
-      if (fin.market_implied_temp != null) byDate[d].mErrs.push(Math.abs(fin.market_implied_temp - obs));
-      if (fin.nws_high != null)            byDate[d].nErrs.push(Math.abs(fin.nws_high - obs));
+      selected.forEach(s => {{
+        if (s.market_implied_temp != null) byDate[d].mErrs.push(Math.abs(s.market_implied_temp - obs));
+        if (s.nws_high != null)            byDate[d].nErrs.push(Math.abs(s.nws_high - obs));
+      }});
     }});
   }});
   const avg    = arr => arr.length ? arr.reduce((s,v)=>s+v,0)/arr.length : null;
@@ -1443,13 +1615,13 @@ function buildPmAllCitiesChart() {{
 }}
 
 function buildPmLeadTimeTable(resolvedDates, markets) {{
-  const BUCKET = 24;
   const byBucket = {{}};
   resolvedDates.forEach(d => {{
     const obs = markets[d].observed_high;
     if (obs == null) return;
     (markets[d].snapshots || []).forEach(s => {{
-      const b = Math.floor((s.lead_hours ?? 0) / BUCKET) * BUCKET;
+      if (s.lead_hours == null || s.lead_hours < 0) return;
+      const b = pmGetBucket(s.lead_hours);
       if (!byBucket[b]) byBucket[b] = {{mErrs:[], nErrs:[]}};
       if (s.market_implied_temp != null) byBucket[b].mErrs.push(s.market_implied_temp - obs);
       if (s.nws_high != null)            byBucket[b].nErrs.push(s.nws_high - obs);
@@ -1464,8 +1636,7 @@ function buildPmLeadTimeTable(resolvedDates, markets) {{
     const mBias = avg(byBucket[b].mErrs);
     const nBias = avg(byBucket[b].nErrs);
     const n     = Math.max(byBucket[b].mErrs.length, byBucket[b].nErrs.length);
-    const label = b === 0 ? '<24h' : b + '\u2013' + (b + BUCKET) + 'h';
-    rows += '<tr><td class="ps-2">' + label + '</td>' +
+    rows += '<tr><td class="ps-2">' + pmBucketLabel(b) + '</td>' +
       '<td>' + (mMAE != null ? mMAE.toFixed(1) + '\u00b0F' : '\u2014') + '</td>' +
       '<td>' + (nMAE != null ? nMAE.toFixed(1) + '\u00b0F' : '\u2014') + '</td>' +
       '<td class="' + pmDiffClass(mBias) + '">' + pmSignedStr(mBias) + '</td>' +
@@ -1522,13 +1693,17 @@ function buildPmTabs(cities) {{
 // ============================================================
 ['selVar','selMetric','selModel','selLt'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderMap));
+document.querySelectorAll('input[name="mapVh"]').forEach(r => r.addEventListener('change', renderMap));
 document.getElementById('periodToggle').addEventListener('change', () => {{ renderTable(); renderMap(); }});
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventListener('change', renderTable));
+document.querySelectorAll('input[name="precipPeriod"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="detailMetric"]').forEach(r => r.addEventListener('change', renderDetailCharts));
 
 ['tsVar','tsMetric','tsLt','tsSpan'].forEach(id =>
   document.getElementById(id).addEventListener('change', renderTs));
+
+document.getElementById('pmMaeBucketSelect').addEventListener('change', () => buildPmAllCitiesChart());
 
 document.getElementById('obsLtSelect').addEventListener('change', () => {{
   if (obsSid && OBS_DATA?.[obsSid]) {{
@@ -1564,11 +1739,15 @@ def generate_site(output_dir: Path = PAGES_WORKTREE) -> None:
 
     if use_monthly:
         print("Extracting monthly (last 20 days) station data...")
-        monthly_stations = extract_monthly_station_data(station_data['lead_times'])
+        monthly_stations, monthly_vh = extract_monthly_station_data(station_data['lead_times'])
         station_data['monthly'] = monthly_stations
+        for vh in [0, 6, 12, 18]:
+            station_data[f'monthly_vh_{vh}'] = monthly_vh.get(f'vh_{vh}', {})
         print(f"  {len(monthly_stations)} stations with monthly data")
     else:
         station_data['monthly'] = None
+        for vh in [0, 6, 12, 18]:
+            station_data[f'monthly_vh_{vh}'] = None
 
     print("Extracting time series data...")
     ts_data = extract_timeseries_data()
