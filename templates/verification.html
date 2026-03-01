@@ -98,7 +98,8 @@
                         <select class="form-select form-select-sm" id="asosVariable" style="width: auto;">
                             <option value="temp">Temperature</option>
                             <option value="mslp">Pressure</option>
-                            <option value="precip">Precipitation</option>
+                            <option value="precip">Precipitation (6hr)</option>
+                            <option value="precip_24hr">Precipitation (24hr)</option>
                             <option value="dewpoint">Dew Point</option>
                         </select>
                         <select class="form-select form-select-sm" id="asosMetric" style="width: auto;">
@@ -262,6 +263,12 @@
                                         <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
                                         <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
                                     </div>
+                                    <div class="btn-group btn-group-sm ms-2" role="group" id="precipPeriodToggle">
+                                        <input type="radio" class="btn-check" name="precipPeriod" id="pp-6hr" value="precip" autocomplete="off" checked>
+                                        <label class="btn btn-outline-secondary" for="pp-6hr">Precip 6hr</label>
+                                        <input type="radio" class="btn-check" name="precipPeriod" id="pp-24hr" value="precip_24hr" autocomplete="off">
+                                        <label class="btn btn-outline-secondary" for="pp-24hr">24hr</label>
+                                    </div>
                                     </div>
                                 </div>
                                 <div class="card-body p-0">
@@ -272,7 +279,7 @@
                                                     <th rowspan="2">Lead</th>
                                                     <th rowspan="2">Runs</th>
                                                     <th colspan="5" class="text-center border-start">Temp (°F)</th>
-                                                    <th colspan="5" class="text-center border-start">Precip (in)</th>
+                                                    <th colspan="5" class="text-center border-start" id="precipTableHeader">Precip 6hr (in)</th>
                                                     <th colspan="5" class="text-center border-start">Dew Point (°F)</th>
                                                     <th colspan="3" class="text-center border-start">Pressure (mb)</th>
                                                 </tr>
@@ -345,6 +352,7 @@
                                             <option value="90">3 months</option>
                                             <option value="180">6 months</option>
                                             <option value="365">1 year</option>
+                                            <option value="9999">All time</option>
                                         </select>
                                     </div>
                                 </div>
@@ -518,7 +526,7 @@ function initAsosMap() {
 function getMaeColor(value, minVal, maxVal, variable) {
     // Fixed scale: different ranges for precipitation vs temp/mslp
     const fixedMin = 0;
-    const fixedMax = (variable === 'precip') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+    const fixedMax = (variable === 'precip_24hr') ? 1.0 : (variable === 'precip') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
     const ratio = Math.max(0, Math.min(1, (value - fixedMin) / (fixedMax - fixedMin)));
 
     // Green (#22c55e) -> Yellow (#eab308) -> Red (#ef4444)
@@ -542,13 +550,13 @@ function getMaeColor(value, minVal, maxVal, variable) {
 // Color interpolation for Bias with variable-specific color schemes
 function getBiasColor(value, minVal, maxVal, variable) {
     // Fixed scale: different ranges for precipitation vs temp/mslp
-    const fixedMax = (variable === 'precip') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+    const fixedMax = (variable === 'precip_24hr') ? 1.0 : (variable === 'precip') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
     const fixedMin = -fixedMax;
     const clampedValue = Math.max(fixedMin, Math.min(fixedMax, value));
     const ratio = clampedValue / fixedMax;  // -1 to 1
 
     // Different color schemes for precipitation vs temperature/pressure
-    if (variable === 'precip') {
+    if (variable === 'precip' || variable === 'precip_24hr') {
         // Precipitation: Brown (dry) -> White -> Green (wet)
         const gradientRatio = (ratio + 1) / 2;  // 0 to 1
         if (gradientRatio < 0.5) {
@@ -624,13 +632,18 @@ function updateColorScale(metric, minVal, maxVal, variable) {
         'temp': '°F',
         'mslp': 'mb',
         'precip': 'in',
+        'precip_24hr': 'in',
         'dewpoint': '°F'
     };
     unitsSpan.textContent = units[variable] || '';
 
     // Use fixed scale ranges - different for precipitation vs temp/mslp
     if (metric === 'bias') {
-        if (variable === 'precip') {
+        if (variable === 'precip_24hr') {
+            minSpan.textContent = '-1.0';
+            maxSpan.textContent = '1.0';
+            scale.style.background = 'linear-gradient(to right, rgb(139, 69, 19), rgb(255, 255, 255), rgb(34, 139, 34))';
+        } else if (variable === 'precip') {
             minSpan.textContent = '-0.3';
             maxSpan.textContent = '0.3';
             // Brown -> White -> Green gradient for precipitation
@@ -647,7 +660,10 @@ function updateColorScale(metric, minVal, maxVal, variable) {
             scale.style.background = 'linear-gradient(to right, #3b82f6, #ffffff 50%, #ef4444)';
         }
     } else {  // MAE
-        if (variable === 'precip') {
+        if (variable === 'precip_24hr') {
+            minSpan.textContent = '0.0';
+            maxSpan.textContent = '1.0';
+        } else if (variable === 'precip') {
             minSpan.textContent = '0.0';
             maxSpan.textContent = '0.3';
         } else {
@@ -1544,6 +1560,11 @@ function renderAsosVerificationTable(v, vAll = null, metric = 'mae') {
         return;
     }
 
+    const precipVar = document.querySelector('input[name="precipPeriod"]:checked')?.value ?? 'precip';
+    const precipLabel = precipVar === 'precip_24hr' ? 'Precip 24hr (in)' : 'Precip 6hr (in)';
+    const precipHeader = document.getElementById('precipTableHeader');
+    if (precipHeader) precipHeader.textContent = precipLabel;
+
     for (let i = 0; i < v.lead_times.length; i++) {
         const lt = v.lead_times[i];
         const days = (lt / 24).toFixed(1);
@@ -1573,15 +1594,16 @@ function renderAsosVerificationTable(v, vAll = null, metric = 'mae') {
         const ifsMslpMae = v.ifs_mslp_mae ? v.ifs_mslp_mae[i] : null;
         const ifsMslpBias = v.ifs_mslp_bias ? v.ifs_mslp_bias[i] : null;
 
-        // Precipitation data
-        const gfsPrecipMae = v.gfs_precip_mae ? v.gfs_precip_mae[i] : null;
-        const gfsPrecipBias = v.gfs_precip_bias ? v.gfs_precip_bias[i] : null;
-        const aifsPrecipMae = v.aifs_precip_mae ? v.aifs_precip_mae[i] : null;
-        const aifsPrecipBias = v.aifs_precip_bias ? v.aifs_precip_bias[i] : null;
-        const ifsPrecipMae = v.ifs_precip_mae ? v.ifs_precip_mae[i] : null;
-        const ifsPrecipBias = v.ifs_precip_bias ? v.ifs_precip_bias[i] : null;
-        const nwsPrecipMae = v.nws_precip_mae ? v.nws_precip_mae[i] : null;
-        const nwsPrecipBias = v.nws_precip_bias ? v.nws_precip_bias[i] : null;
+        // Precipitation data (6hr or 24hr based on toggle)
+        const pfx = precipVar === 'precip_24hr' ? 'precip_24hr' : 'precip';
+        const gfsPrecipMae = v[`gfs_${pfx}_mae`] ? v[`gfs_${pfx}_mae`][i] : null;
+        const gfsPrecipBias = v[`gfs_${pfx}_bias`] ? v[`gfs_${pfx}_bias`][i] : null;
+        const aifsPrecipMae = v[`aifs_${pfx}_mae`] ? v[`aifs_${pfx}_mae`][i] : null;
+        const aifsPrecipBias = v[`aifs_${pfx}_bias`] ? v[`aifs_${pfx}_bias`][i] : null;
+        const ifsPrecipMae = v[`ifs_${pfx}_mae`] ? v[`ifs_${pfx}_mae`][i] : null;
+        const ifsPrecipBias = v[`ifs_${pfx}_bias`] ? v[`ifs_${pfx}_bias`][i] : null;
+        const nwsPrecipMae = v[`nws_${pfx}_mae`] ? v[`nws_${pfx}_mae`][i] : null;
+        const nwsPrecipBias = v[`nws_${pfx}_bias`] ? v[`nws_${pfx}_bias`][i] : null;
 
         // Dewpoint data
         const gfsDewMae = v.gfs_dewpoint_mae ? v.gfs_dewpoint_mae[i] : null;
@@ -1722,7 +1744,7 @@ const DROUGHT_COLORS = {
 async function loadDroughtOverlay() {
     const variable = document.getElementById('asosVariable').value;
     const periodToggle = document.getElementById('asosPeriodToggle').checked;
-    const showDrought = (variable === 'dewpoint' || variable === 'precip') && periodToggle;
+    const showDrought = (variable === 'dewpoint' || variable === 'precip' || variable === 'precip_24hr') && periodToggle;
 
     // Remove existing layer and hide legend
     if (droughtLayer) {
@@ -2161,6 +2183,12 @@ document.querySelectorAll('input[name="validHour"]').forEach(radio => {
     });
 });
 document.querySelectorAll('input[name="tableMetric"]').forEach(radio => {
+    radio.addEventListener('change', function() {
+        const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
+        loadMeanAsosVerification(period);
+    });
+});
+document.querySelectorAll('input[name="precipPeriod"]').forEach(radio => {
     radio.addEventListener('change', function() {
         const period = document.getElementById('asosPeriodToggle').checked ? 'monthly' : 'all';
         loadMeanAsosVerification(period);

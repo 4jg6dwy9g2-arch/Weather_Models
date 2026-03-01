@@ -1,0 +1,420 @@
+{% extends "base.html" %}
+
+{% block title %}Polymarket Temperature Markets — Weather Forecast{% endblock %}
+
+{% block extra_css %}
+<style>
+    .pm-card {
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        padding: 1.25rem;
+        margin-bottom: 1rem;
+    }
+
+    .section-header {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #1d1d1f;
+        margin: 1.5rem 0 0.75rem;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .city-tabs .nav-link {
+        font-size: 0.88rem;
+        font-weight: 600;
+        padding: 0.35rem 0.9rem;
+    }
+
+    .verif-table th {
+        font-size: 0.78rem;
+        font-weight: 700;
+        color: #555;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+
+    .verif-table td {
+        font-size: 0.88rem;
+        vertical-align: middle;
+    }
+
+    .diff-warm    { color: #c04000; font-weight: 700; }
+    .diff-cool    { color: #0060b0; font-weight: 700; }
+    .diff-neutral { color: #555; }
+
+    .empty-state {
+        text-align: center;
+        color: #999;
+        padding: 2.5rem;
+        font-size: 0.9rem;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+
+    {% if not request.args.get('embed') %}
+    <div class="d-flex align-items-center justify-content-between mb-3">
+        <div>
+            <h1 class="mb-1"><i class="bi bi-graph-up-arrow"></i> Polymarket Daily High Temp</h1>
+            <p class="text-muted mb-0" style="font-size:0.88rem;">
+                Market-implied temperature vs. NWS forecast · Verified against ASOS observed high
+            </p>
+        </div>
+        <button class="btn btn-sm btn-outline-secondary" onclick="loadData()">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+    </div>
+    {% else %}
+    <div class="d-flex align-items-center justify-content-between mb-2">
+        <p class="text-muted mb-0" style="font-size:0.85rem;">
+            <i class="bi bi-graph-up-arrow"></i>
+            <strong>Polymarket Daily High Temp</strong> · Market-implied vs. NWS at each sync
+        </p>
+        <button class="btn btn-sm btn-outline-secondary" onclick="loadData()">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+    </div>
+    {% endif %}
+
+    <div id="loadingState" class="empty-state" style="display:none;">
+        <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
+        <span class="ms-2">Loading market data…</span>
+    </div>
+
+    <div id="errorState" class="empty-state" style="display:none;">
+        <i class="bi bi-exclamation-circle text-danger fs-4"></i>
+        <p id="errorMsg" class="mt-2 mb-0"></p>
+    </div>
+
+    <!-- All-cities MAE chart -->
+    <div id="allCitiesMaeSection" style="display:none;">
+        <div class="section-header d-flex align-items-center justify-content-between">
+            <span><i class="bi bi-graph-up"></i> Daily MAE — All Cities</span>
+            <select class="form-select form-select-sm" id="maeBucketSelect" style="width:auto;font-weight:normal;">
+                <option value="final">Final snap</option>
+                <option value="0">&lt;6h</option>
+                <option value="6">6–12h</option>
+                <option value="12">12–18h</option>
+                <option value="18">18–24h</option>
+                <option value="24">24–48h</option>
+                <option value="48">48h+</option>
+            </select>
+        </div>
+        <div class="pm-card">
+            <p id="maeChartDesc" class="text-muted mb-2" style="font-size:0.82rem;">
+                Average absolute error across all cities using the final sync before each market resolved.
+            </p>
+            <div style="position:relative;height:280px"><canvas id="allCitiesMaeChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- City tabs + per-city lead-time table -->
+    <ul class="nav nav-tabs city-tabs mb-3" id="cityTabs" role="tablist"></ul>
+    <div id="cityPane"></div>
+
+</div>
+
+<script>
+const COLOR_MARKET = '#2563eb';
+const COLOR_NWS    = '#d97706';
+
+let _pmChart = null;
+let _allCitiesChart = null;
+
+// ── Formatters ──────────────────────────────────────────────────────────
+function fmtDate(isoStr) {
+    return new Date(isoStr + 'T12:00:00').toLocaleDateString('en-US',
+        { weekday:'short', month:'short', day:'numeric' });
+}
+function diffClass(d) {
+    if (d === null || d === undefined) return 'diff-neutral';
+    return d > 0.5 ? 'diff-warm' : d < -0.5 ? 'diff-cool' : 'diff-neutral';
+}
+function signedStr(v) {
+    if (v === null || v === undefined) return '—';
+    return (v >= 0 ? '+' : '') + v.toFixed(1) + '°F';
+}
+function tempStr(v) {
+    return (v !== null && v !== undefined) ? v.toFixed(1) + '°F' : '—';
+}
+
+// ── All-cities daily MAE chart ─────────────────────────────────────────────
+function buildAllCitiesMaeChart(allData, selectedBucket) {
+    const el = document.getElementById('allCitiesMaeChart');
+    if (!el) return;
+
+    const isFinal = selectedBucket === 'final';
+    const bucketNum = isFinal ? null : Number(selectedBucket);
+
+    // Update description
+    const descEl = document.getElementById('maeChartDesc');
+    if (descEl) {
+        descEl.textContent = isFinal
+            ? 'Average absolute error across all cities using the final sync before each market resolved.'
+            : `Average absolute error across all cities for snapshots in the ${bucketLabel(bucketNum)} lead window.`;
+    }
+
+    const cities = allData._cities || [];
+    const byDate = {};
+
+    cities.forEach(c => {
+        const cityData = allData[c.key];
+        if (!cityData) return;
+        Object.entries(cityData.markets || {}).forEach(([d, entry]) => {
+            if (!entry.resolved || entry.observed_high == null) return;
+            const obs   = entry.observed_high;
+            const snaps = (entry.snapshots || []).filter(s => s.lead_hours != null && s.lead_hours >= 0);
+
+            let selected;
+            if (isFinal) {
+                // closest to event (smallest positive lead_hours)
+                selected = snaps.reduce((best, s) =>
+                    best === null || s.lead_hours < best.lead_hours ? s : best, null);
+                selected = selected ? [selected] : [];
+            } else {
+                selected = snaps.filter(s => getBucket(s.lead_hours) === bucketNum);
+            }
+
+            if (!selected.length) return;
+            if (!byDate[d]) byDate[d] = { mErrs: [], nErrs: [] };
+            selected.forEach(s => {
+                if (s.market_implied_temp != null) byDate[d].mErrs.push(Math.abs(s.market_implied_temp - obs));
+                if (s.nws_high           != null) byDate[d].nErrs.push(Math.abs(s.nws_high - obs));
+            });
+        });
+    });
+
+    const avg    = arr => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
+    const dates  = Object.keys(byDate).sort();
+    const labels = dates.map(fmtDate);
+    const mMAE   = dates.map(d => avg(byDate[d].mErrs));
+    const nMAE   = dates.map(d => avg(byDate[d].nErrs));
+
+    if (_allCitiesChart) { _allCitiesChart.destroy(); _allCitiesChart = null; }
+
+    if (dates.length < 1) {
+        document.getElementById('allCitiesMaeSection').style.display = 'none';
+        return;
+    }
+    document.getElementById('allCitiesMaeSection').style.display = '';
+
+    _allCitiesChart = new Chart(el.getContext('2d'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'Market',
+                    data: mMAE,
+                    borderColor: COLOR_MARKET, backgroundColor: COLOR_MARKET,
+                    borderWidth: 2, pointRadius: 4, tension: 0.3,
+                },
+                {
+                    label: 'NWS',
+                    data: nMAE,
+                    borderColor: COLOR_NWS, backgroundColor: COLOR_NWS,
+                    borderWidth: 2, pointRadius: 4, tension: 0.3,
+                    borderDash: [5, 4],
+                },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { position: 'top', labels: { usePointStyle: true } },
+                tooltip: { callbacks: {
+                    label: ctx => ctx.parsed.y != null
+                        ? `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}°F` : null,
+                }},
+            },
+            scales: {
+                x: { grid: { display: false }, title: { display: true, text: 'Date' },
+                     ticks: { maxRotation: 45, minRotation: 45 } },
+                y: { min: 0, grid: { color: '#e5e7eb' },
+                     title: { display: true, text: 'Avg MAE (°F)' } },
+            },
+        },
+    });
+}
+
+// ── Lead-time verification table ──────────────────────────────────────────
+const BUCKET_EDGES = [0, 6, 12, 18, 24, 48];
+
+function getBucket(lead_hours) {
+    for (let i = BUCKET_EDGES.length - 1; i >= 0; i--) {
+        if (lead_hours >= BUCKET_EDGES[i]) return BUCKET_EDGES[i];
+    }
+    return BUCKET_EDGES[0];
+}
+
+function bucketLabel(b) {
+    const idx = BUCKET_EDGES.indexOf(b);
+    if (idx === BUCKET_EDGES.length - 1) return `${b}h+`;
+    return `${b === 0 ? '&lt;' : b + '–'}${BUCKET_EDGES[idx + 1]}h`;
+}
+
+function buildLeadTimeTable(resolvedDates, markets) {
+    const byBucket = {};
+
+    resolvedDates.forEach(d => {
+        const obs = markets[d].observed_high;
+        if (obs === null) return;
+        markets[d].snapshots.forEach(s => {
+            if (s.lead_hours == null || s.lead_hours < 0) return;
+            const bucket = getBucket(s.lead_hours);
+            if (!byBucket[bucket]) byBucket[bucket] = { mErrs: [], nErrs: [] };
+            if (s.market_implied_temp !== null) byBucket[bucket].mErrs.push(s.market_implied_temp - obs);
+            if (s.nws_high !== null)            byBucket[bucket].nErrs.push(s.nws_high - obs);
+        });
+    });
+
+    const avg = arr => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
+    const buckets = Object.keys(byBucket).map(Number).sort((a, b) => b - a);
+
+    const rows = buckets.map(b => {
+        const mMAE  = avg(byBucket[b].mErrs.map(Math.abs));
+        const nMAE  = avg(byBucket[b].nErrs.map(Math.abs));
+        const mBias = avg(byBucket[b].mErrs);
+        const nBias = avg(byBucket[b].nErrs);
+        const n     = Math.max(byBucket[b].mErrs.length, byBucket[b].nErrs.length);
+        return `<tr>
+            <td class="ps-3">${bucketLabel(b)}</td>
+            <td>${mMAE !== null ? mMAE.toFixed(1) + '°F' : '—'}</td>
+            <td>${nMAE !== null ? nMAE.toFixed(1) + '°F' : '—'}</td>
+            <td class="${diffClass(mBias)}">${signedStr(mBias)}</td>
+            <td class="${diffClass(nBias)}">${signedStr(nBias)}</td>
+            <td class="text-muted">${n}</td>
+        </tr>`;
+    }).join('');
+
+    const emptyRow = `<tr><td colspan="6" class="text-center text-muted py-3" style="font-size:0.85rem;">
+        No resolved markets with observed temperatures yet — data will appear after markets close.
+    </td></tr>`;
+
+    return `
+    <div class="section-header"><i class="bi bi-bar-chart-line"></i> Lead-Time Verification</div>
+    ${resolvedDates.length > 0 ? `<p class="text-muted mb-2" style="font-size:0.82rem;">
+        Based on ${resolvedDates.length} resolved market${resolvedDates.length > 1 ? 's' : ''} with observed temperatures.
+        Errors binned by hours before event.
+    </p>` : ''}
+    <div class="pm-card p-0" style="overflow:hidden;">
+        <table class="table table-sm table-hover verif-table mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th class="ps-3">Lead Window</th>
+                    <th>Market MAE</th>
+                    <th>NWS MAE</th>
+                    <th>Market Bias</th>
+                    <th>NWS Bias</th>
+                    <th>N</th>
+                </tr>
+            </thead>
+            <tbody>${rows || emptyRow}</tbody>
+        </table>
+    </div>`;
+}
+
+// ── Render a city pane ────────────────────────────────────────────────────
+function renderCity(cityKey, allData) {
+    const pane = document.getElementById('cityPane');
+
+    const cityData = allData[cityKey];
+    if (!cityData) {
+        pane.innerHTML = '<div class="empty-state">No data for this city yet.</div>';
+        return;
+    }
+
+    const markets         = cityData.markets || {};
+    const allDates        = Object.keys(markets).sort();
+    const resolved        = allDates.filter(d =>  markets[d].resolved).reverse();
+    const resolvedWithObs = resolved.filter(d => markets[d].observed_high !== null);
+
+    const html = buildLeadTimeTable(resolvedWithObs, markets);
+    pane.innerHTML = html || `<div class="empty-state">
+        <i class="bi bi-clock text-muted fs-4"></i>
+        <p class="mt-2 mb-0">Collecting sync snapshots — verification will appear once markets resolve.</p>
+    </div>`;
+}
+
+// ── City tabs ─────────────────────────────────────────────────────────────
+let _allData    = null;
+let _activeCity = null;
+
+function buildTabs(cities) {
+    const tabBar = document.getElementById('cityTabs');
+    tabBar.innerHTML = '';
+    cities.forEach((c, i) => {
+        const li  = document.createElement('li');
+        li.className = 'nav-item';
+        const btn = document.createElement('button');
+        btn.className = 'nav-link' + (i === 0 ? ' active' : '');
+        btn.textContent = c.display;
+        btn.addEventListener('click', () => {
+            tabBar.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            _activeCity = c.key;
+            renderCity(c.key, _allData);
+        });
+        li.appendChild(btn);
+        tabBar.appendChild(li);
+    });
+}
+
+async function loadData() {
+    document.getElementById('loadingState').style.display = 'block';
+    document.getElementById('errorState').style.display   = 'none';
+    document.getElementById('cityPane').innerHTML          = '';
+    document.getElementById('allCitiesMaeSection').style.display = 'none';
+    if (_allCitiesChart) { _allCitiesChart.destroy(); _allCitiesChart = null; }
+
+    let data;
+    try {
+        const resp = await fetch('/api/polymarket/nyc');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        data = await resp.json();
+    } catch (err) {
+        document.getElementById('loadingState').style.display = 'none';
+        document.getElementById('errorState').style.display   = 'block';
+        document.getElementById('errorMsg').textContent = `Failed to load data: ${err.message}`;
+        return;
+    }
+    document.getElementById('loadingState').style.display = 'none';
+    _allData = data;
+
+    const cities = data._cities || [];
+    if (!cities.length) {
+        document.getElementById('errorState').style.display = 'block';
+        document.getElementById('errorMsg').textContent = 'No city data available.';
+        return;
+    }
+
+    buildTabs(cities);
+    _activeCity = _activeCity || cities[0].key;
+
+    // Re-activate previously selected tab
+    const tabs = document.getElementById('cityTabs').querySelectorAll('.nav-link');
+    tabs.forEach((btn, i) => {
+        if (cities[i] && cities[i].key === _activeCity) {
+            tabs.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+        }
+    });
+
+    buildAllCitiesMaeChart(_allData, document.getElementById('maeBucketSelect').value);
+    renderCity(_activeCity, _allData);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadData();
+    document.getElementById('maeBucketSelect').addEventListener('change', () => {
+        if (_allData) buildAllCitiesMaeChart(_allData, document.getElementById('maeBucketSelect').value);
+    });
+});
+</script>
+{% endblock %}
