@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-03-03 23:08 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-03-03 23:13 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -426,7 +426,8 @@ thead tr:nth-child(2) th { background: white; }
         <option value="48">48h+</option>
       </select>
     </div>
-    <div style="position:relative;height:260px"><canvas id="pmMaeChart"></canvas></div>
+    <div style="position:relative;height:200px"><canvas id="pmMaeChart"></canvas></div>
+    <div style="position:relative;height:85px;margin-top:2px"><canvas id="pmVolChart"></canvas></div>
   </div>
   <div class="card-header border-top d-flex align-items-center gap-2 py-1" style="background:#eef2ff;">
     <small class="text-muted me-2" style="font-size:0.75rem;">Lead-time verification by city:</small>
@@ -461,6 +462,7 @@ let obsCharts = {};
 let obsSid = null;
 let PM_DATA = null;
 let pmMaeChart = null;
+let pmVolChart = null;
 
 const DROUGHT_COLORS = {0:'#FFFF00',1:'#FCD37F',2:'#FFAA00',3:'#E60000',4:'#730000'};
 
@@ -500,7 +502,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-03-03_23:08_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-03-03_23:13_UTC').then(r => r.json()).catch(() => null),
     fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
@@ -1204,17 +1206,16 @@ function buildPmAllCitiesChart(selectedBucket) {
   const nMAE    = dates.map(d => avg(byDate[d].nErrs));
   const volData = dates.map(d => volByDate[d] || null);
   if (pmMaeChart) { pmMaeChart.destroy(); pmMaeChart = null; }
+  if (pmVolChart) { pmVolChart.destroy(); pmVolChart = null; }
   pmMaeChart = new Chart(el.getContext('2d'), {
+    type: 'line',
     data: {
       labels,
       datasets: [
-        { type:'bar', label:'Total Volume', data:volData,
-           backgroundColor:'rgba(156,163,175,0.35)', borderColor:'rgba(156,163,175,0.6)',
-           borderWidth:1, yAxisID:'y1', order:2 },
-        { type:'line', label:'Market', data:mMAE, borderColor:'#2563eb', backgroundColor:'#2563eb',
-           borderWidth:2, pointRadius:4, tension:0.3, yAxisID:'y', order:1 },
-        { type:'line', label:'NWS', data:nMAE, borderColor:'#d97706', backgroundColor:'#d97706',
-           borderWidth:2, pointRadius:4, tension:0.3, borderDash:[5,4], yAxisID:'y', order:1 },
+        { label:'Market', data:mMAE, borderColor:'#2563eb', backgroundColor:'#2563eb',
+           borderWidth:2, pointRadius:4, tension:0.3 },
+        { label:'NWS', data:nMAE, borderColor:'#d97706', backgroundColor:'#d97706',
+           borderWidth:2, pointRadius:4, tension:0.3, borderDash:[5,4] },
       ],
     },
     options: {
@@ -1222,26 +1223,45 @@ function buildPmAllCitiesChart(selectedBucket) {
       interaction:{mode:'index', intersect:false},
       plugins:{
         legend:{position:'top', labels:{usePointStyle:true}},
-        tooltip:{callbacks:{label:ctx => {
-          if (ctx.dataset.label === 'Total Volume') {
-            const v = ctx.parsed.y;
-            if (v == null) return null;
-            return 'Volume: $' + (v >= 1000 ? (v/1000).toFixed(1)+'k' : v.toFixed(0));
-          }
-          return ctx.parsed.y != null
-            ? ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '°F' : null;
-        }}},
+        tooltip:{callbacks:{label:ctx => ctx.parsed.y != null
+          ? ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '°F' : null}},
       },
       scales:{
-        x:{grid:{display:false}, title:{display:true, text:'Date'},
-           ticks:{maxRotation:45, minRotation:45}},
+        x:{grid:{color:'#e5e7eb'}, ticks:{display:false}, title:{display:false}},
         y:{min:0, grid:{color:'#e5e7eb'}, title:{display:true, text:'Avg MAE (°F)'}},
-        y1:{position:'right', min:0, grid:{display:false},
-             title:{display:true, text:'Total Volume ($)'},
-             ticks:{callback:v => '$'+(v>=1000?(v/1000).toFixed(0)+'k':v)}},
       },
     },
   });
+  const volEl = document.getElementById('pmVolChart');
+  if (volEl) {
+    pmVolChart = new Chart(volEl.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{ label:'Total Volume', data:volData,
+           backgroundColor:'rgba(156,163,175,0.5)', borderColor:'rgba(107,114,128,0.7)',
+           borderWidth:1 }],
+      },
+      options: {
+        responsive:true, maintainAspectRatio:false,
+        interaction:{mode:'index', intersect:false},
+        plugins:{
+          legend:{display:false},
+          tooltip:{callbacks:{label:ctx => {
+            const v = ctx.parsed.y;
+            if (v == null) return null;
+            return 'Volume: $' + (v >= 1000 ? (v/1000).toFixed(1)+'k' : v.toFixed(0));
+          }}},
+        },
+        scales:{
+          x:{grid:{display:false}, ticks:{maxRotation:45, minRotation:45, font:{size:10}}},
+          y:{min:0, grid:{color:'#e5e7eb'},
+             title:{display:true, text:'Volume ($)', font:{size:10}},
+             ticks:{callback:v => '$'+(v>=1000?(v/1000).toFixed(0)+'k':v), font:{size:10}}},
+        },
+      },
+    });
+  }
 }
 
 function buildPmLeadTimeTable(resolvedDates, markets) {
