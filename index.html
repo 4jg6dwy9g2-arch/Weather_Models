@@ -32,7 +32,7 @@ thead tr:nth-child(2) th { background: white; }
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <div>
     <h5 class="mb-0"><i class="bi bi-graph-up"></i> ASOS Model Verification</h5>
-    <small class="text-muted">Updated 2026-03-03 02:17 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
+    <small class="text-muted">Updated 2026-03-03 09:27 UTC &mdash; <span id="stationCount">loading...</span> &mdash; <a href="#" data-bs-toggle="modal" data-bs-target="#methodologyModal">Methodology</a></small>
   </div>
 </div>
 
@@ -500,7 +500,7 @@ async function loadAll() {
     fetch('data/map.json').then(r => r.json()),
     fetch('data/table.json').then(r => r.json()),
     fetch('data/timeseries.json').then(r => r.json()),
-    fetch('data/station_obs.json?v=2026-03-03_02:17_UTC').then(r => r.json()).catch(() => null),
+    fetch('data/station_obs.json?v=2026-03-03_09:27_UTC').then(r => r.json()).catch(() => null),
     fetch('data/polymarket.json').then(r => r.json()).catch(() => null),
   ]);
   MAP_DATA = m; TABLE_DATA = t; TS_DATA = ts; OBS_DATA = obs; PM_DATA = pm;
@@ -752,8 +752,8 @@ function renderObsCharts(sid, lt) {
 
   const labels = records.map(r => {
     const d = new Date(r.t);
-    const md = d.toLocaleDateString('en-US', {month:'numeric', day:'numeric'});
-    const hh = d.toLocaleTimeString('en-US', {hour:'2-digit', hour12:false});
+    const md = d.toLocaleDateString('en-US', {month:'numeric', day:'numeric', timeZone:'UTC'});
+    const hh = d.toLocaleTimeString('en-US', {hour:'2-digit', hour12:false, timeZone:'UTC'});
     return `${md} ${hh}Z`;
   });
 
