@@ -51,6 +51,91 @@
         padding: 2.5rem;
         font-size: 0.9rem;
     }
+
+    .disagreement-badge {
+        display: inline-block;
+        font-size: 0.78rem;
+        font-weight: 700;
+        padding: 2px 7px;
+        border-radius: 10px;
+        letter-spacing: 0.02em;
+    }
+    .badge-warm { background: #fee2e2; color: #b91c1c; }
+    .badge-cool { background: #dbeafe; color: #1d4ed8; }
+
+    /* Live markets section */
+    .live-market-card {
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        padding: 1.25rem;
+        height: 100%;
+    }
+
+    .bracket-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin: 0.6rem 0;
+    }
+
+    .bracket-pill {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        border-radius: 8px;
+        padding: 5px 9px;
+        font-size: 0.78rem;
+        min-width: 72px;
+        border: 1px solid #e5e7eb;
+        background: #f9fafb;
+        transition: background 0.15s;
+    }
+
+    .bracket-pill.top-bracket {
+        border-color: #2563eb;
+        background: #eff6ff;
+    }
+
+    .bracket-pill.second-bracket {
+        border-color: #93c5fd;
+        background: #f0f7ff;
+    }
+
+    .bracket-prob {
+        font-size: 1.05rem;
+        font-weight: 700;
+        line-height: 1.2;
+    }
+
+    .bracket-label {
+        font-size: 0.68rem;
+        color: #6b7280;
+        text-align: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 90px;
+    }
+
+    .live-stat-block {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .live-stat-label {
+        font-size: 0.72rem;
+        color: #9ca3af;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        font-weight: 600;
+    }
+
+    .live-stat-value {
+        font-size: 1.4rem;
+        font-weight: 700;
+        line-height: 1.2;
+    }
 </style>
 {% endblock %}
 
@@ -65,7 +150,7 @@
                 Market-implied temperature vs. NWS forecast · Verified against ASOS observed high
             </p>
         </div>
-        <button class="btn btn-sm btn-outline-secondary" onclick="loadData()">
+        <button id="refreshBtn" class="btn btn-sm btn-outline-secondary" onclick="liveRefresh()">
             <i class="bi bi-arrow-clockwise"></i> Refresh
         </button>
     </div>
@@ -75,7 +160,7 @@
             <i class="bi bi-graph-up-arrow"></i>
             <strong>Polymarket Daily High Temp</strong> · Market-implied vs. NWS at each sync
         </p>
-        <button class="btn btn-sm btn-outline-secondary" onclick="loadData()">
+        <button id="refreshBtn" class="btn btn-sm btn-outline-secondary" onclick="liveRefresh()">
             <i class="bi bi-arrow-clockwise"></i> Refresh
         </button>
     </div>
@@ -83,7 +168,7 @@
 
     <div id="loadingState" class="empty-state" style="display:none;">
         <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
-        <span class="ms-2">Loading market data…</span>
+        <span class="ms-2" id="loadingMsg">Fetching live market data…</span>
     </div>
 
     <div id="errorState" class="empty-state" style="display:none;">
@@ -108,13 +193,63 @@
             <p id="maeChartDesc" class="text-muted mb-2" style="font-size:0.82rem;">
                 Average absolute error across all cities for snapshots in the &lt;6h lead window.
             </p>
-            <div style="position:relative;height:280px"><canvas id="allCitiesMaeChart"></canvas></div>
+            <div style="position:relative;height:220px"><canvas id="allCitiesMaeChart"></canvas></div>
+            <div style="position:relative;height:90px;margin-top:2px"><canvas id="allCitiesVolChart"></canvas></div>
         </div>
     </div>
 
     <!-- City tabs + per-city lead-time table -->
     <ul class="nav nav-tabs city-tabs mb-3" id="cityTabs" role="tablist"></ul>
     <div id="cityPane"></div>
+
+    <!-- Live markets section -->
+    <div id="liveMarketsSection" style="display:none; margin-top:1.5rem;">
+        <div class="section-header d-flex align-items-center justify-content-between">
+            <span><i class="bi bi-activity"></i> Live Markets</span>
+            <span id="liveMarketsTimestamp" class="text-muted" style="font-size:0.8rem;font-weight:normal;"></span>
+        </div>
+        <p class="text-muted mb-3" style="font-size:0.82rem;">
+            Current bracket prices and market-implied temperature for each city's active markets.
+            Charts show how the market-implied and NWS temperatures have evolved over time.
+        </p>
+        <div class="row row-cols-1 row-cols-xl-2 g-3" id="liveMarketsContent"></div>
+    </div>
+
+    <!-- NWS vs. Market disagreement section -->
+    <div id="disagreementSection" style="display:none; margin-top:1.5rem;">
+        <div class="section-header d-flex align-items-center justify-content-between">
+            <span><i class="bi bi-exclamation-triangle"></i> NWS vs. Market Disagreements</span>
+            <div class="d-flex align-items-center gap-2">
+                <label class="text-muted mb-0" style="font-size:0.82rem;font-weight:normal;">Threshold:</label>
+                <select class="form-select form-select-sm" id="disagreementThreshold" style="width:auto;font-weight:normal;">
+                    <option value="2">≥ 2°F</option>
+                    <option value="3" selected>≥ 3°F</option>
+                    <option value="5">≥ 5°F</option>
+                    <option value="7">≥ 7°F</option>
+                </select>
+            </div>
+        </div>
+        <p class="text-muted mb-2" style="font-size:0.82rem;">
+            Active markets where the latest NWS forecast and market-implied temperature disagree.
+            NWS value must fall within the same bracket as the implied temp for this comparison to be most meaningful.
+        </p>
+        <div class="pm-card p-0" style="overflow:hidden;">
+            <table class="table table-sm table-hover verif-table mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th class="ps-3">City</th>
+                        <th>Date</th>
+                        <th>Market</th>
+                        <th>NWS</th>
+                        <th>Diff (NWS − Mkt)</th>
+                        <th>Lead</th>
+                        <th>Top Bracket</th>
+                    </tr>
+                </thead>
+                <tbody id="disagreementRows"></tbody>
+            </table>
+        </div>
+    </div>
 
 </div>
 
@@ -124,6 +259,7 @@ const COLOR_NWS    = '#d97706';
 
 let _pmChart = null;
 let _allCitiesChart = null;
+let _allCitiesVolChart = null;
 
 // ── Formatters ──────────────────────────────────────────────────────────
 function fmtDate(isoStr) {
@@ -160,6 +296,7 @@ function buildAllCitiesMaeChart(allData, selectedBucket) {
 
     const cities = allData._cities || [];
     const byDate = {};
+    const volByDate = {};
 
     cities.forEach(c => {
         const cityData = allData[c.key];
@@ -168,6 +305,10 @@ function buildAllCitiesMaeChart(allData, selectedBucket) {
             if (!entry.resolved || entry.observed_high == null) return;
             const obs   = entry.observed_high;
             const snaps = (entry.snapshots || []).filter(s => s.lead_hours != null && s.lead_hours >= 0);
+
+            // Accumulate total volume (max across snapshots = final traded volume)
+            const maxVol = snaps.reduce((mx, s) => Math.max(mx, s.volume || 0), 0);
+            if (maxVol > 0) volByDate[d] = (volByDate[d] || 0) + maxVol;
 
             let selected;
             if (isFinal) {
@@ -193,8 +334,10 @@ function buildAllCitiesMaeChart(allData, selectedBucket) {
     const labels = dates.map(fmtDate);
     const mMAE   = dates.map(d => avg(byDate[d].mErrs));
     const nMAE   = dates.map(d => avg(byDate[d].nErrs));
+    const volData = dates.map(d => volByDate[d] || null);
 
     if (_allCitiesChart) { _allCitiesChart.destroy(); _allCitiesChart = null; }
+    if (_allCitiesVolChart) { _allCitiesVolChart.destroy(); _allCitiesVolChart = null; }
 
     if (dates.length < 1) {
         document.getElementById('allCitiesMaeSection').style.display = 'none';
@@ -233,13 +376,51 @@ function buildAllCitiesMaeChart(allData, selectedBucket) {
                 }},
             },
             scales: {
-                x: { grid: { display: false }, title: { display: true, text: 'Date' },
-                     ticks: { maxRotation: 45, minRotation: 45 } },
+                x: { grid: { color: '#e5e7eb' }, ticks: { display: false }, title: { display: false } },
                 y: { min: 0, grid: { color: '#e5e7eb' },
                      title: { display: true, text: 'Avg MAE (°F)' } },
             },
         },
     });
+
+    const volEl = document.getElementById('allCitiesVolChart');
+    if (volEl) {
+        _allCitiesVolChart = new Chart(volEl.getContext('2d'), {
+            type: 'bar',
+            data: {
+                labels,
+                datasets: [{
+                    label: 'Total Volume',
+                    data: volData,
+                    backgroundColor: 'rgba(156,163,175,0.5)',
+                    borderColor: 'rgba(107,114,128,0.7)',
+                    borderWidth: 1,
+                }],
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: { callbacks: {
+                        label: ctx => {
+                            const v = ctx.parsed.y;
+                            if (v == null) return null;
+                            return 'Volume: $' + (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0));
+                        },
+                    }},
+                },
+                scales: {
+                    x: { grid: { display: false },
+                         ticks: { maxRotation: 45, minRotation: 45, font: { size: 10 } } },
+                    y: { min: 0, grid: { color: '#e5e7eb' },
+                         title: { display: true, text: 'Volume ($)', font: { size: 10 } },
+                         ticks: { callback: v => '$' + (v >= 1000 ? (v / 1000).toFixed(0) + 'k' : v),
+                                  font: { size: 10 } } },
+                },
+            },
+        });
+    }
 }
 
 // ── Lead-time verification table ──────────────────────────────────────────
@@ -357,6 +538,263 @@ function renderCity(cityKey, allData) {
     </div>`;
 }
 
+// ── NWS vs. Market disagreement section ──────────────────────────────────
+function buildDisagreementSection(allData, threshold) {
+    const section = document.getElementById('disagreementSection');
+    const tbody   = document.getElementById('disagreementRows');
+    const cities  = allData._cities || [];
+    const rows    = [];
+
+    cities.forEach(c => {
+        const cityData = allData[c.key];
+        if (!cityData || !cityData.markets) return;
+
+        Object.entries(cityData.markets).forEach(([dateStr, entry]) => {
+            if (entry.resolved) return;   // market closed, not actionable
+
+            // Find latest snapshot that still has positive lead time
+            const snaps = (entry.snapshots || [])
+                .filter(s => s.lead_hours != null && s.lead_hours > 0);
+            if (!snaps.length) return;
+            const latest = snaps.reduce((best, s) => s.lead_hours < best.lead_hours ? s : best);
+
+            const mkt = latest.market_implied_temp;
+            const nws = latest.nws_high;
+            if (mkt == null || nws == null) return;
+
+            const diff = nws - mkt;
+            if (Math.abs(diff) < threshold) return;
+
+            // Find the top bracket (highest YES price)
+            const brackets = entry.brackets || [];
+            const prices   = entry.prices   || [];
+            let topBracket = '—';
+            if (brackets.length) {
+                const maxIdx = prices.indexOf(Math.max(...prices));
+                topBracket = brackets[maxIdx] ?? '—';
+            }
+
+            rows.push({ city: c.display, dateStr, mkt, nws, diff,
+                        lead: latest.lead_hours, topBracket });
+        });
+    });
+
+    if (!rows.length) {
+        section.style.display = 'none';
+        return;
+    }
+
+    // Sort by absolute diff descending
+    rows.sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+
+    tbody.innerHTML = rows.map(r => {
+        const isWarm  = r.diff > 0;
+        const badgeCls = isWarm ? 'badge-warm' : 'badge-cool';
+        const arrow    = isWarm ? '▲' : '▼';
+        const leadStr  = r.lead < 24
+            ? `${r.lead.toFixed(1)}h`
+            : `${(r.lead / 24).toFixed(1)}d`;
+        return `<tr>
+            <td class="ps-3 fw-semibold">${r.city}</td>
+            <td>${fmtDate(r.dateStr)}</td>
+            <td>${tempStr(r.mkt)}</td>
+            <td>${tempStr(r.nws)}</td>
+            <td><span class="disagreement-badge ${badgeCls}">${arrow} ${signedStr(r.diff)}</span></td>
+            <td class="text-muted">${leadStr}</td>
+            <td class="text-muted" style="font-size:0.8rem;">${r.topBracket}</td>
+        </tr>`;
+    }).join('');
+
+    section.style.display = '';
+}
+
+// ── Live markets section ──────────────────────────────────────────────────
+let _liveCharts = {};
+
+function buildLiveMarketsSection(allData) {
+    const cities   = allData._cities || [];
+    const section  = document.getElementById('liveMarketsSection');
+    const content  = document.getElementById('liveMarketsContent');
+
+    // Destroy previous charts
+    Object.values(_liveCharts).forEach(c => c.destroy());
+    _liveCharts = {};
+
+    const colsHtml   = [];
+    const deferred   = [];   // charts to create after DOM flush
+
+    cities.forEach(city => {
+        const cityData = allData[city.key];
+        if (!cityData || !cityData.markets) return;
+
+        // Active = unresolved markets, sorted soonest first
+        const active = Object.entries(cityData.markets)
+            .filter(([, e]) => !e.resolved)
+            .sort(([a], [b]) => a.localeCompare(b));
+
+        active.forEach(([dateStr, entry]) => {
+            const chartId = `lc-${city.key}-${dateStr.replace(/-/g, '')}`;
+            const snaps   = (entry.snapshots || [])
+                .filter(s => s.fetched_at)
+                .sort((a, b) => a.fetched_at.localeCompare(b.fetched_at));
+            const latest  = snaps.length ? snaps[snaps.length - 1] : null;
+            const implied = latest?.market_implied_temp;
+            const nws     = latest?.nws_high;
+            const lead    = latest?.lead_hours;
+            const vol     = latest?.volume;
+
+            const brackets = entry.brackets || [];
+            const prices   = entry.prices   || [];
+
+            // Sort bracket indices by price descending to find top/second
+            const ranked = prices.map((p, i) => ({ i, p })).sort((a, b) => b.p - a.p);
+            const topIdx  = ranked[0]?.i ?? -1;
+            const secIdx  = ranked[1]?.i ?? -1;
+
+            const bracketPills = brackets.map((b, i) => {
+                const pct  = ((prices[i] || 0) * 100).toFixed(0);
+                const cls  = i === topIdx ? 'top-bracket'
+                           : i === secIdx ? 'second-bracket' : '';
+                const col  = i === topIdx ? '#2563eb'
+                           : i === secIdx ? '#3b82f6' : '#374151';
+                return `<div class="bracket-pill ${cls}">
+                    <span class="bracket-label">${b}</span>
+                    <span class="bracket-prob" style="color:${col};">${pct}%</span>
+                </div>`;
+            }).join('');
+
+            const leadStr = lead != null
+                ? (lead < 24 ? `${lead.toFixed(1)}h` : `${(lead / 24).toFixed(1)}d`)
+                : '—';
+
+            const volStr = vol != null
+                ? '$' + (vol >= 1000 ? (vol / 1000).toFixed(1) + 'k' : vol.toFixed(0))
+                : '';
+
+            const diff = (implied != null && nws != null) ? nws - implied : null;
+
+            const statsRow = `
+                <div class="d-flex gap-4 mb-1">
+                    <div class="live-stat-block">
+                        <span class="live-stat-label">Market-Implied</span>
+                        <span class="live-stat-value" style="color:#2563eb;">${implied != null ? implied.toFixed(1) + '°F' : '—'}</span>
+                    </div>
+                    <div class="live-stat-block">
+                        <span class="live-stat-label">NWS Forecast</span>
+                        <span class="live-stat-value" style="color:#d97706;">${nws != null ? nws.toFixed(1) + '°F' : '—'}</span>
+                    </div>
+                    ${diff != null ? `<div class="live-stat-block">
+                        <span class="live-stat-label">NWS − Mkt</span>
+                        <span class="live-stat-value ${diffClass(diff)}">${signedStr(diff)}</span>
+                    </div>` : ''}
+                    ${volStr ? `<div class="live-stat-block ms-auto text-end">
+                        <span class="live-stat-label">Volume</span>
+                        <span style="font-size:0.9rem;font-weight:600;color:#555;">${volStr}</span>
+                    </div>` : ''}
+                </div>`;
+
+            const chartSection = snaps.length > 1
+                ? `<div style="position:relative;height:180px;margin-top:0.75rem;"><canvas id="${chartId}"></canvas></div>`
+                : `<p class="text-muted mt-2 mb-0" style="font-size:0.78rem;"><i class="bi bi-clock"></i> ${snaps.length} sync snapshot${snaps.length === 1 ? '' : 's'} — chart appears after more syncs.</p>`;
+
+            colsHtml.push(`
+            <div class="col">
+              <div class="live-market-card">
+                <div class="d-flex align-items-center justify-content-between mb-2">
+                    <div>
+                        <span class="fw-bold" style="font-size:1rem;">${city.display}</span>
+                        <span class="text-muted ms-2" style="font-size:0.85rem;">${fmtDate(dateStr)}</span>
+                    </div>
+                    <span class="badge text-bg-success" style="font-size:0.72rem;font-weight:600;">
+                        <i class="bi bi-circle-fill" style="font-size:0.5rem;vertical-align:middle;"></i>
+                        Live · ${leadStr} to go
+                    </span>
+                </div>
+                ${statsRow}
+                <div class="bracket-grid">${bracketPills}</div>
+                ${chartSection}
+              </div>
+            </div>`);
+
+            if (snaps.length > 1) {
+                deferred.push({ chartId, snaps });
+            }
+        });
+    });
+
+    if (!colsHtml.length) {
+        section.style.display = 'none';
+        return;
+    }
+
+    content.innerHTML = colsHtml.join('');
+    section.style.display = '';
+
+    // Render charts after DOM update
+    deferred.forEach(({ chartId, snaps }) => {
+        const el = document.getElementById(chartId);
+        if (!el) return;
+
+        const labels = snaps.map(s => {
+            const d = new Date(s.fetched_at);
+            return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+                + ' ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+        });
+
+        _liveCharts[chartId] = new Chart(el.getContext('2d'), {
+            type: 'line',
+            data: {
+                labels,
+                datasets: [
+                    {
+                        label: 'Market-Implied',
+                        data: snaps.map(s => s.market_implied_temp),
+                        borderColor: COLOR_MARKET, backgroundColor: 'transparent',
+                        borderWidth: 2, pointRadius: 3, tension: 0.3,
+                    },
+                    {
+                        label: 'NWS Forecast',
+                        data: snaps.map(s => s.nws_high),
+                        borderColor: COLOR_NWS, backgroundColor: 'transparent',
+                        borderWidth: 2, pointRadius: 3, tension: 0.3,
+                        borderDash: [5, 4],
+                    },
+                ],
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { position: 'top', labels: { usePointStyle: true, font: { size: 11 } } },
+                    tooltip: { callbacks: {
+                        label: ctx => ctx.parsed.y != null
+                            ? `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}°F` : null,
+                    }},
+                },
+                scales: {
+                    x: { grid: { display: false }, ticks: { maxRotation: 45, font: { size: 10 }, maxTicksLimit: 12 } },
+                    y: { grid: { color: '#e5e7eb' }, ticks: { callback: v => v + '°F', font: { size: 10 } } },
+                },
+            },
+        });
+    });
+
+    // Timestamp from most recent snapshot
+    let maxTs = '';
+    (allData._cities || []).forEach(c => {
+        const cd = allData[c.key];
+        if (!cd?.markets) return;
+        Object.values(cd.markets).forEach(e => {
+            (e.snapshots || []).forEach(s => { if (s.fetched_at > maxTs) maxTs = s.fetched_at; });
+        });
+    });
+    const tsEl = document.getElementById('liveMarketsTimestamp');
+    if (tsEl && maxTs) {
+        tsEl.textContent = 'as of ' + new Date(maxTs).toLocaleString('en-US',
+            { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    }
+}
+
 // ── City tabs ─────────────────────────────────────────────────────────────
 let _allData    = null;
 let _activeCity = null;
@@ -383,18 +821,29 @@ function buildTabs(cities) {
     });
 }
 
-async function loadData() {
+function _setRefreshBusy(busy) {
+    const btn = document.getElementById('refreshBtn');
+    if (!btn) return;
+    btn.disabled = busy;
+    btn.innerHTML = busy
+        ? '<span class="spinner-border spinner-border-sm" role="status"></span> Fetching…'
+        : '<i class="bi bi-arrow-clockwise"></i> Refresh';
+}
+
+async function _fetchAndRender(url, fetchOpts = {}) {
     document.getElementById('loadingState').style.display = 'block';
     document.getElementById('errorState').style.display   = 'none';
     document.getElementById('cityPane').innerHTML          = '';
     document.getElementById('allCitiesMaeSection').style.display = 'none';
     if (_allCitiesChart) { _allCitiesChart.destroy(); _allCitiesChart = null; }
+    if (_allCitiesVolChart) { _allCitiesVolChart.destroy(); _allCitiesVolChart = null; }
 
     let data;
     try {
-        const resp = await fetch('/api/polymarket/nyc');
+        const resp = await fetch(url, fetchOpts);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         data = await resp.json();
+        if (data.error) throw new Error(data.error);
     } catch (err) {
         document.getElementById('loadingState').style.display = 'none';
         document.getElementById('errorState').style.display   = 'block';
@@ -415,7 +864,6 @@ async function loadData() {
     const validKeys = new Set(['__all__', ...cities.map(c => c.key)]);
     if (!validKeys.has(_activeCity)) _activeCity = '__all__';
 
-    // Re-activate previously selected tab
     const tabs = document.getElementById('cityTabs').querySelectorAll('.nav-link');
     tabs.forEach(btn => {
         if (btn.dataset.cityKey === _activeCity) {
@@ -426,12 +874,32 @@ async function loadData() {
 
     buildAllCitiesMaeChart(_allData, document.getElementById('maeBucketSelect').value);
     renderCity(_activeCity, _allData);
+    buildDisagreementSection(_allData, Number(document.getElementById('disagreementThreshold').value));
+    buildLiveMarketsSection(_allData);
+}
+
+async function liveRefresh() {
+    _setRefreshBusy(true);
+    document.getElementById('loadingMsg').textContent = 'Fetching live market data…';
+    try {
+        await _fetchAndRender('/api/polymarket/refresh', { method: 'POST' });
+    } finally {
+        _setRefreshBusy(false);
+    }
+}
+
+async function loadData() {
+    document.getElementById('loadingMsg').textContent = 'Loading market data…';
+    await _fetchAndRender('/api/polymarket/nyc');
 }
 
 document.addEventListener('DOMContentLoaded', () => {
     loadData();
     document.getElementById('maeBucketSelect').addEventListener('change', () => {
         if (_allData) buildAllCitiesMaeChart(_allData, document.getElementById('maeBucketSelect').value);
+    });
+    document.getElementById('disagreementThreshold').addEventListener('change', () => {
+        if (_allData) buildDisagreementSection(_allData, Number(document.getElementById('disagreementThreshold').value));
     });
 });
 </script>

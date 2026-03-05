@@ -168,6 +168,14 @@ def generate_html(data: dict, use_monthly: bool = False) -> str:
       <input class="form-check-input" type="checkbox" id="periodToggle">
       <label class="form-check-label" for="periodToggle">Last 20 days</label>
     </div>
+    <div class="btn-group btn-group-sm" role="group" id="tableMetricToggle">
+      <input type="radio" class="btn-check" name="tableMetric" id="tm-mae" value="mae" autocomplete="off" checked>
+      <label class="btn btn-outline-primary" for="tm-mae">MAE</label>
+      <input type="radio" class="btn-check" name="tableMetric" id="tm-wmae" value="wmae" autocomplete="off">
+      <label class="btn btn-outline-primary" for="tm-wmae">WMAE (Precip)</label>
+      <input type="radio" class="btn-check" name="tableMetric" id="tm-bias" value="bias" autocomplete="off">
+      <label class="btn btn-outline-primary" for="tm-bias">Bias</label>
+    </div>
     <div class="btn-group btn-group-sm" role="group" id="precipPeriodToggle">
       <input type="radio" class="btn-check" name="precipPeriod" id="pp-6hr" value="precip" autocomplete="off" checked>
       <label class="btn btn-outline-secondary" for="pp-6hr">Precip 6hr</label>
@@ -252,8 +260,9 @@ function winner(models) {{
 function renderTable() {{
   const period = document.getElementById('periodToggle').checked ? 'monthly' : 'all';
   const vh = document.querySelector('input[name="validHour"]:checked').value;
-  const metric = document.querySelector('input[name="tableMetric"]:checked').value;
+  const metric = document.querySelector('input[name="tableMetric"]:checked')?.value ?? 'mae';
   const isMae = metric === 'mae';
+  const isWmae = metric === 'wmae';
   const key = `${{period}}_${{vh === '' ? 'all' : vh}}`;
   const v = ALL_DATA[key];
   const tbody = document.getElementById('tbody');
@@ -272,8 +281,8 @@ function renderTable() {{
   const vAll = ALL_DATA['all_all'];
   const a = (period === 'monthly' && MONTHLY_ACTIVE) ? vAll : null;
 
-  const f1 = (val, ref) => val != null ? val.toFixed(1) + (isMae && a ? pctMae(val, ref) : '') : '--';
-  const f2 = (val, ref) => val != null ? val.toFixed(2) + (isMae && a ? pctMae(val, ref) : '') : '--';
+  const f1 = (val, ref) => val != null ? val.toFixed(1) + ((isMae || isWmae) && a ? pctMae(val, ref) : '') : '--';
+  const f2 = (val, ref) => val != null ? val.toFixed(2) + ((isMae || isWmae) && a ? pctMae(val, ref) : '') : '--';
   const sg = (val, dp=1) => val != null ? (val > 0 ? '+' : '') + val.toFixed(dp) : '--';
 
   const pfx = precipVar === 'precip_24hr' ? 'precip_24hr' : 'precip';
@@ -288,10 +297,19 @@ function renderTable() {{
     const iTm = v.ifs_temp_mae?.[i],  iTb = v.ifs_temp_bias?.[i];
     const nTm = v.nws_temp_mae?.[i],  nTb = v.nws_temp_bias?.[i];
 
-    const gRm = v[`gfs_${{pfx}}_mae`]?.[i],  gRb = v[`gfs_${{pfx}}_bias`]?.[i];
-    const aRm = v[`aifs_${{pfx}}_mae`]?.[i], aRb = v[`aifs_${{pfx}}_bias`]?.[i];
-    const iRm = v[`ifs_${{pfx}}_mae`]?.[i],  iRb = v[`ifs_${{pfx}}_bias`]?.[i];
-    const nRm = v[`nws_${{pfx}}_mae`]?.[i],  nRb = v[`nws_${{pfx}}_bias`]?.[i];
+    // Precip: choose MAE or WMAE based on metric toggle
+    const gRm = isWmae ? (v[`gfs_${{pfx}}_wmae`]?.[i] ?? v[`gfs_${{pfx}}_mae`]?.[i]) : v[`gfs_${{pfx}}_mae`]?.[i];
+    const aRm = isWmae ? (v[`aifs_${{pfx}}_wmae`]?.[i] ?? v[`aifs_${{pfx}}_mae`]?.[i]) : v[`aifs_${{pfx}}_mae`]?.[i];
+    const iRm = isWmae ? (v[`ifs_${{pfx}}_wmae`]?.[i] ?? v[`ifs_${{pfx}}_mae`]?.[i]) : v[`ifs_${{pfx}}_mae`]?.[i];
+    const nRm = isWmae ? (v[`nws_${{pfx}}_wmae`]?.[i] ?? v[`nws_${{pfx}}_mae`]?.[i]) : v[`nws_${{pfx}}_mae`]?.[i];
+    const gRb = v[`gfs_${{pfx}}_bias`]?.[i];
+    const aRb = v[`aifs_${{pfx}}_bias`]?.[i];
+    const iRb = v[`ifs_${{pfx}}_bias`]?.[i];
+    const nRb = v[`nws_${{pfx}}_bias`]?.[i];
+    const aRmRef = isWmae ? (a?.[`aifs_${{pfx}}_wmae`]?.[i] ?? a?.[`aifs_${{pfx}}_mae`]?.[i]) : a?.[`aifs_${{pfx}}_mae`]?.[i];
+    const gRmRef = isWmae ? (a?.[`gfs_${{pfx}}_wmae`]?.[i] ?? a?.[`gfs_${{pfx}}_mae`]?.[i]) : a?.[`gfs_${{pfx}}_mae`]?.[i];
+    const iRmRef = isWmae ? (a?.[`ifs_${{pfx}}_wmae`]?.[i] ?? a?.[`ifs_${{pfx}}_mae`]?.[i]) : a?.[`ifs_${{pfx}}_mae`]?.[i];
+    const nRmRef = isWmae ? (a?.[`nws_${{pfx}}_wmae`]?.[i] ?? a?.[`nws_${{pfx}}_mae`]?.[i]) : a?.[`nws_${{pfx}}_mae`]?.[i];
 
     const gDm = v.gfs_dewpoint_mae?.[i],  gDb = v.gfs_dewpoint_bias?.[i];
     const aDm = v.aifs_dewpoint_mae?.[i], aDb = v.aifs_dewpoint_bias?.[i];
@@ -315,6 +333,7 @@ function renderTable() {{
       {{n:'IFS',mae:iDm,cls:'badge bg-success'}},  {{n:'NWS',mae:nDm,cls:'badge bg-dark'}}
     ]);
 
+    const showPrecipNum = isMae || isWmae;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td><strong>${{formatLeadTime(lt)}}</strong></td>
@@ -324,10 +343,10 @@ function renderTable() {{
       <td class="text-center">${{isMae ? f1(iTm,a?.ifs_temp_mae?.[i])  : sg(iTb)}}</td>
       <td class="text-center">${{isMae ? f1(nTm,a?.nws_temp_mae?.[i])  : sg(nTb)}}</td>
       <td><span class="${{tCls}}">${{tWin}}</span></td>
-      <td class="text-center border-start">${{isMae ? f2(gRm,a?.[`gfs_${{pfx}}_mae`]?.[i]) : sg(gRb,2)}}</td>
-      <td class="text-center">${{isMae ? f2(aRm,a?.[`aifs_${{pfx}}_mae`]?.[i]) : sg(aRb,2)}}</td>
-      <td class="text-center">${{isMae ? f2(iRm,a?.[`ifs_${{pfx}}_mae`]?.[i])  : sg(iRb,2)}}</td>
-      <td class="text-center">${{isMae ? f2(nRm,a?.[`nws_${{pfx}}_mae`]?.[i])  : sg(nRb,2)}}</td>
+      <td class="text-center border-start">${{showPrecipNum ? f2(gRm,gRmRef) : sg(gRb,2)}}</td>
+      <td class="text-center">${{showPrecipNum ? f2(aRm,aRmRef) : sg(aRb,2)}}</td>
+      <td class="text-center">${{showPrecipNum ? f2(iRm,iRmRef) : sg(iRb,2)}}</td>
+      <td class="text-center">${{showPrecipNum ? f2(nRm,nRmRef) : sg(nRb,2)}}</td>
       <td><span class="${{rCls}}">${{rWin}}</span></td>
       <td class="text-center border-start">${{isMae ? f1(gDm,a?.gfs_dewpoint_mae?.[i]) : sg(gDb)}}</td>
       <td class="text-center">${{isMae ? f1(aDm,a?.aifs_dewpoint_mae?.[i]) : sg(aDb)}}</td>
@@ -347,6 +366,7 @@ document.querySelectorAll('input[name="validHour"]').forEach(r => r.addEventList
 document.querySelectorAll('input[name="tableMetric"]').forEach(r => r.addEventListener('change', renderTable));
 document.querySelectorAll('input[name="precipPeriod"]').forEach(r => r.addEventListener('change', renderTable));
 renderTable();
+
 </script>
 </body>
 </html>"""

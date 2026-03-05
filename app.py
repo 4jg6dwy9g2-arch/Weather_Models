@@ -6422,10 +6422,17 @@ def api_polymarket_nyc():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/single-run-bias')
-def single_run_bias_page():
-    """Single run bias map page - shows model bias for a specific forecast run."""
-    return render_template('single_run_bias.html')
+@app.route('/api/polymarket/refresh', methods=['POST'])
+def api_polymarket_refresh():
+    """Fetch live Polymarket + NWS data for all cities, append snapshot, return updated cache."""
+    try:
+        _polymarket.update_polymarket_cache()
+        data = _polymarket.load_polymarket_cache()
+        return jsonify(data)
+    except Exception as e:
+        logger.error("Polymarket live refresh failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
 
 
 @app.route('/api/observations')
@@ -6617,6 +6624,18 @@ def api_weather_history():
 
     try:
         data = weatherlink.read_csv_data_full(start_date, end_date, variable)
+
+        # Aggregate rain to daily totals (5-min increments are not useful as raw points)
+        if variable == 'rain':
+            daily_totals = {}
+            for pt in data:
+                if pt['v'] is None:
+                    continue
+                day = pt['t'][:10]  # YYYY-MM-DD
+                daily_totals[day] = daily_totals.get(day, 0.0) + pt['v']
+            data = [{'t': f'{day}T12:00:00', 'v': round(total, 2)}
+                    for day, total in sorted(daily_totals.items())]
+
         return jsonify({'success': True, 'data': data, 'variable': variable, 'days': days})
     except Exception as e:
         logger.error(f"Error reading weather history for {variable}: {e}")
@@ -8322,6 +8341,7 @@ def api_asos_station_verification():
                 "mslp_mae": raw_result["mslp_mae"],
                 "mslp_bias": raw_result["mslp_bias"],
                 "precip_mae": raw_result["precip_mae"],
+                "precip_wmae": raw_result.get("precip_wmae", []),
                 "precip_bias": raw_result["precip_bias"],
                 "dewpoint_mae": raw_result.get("dewpoint_mae", []),
                 "dewpoint_bias": raw_result.get("dewpoint_bias", []),
@@ -8340,6 +8360,7 @@ def api_asos_station_verification():
                 "temp_bias": raw_result["temp_bias"],
                 "temp_count": raw_result.get("temp_count", []),
                 "precip_mae": raw_result["precip_mae"],
+                "precip_wmae": raw_result.get("precip_wmae", []),
                 "precip_bias": raw_result["precip_bias"],
                 "precip_count": raw_result.get("precip_count", []),
                 "dewpoint_mae": raw_result.get("dewpoint_mae", []),
@@ -8441,8 +8462,8 @@ def api_asos_station_obs_timeseries():
 
     try:
         db = asos.load_asos_forecasts_db()
-        kenny_temp_station_biases, kenny_temp_global_bias = asos._compute_kenny_station_biases(db, "temp")
-        kenny_dew_station_biases, kenny_dew_global_bias = asos._compute_kenny_station_biases(db, "dewpoint")
+        kenny_temp_station_biases, kenny_temp_global_bias = asos._compute_kenny_station_biases_cached(db, "temp")
+        kenny_dew_station_biases, kenny_dew_global_bias = asos._compute_kenny_station_biases_cached(db, "dewpoint")
         runs = db.get("runs", {})
         if not runs:
             return jsonify({"success": False, "error": "No ASOS forecast runs available"}), 404
@@ -8456,6 +8477,30 @@ def api_asos_station_obs_timeseries():
 
         station_obs = db.get("observations", {}).get(station_id, {})
         records = []
+
+        # Pre-sort station obs by timestamp once for O(log n) lookups inside the run loop
+        import bisect as _bisect
+        _sorted_obs = sorted(
+            ((datetime.fromisoformat(ts).timestamp(), var_key, val)
+             for ts, obs_data in station_obs.items()
+             for var_key, val in obs_data.items()
+             if val is not None),
+            key=lambda x: x[0]
+        )
+        _sorted_obs_ts = [x[0] for x in _sorted_obs]
+
+        def _nearest_var(var_key, target_ts, max_delta_s=90 * 60):
+            lo = _bisect.bisect_left(_sorted_obs_ts, target_ts - max_delta_s)
+            hi = _bisect.bisect_right(_sorted_obs_ts, target_ts + max_delta_s)
+            best_val, best_delta = None, max_delta_s + 1.0
+            for i in range(lo, hi):
+                if _sorted_obs[i][1] != var_key:
+                    continue
+                d = abs(_sorted_obs[i][0] - target_ts)
+                if d < best_delta:
+                    best_val = _sorted_obs[i][2]
+                    best_delta = d
+            return best_val
 
         for run_key, run_data in runs.items():
             try:
@@ -8476,25 +8521,9 @@ def api_asos_station_obs_timeseries():
             if cutoff and valid_time < cutoff:
                 continue
 
-            def _nearest_var(var_key, max_delta_minutes=90):
-                best_val = None
-                best_delta = timedelta(minutes=max_delta_minutes + 1)
-                for obs_time_str, obs_data in station_obs.items():
-                    try:
-                        obs_time = datetime.fromisoformat(obs_time_str)
-                    except Exception:
-                        continue
-                    delta = abs(obs_time - valid_time)
-                    if delta > timedelta(minutes=max_delta_minutes):
-                        continue
-                    val = obs_data.get(var_key)
-                    if val is not None and delta < best_delta:
-                        best_delta = delta
-                        best_val = val
-                return best_val
-
-            obs_temp = _nearest_var('temp', max_delta_minutes=90)
-            obs_dewpoint = _nearest_var('dewpoint', max_delta_minutes=90)
+            target_ts = valid_time.timestamp()
+            obs_temp = _nearest_var('temp', target_ts)
+            obs_dewpoint = _nearest_var('dewpoint', target_ts)
             # For precip, use 6-hr accumulation logic (synoptic times)
             obs = asos.get_stored_observation(db, station_id, valid_time, max_delta_minutes=70)
             obs_precip = obs.get("precip_6hr") if obs else None
@@ -8796,6 +8825,15 @@ def api_asos_verification_time_series():
                 "bias": nws_data.get("bias", []),
                 "counts": nws_data.get("counts", [])
             }
+
+        # Per-station winner percentages aligned with dates
+        winner_pcts_by_date = asos.get_winner_pcts_from_cache(variable, lead_time)
+        model_keys = ['gfs', 'aifs', 'kenny', 'ifs', 'nws']
+        result["daily_winner_pcts"] = {
+            m: [winner_pcts_by_date.get(d, {}).get(m) for d in result["dates"]]
+            for m in model_keys
+        }
+
         _verification_cache[cache_key] = result
         _verification_cache_time[cache_key] = time.time()
         return jsonify(result)
@@ -9211,6 +9249,8 @@ def api_rebuild_verification_cache():
     """Rebuild only the ASOS verification cache (no data fetch)."""
     try:
         result = asos.precompute_verification_cache()
+        _verification_cache.clear()
+        _verification_cache_time.clear()
         station_count = len(result.get('by_station', {})) if result else 0
         vh_count = len(result.get('by_station_by_valid_hour', {})) if result else 0
         return jsonify({
@@ -9833,315 +9873,6 @@ def api_asos_status():
 
     except Exception as e:
         logger.error(f"Error getting ASOS status: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
-@app.route('/api/asos/available-runs')
-def api_asos_available_runs():
-    """Get list of available forecast runs for single run bias analysis."""
-    try:
-        # Load ASOS forecasts database
-        db = asos.load_asos_forecasts_db()
-
-        if not db or 'runs' not in db:
-            return jsonify({"success": False, "error": "No forecast data available"})
-
-        runs = db['runs']
-
-        # Convert to sorted list (most recent first)
-        run_list = [{"run_time": rt} for rt in sorted(runs.keys(), reverse=True)]
-
-        return jsonify({
-            "success": True,
-            "runs": run_list[:50]  # Limit to 50 most recent runs
-        })
-
-    except Exception as e:
-        logger.error(f"Error getting available runs: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
-@app.route('/api/asos/available-valid-times')
-def api_asos_available_valid_times():
-    """Get list of available observation/valid times for single run bias analysis.
-    Only returns synoptic times (00Z, 06Z, 12Z, 18Z) where we have observation data."""
-    try:
-        # Load ASOS forecasts database
-        db = asos.load_asos_forecasts_db()
-
-        if not db or 'observations' not in db:
-            return jsonify({"success": False, "error": "No observation data available"})
-
-        observations = db['observations']
-
-        # Collect synoptic times (00Z, 06Z, 12Z, 18Z) where we have observations
-        valid_times_set = set()
-
-        for station_id, station_obs in observations.items():
-            for obs_time_str in station_obs.keys():
-                obs_time = datetime.fromisoformat(obs_time_str)
-
-                # Only include synoptic times (00Z, 06Z, 12Z, 18Z)
-                if obs_time.hour in [0, 6, 12, 18] and obs_time.minute <= 5:
-                    # Round to exact synoptic hour
-                    synoptic_time = obs_time.replace(minute=0, second=0, microsecond=0)
-                    valid_times_set.add(synoptic_time.isoformat())
-
-        # Convert to sorted list (most recent first)
-        valid_times = sorted(valid_times_set, reverse=True)
-
-        return jsonify({
-            "success": True,
-            "valid_times": valid_times[:100]  # Limit to 100 most recent synoptic times
-        })
-
-    except Exception as e:
-        logger.error(f"Error getting available valid times: {e}")
-        return jsonify({"success": False, "error": str(e)})
-
-
-@app.route('/api/asos/single-run-bias')
-def api_asos_single_run_bias():
-    """
-    Get bias data for a specific observation time and forecast lead time.
-
-    Query parameters:
-    - valid_time: ISO format datetime of the observation/valid time (required)
-    - lead_time: Forecast lead time in hours (required)
-    - variable: Variable to analyze ('temp', 'mslp', or 'precip', default 'temp')
-
-    Example: valid_time=2026-02-07T12:00:00Z, lead_time=12
-    This will use the forecast from 2026-02-07T00:00:00Z at F+12 hours
-    """
-    try:
-        valid_time_str = request.args.get('valid_time')
-        lead_time_str = request.args.get('lead_time')
-        variable = request.args.get('variable', 'temp')
-
-        if not valid_time_str or not lead_time_str:
-            return jsonify({"success": False, "error": "Missing required parameters"})
-
-        # Parse parameters
-        valid_time = datetime.fromisoformat(valid_time_str.replace('Z', '+00:00'))
-        lead_time = int(lead_time_str)
-
-        # Calculate run time (valid_time - lead_time)
-        run_time = valid_time - timedelta(hours=lead_time)
-
-        # Load ASOS forecasts database
-        db = asos.load_asos_forecasts_db()
-
-        if not db or 'runs' not in db or 'stations' not in db or 'observations' not in db:
-            return jsonify({"success": False, "error": "No forecast data available"})
-
-        runs = db['runs']
-        stations_meta = db['stations']
-        observations = db['observations']
-
-        # Check if this run exists
-        run_key = run_time.isoformat()
-        if run_key not in runs:
-            return jsonify({"success": False, "error": f"No forecast data for run {run_time.strftime('%Y-%m-%d %HZ')}"})
-
-        run_data = runs[run_key]
-
-        # Get forecast hours for this run
-        forecast_hours = run_data.get('forecast_hours', [])
-        if lead_time not in forecast_hours:
-            return jsonify({"success": False, "error": f"Lead time {lead_time}h not available for this run"})
-
-        # Find the index of this lead time
-        try:
-            lead_idx = forecast_hours.index(lead_time)
-        except ValueError:
-            return jsonify({"success": False, "error": f"Lead time {lead_time}h not found"})
-
-        # Variable name mapping
-        var_name_map = {
-            'temp': 'temps',
-            'mslp': 'mslps',
-            'precip': 'precips'
-        }
-        var_key = var_name_map.get(variable, variable + 's')
-
-        # Collect bias data for all stations
-        stations_data = {}
-        all_biases = {'gfs': [], 'aifs': [], 'ifs': [], 'nws': []}
-
-        # Helper function to get observation near valid time
-        # Uses composite observation matching to handle ASOS stations that report
-        # different variables at different times (MSLP every 5min, temp/precip hourly at :56)
-        def get_observation(station_id, valid_time):
-            if station_id not in observations:
-                return None
-
-            station_obs = observations[station_id]
-            max_delta = timedelta(minutes=30)
-
-            # Find nearest observation for each variable separately
-            best = {
-                'temp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
-                'mslp': {'value': None, 'delta': max_delta + timedelta(seconds=1)},
-                'precip': {'value': None, 'delta': max_delta + timedelta(seconds=1)}
-            }
-
-            # Search through all observations to find nearest for each variable
-            for obs_time_str, obs_data in station_obs.items():
-                try:
-                    obs_time = datetime.fromisoformat(obs_time_str)
-                    delta = abs(obs_time - valid_time)
-
-                    if delta > max_delta:
-                        continue
-
-                    # Check each variable and update if this observation is closer
-                    if obs_data.get('temp') is not None and delta < best['temp']['delta']:
-                        best['temp']['value'] = obs_data['temp']
-                        best['temp']['delta'] = delta
-
-                    if obs_data.get('mslp') is not None and delta < best['mslp']['delta']:
-                        best['mslp']['value'] = obs_data['mslp']
-                        best['mslp']['delta'] = delta
-
-                    if obs_data.get('precip') is not None and delta < best['precip']['delta']:
-                        best['precip']['value'] = obs_data['precip']
-                        best['precip']['delta'] = delta
-
-                except (ValueError, AttributeError):
-                    continue
-
-            # Build composite observation from nearest source for each variable
-            if all(best[v]['value'] is None for v in ['temp', 'mslp', 'precip']):
-                return None
-
-            return {
-                'temp': best['temp']['value'],
-                'mslp': best['mslp']['value'],
-                'precip': best['precip']['value']
-            }
-
-        # Process each station
-        for station_id, station_meta in stations_meta.items():
-            station_info = {
-                'name': station_meta['name'],
-                'lat': station_meta['lat'],
-                'lon': station_meta['lon']
-            }
-
-            # Get observation for this valid time
-            obs = get_observation(station_id, valid_time)
-            if not obs:
-                continue
-
-            # For precipitation, model forecasts are 6-hour accumulated totals.
-            # Use calculate_6hr_precip_total to match the same accumulation window.
-            if variable == 'precip':
-                observed_value = asos.calculate_6hr_precip_total(db, station_id, valid_time)
-                if observed_value is None:
-                    continue
-            else:
-                if obs.get(variable) is None:
-                    continue
-                observed_value = obs[variable]
-
-            # Get forecast for each model
-            for model in ['gfs', 'aifs', 'ifs', 'nws']:
-                if model not in run_data:
-                    continue
-
-                model_stations = run_data[model]
-                if station_id not in model_stations:
-                    continue
-
-                station_fcst = model_stations[station_id]
-                if var_key not in station_fcst:
-                    continue
-
-                forecast_values = station_fcst[var_key]
-                if not forecast_values or len(forecast_values) <= lead_idx:
-                    continue
-
-                forecast_value = forecast_values[lead_idx]
-                if forecast_value is None:
-                    continue
-
-                # Calculate bias (forecast - observed)
-                bias = forecast_value - observed_value
-
-                # Add to station data
-                if station_id not in stations_data:
-                    stations_data[station_id] = station_info.copy()
-
-                stations_data[station_id][model] = {
-                    'bias': bias,
-                    'forecast': forecast_value,
-                    'observed': observed_value
-                }
-
-                all_biases[model].append(bias)
-
-        if not stations_data:
-            return jsonify({"success": False, "error": "No matching data for this run and lead time"})
-
-        # Calculate min/max for color scale (symmetric around 0 for bias)
-        all_bias_values = []
-        for model_biases in all_biases.values():
-            all_bias_values.extend(model_biases)
-
-        # Set color scale ranges based on variable
-        if variable == 'temp':
-            # Fixed scale for temperature for consistency across runs
-            min_value = -10.0
-            max_value = 10.0
-        elif variable == 'precip':
-            # Dynamic scale for precipitation (small values)
-            if all_bias_values:
-                max_abs = max(abs(min(all_bias_values)), abs(max(all_bias_values)))
-                max_abs = max(max_abs, 0.5)  # Minimum ±0.5 inches
-                min_value = -max_abs
-                max_value = max_abs
-            else:
-                min_value = -1.0
-                max_value = 1.0
-        else:
-            # Dynamic scale for pressure
-            if all_bias_values:
-                max_abs = max(abs(min(all_bias_values)), abs(max(all_bias_values)))
-                max_abs = max(max_abs, 5.0)  # Minimum ±5 mb
-                min_value = -max_abs
-                max_value = max_abs
-            else:
-                min_value = -10.0
-                max_value = 10.0
-
-        # Calculate summary statistics for each model
-        summary = {}
-        for model in ['gfs', 'aifs', 'ifs', 'nws']:
-            if all_biases[model]:
-                biases = np.array(all_biases[model])
-                summary[model] = {
-                    'mean': float(np.mean(biases)),
-                    'median': float(np.median(biases)),
-                    'std': float(np.std(biases)),
-                    'count': len(biases)
-                }
-
-        return jsonify({
-            "success": True,
-            "stations": stations_data,
-            "min_value": min_value,
-            "max_value": max_value,
-            "summary": summary,
-            "run_time": run_time.isoformat(),
-            "valid_time": valid_time.isoformat(),
-            "lead_time": lead_time,
-            "variable": variable
-        })
-
-    except Exception as e:
-        logger.error(f"Error getting single run bias: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)})
 
 
@@ -11292,6 +11023,190 @@ def api_cdl_tile(z, x, y):
     resp = Response(png, mimetype='image/png')
     resp.headers['Cache-Control'] = 'public, max-age=86400'
     return resp
+
+
+@app.route('/api/asos/single-event-available-dates')
+def api_asos_single_event_available_dates():
+    """Return sorted list of dates covered by current runs in the ASOS DB."""
+    try:
+        db = asos.load_asos_forecasts_db()
+        dates = asos.get_single_event_available_dates(db)
+        return jsonify({"success": True, "dates": dates})
+    except Exception as e:
+        logger.error(f"Error getting single-event available dates: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+# Cache for single-event map results keyed by (date, lead_time, model) — 5-min TTL.
+# All variables are returned in one response; variable/metric filtering is done client-side.
+_single_event_map_cache: dict = {}
+_single_event_map_cache_time: dict = {}
+
+@app.route('/api/asos/single-event-map')
+def api_asos_single_event_map():
+    """
+    Get per-station stats (all variables) for a single date (and optional synoptic hour)
+    at a given lead time and model.  Variable/metric selection is done client-side.
+
+    Query params: date (YYYY-MM-DD), lead_time (hours), model, valid_hour (0/6/12/18, optional)
+    """
+    date_str    = request.args.get('date', '')
+    lead_time   = request.args.get('lead_time', 24, type=int)
+    model       = request.args.get('model', 'gfs')
+    valid_hour  = request.args.get('valid_hour', None, type=int)
+    include_obs = request.args.get('include_obs', 'false').lower() == 'true'
+
+    if not date_str:
+        return jsonify({"success": False, "error": "date parameter required"})
+
+    cache_key = f"{date_str}_{valid_hour}_{lead_time}_{model}" + ("_obs" if include_obs else "")
+    now_ts = time.time()
+    if cache_key in _single_event_map_cache:
+        if now_ts - _single_event_map_cache_time.get(cache_key, 0) < 300:  # 5-min TTL
+            return jsonify(_single_event_map_cache[cache_key])
+
+    try:
+        db = asos.load_asos_forecasts_db()
+        verification = asos.get_single_event_verification(db, date_str, lead_time, model, valid_hour=valid_hour, include_obs=include_obs)
+
+        stations = []
+        for station_id, data in verification.items():
+            stations.append({
+                "station_id": station_id,
+                "name": data.get('name', station_id),
+                "lat": data.get('lat'),
+                "lon": data.get('lon'),
+                "state": data.get('state', ''),
+                "variables": data.get('variables', {}),
+            })
+
+        result = {
+            "success": True,
+            "stations": stations,
+            "date": date_str,
+            "valid_hour": valid_hour,
+            "lead_time": lead_time,
+            "model": model,
+            "station_count": len(stations),
+        }
+        _single_event_map_cache[cache_key] = result
+        _single_event_map_cache_time[cache_key] = now_ts
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error getting single-event map: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/asos/single-event-station')
+def api_asos_single_event_station():
+    """
+    Get per-valid-time obs + all-model forecast/bias across a date range for one station.
+
+    Query params: station_id, date_start (YYYY-MM-DD), date_end (YYYY-MM-DD), lead_time (hours)
+    """
+    station_id = request.args.get('station_id', '')
+    date_start = request.args.get('date_start', '')
+    date_end   = request.args.get('date_end', '')
+    lead_time  = request.args.get('lead_time', 24, type=int)
+
+    if not station_id or not date_start or not date_end:
+        return jsonify({"success": False, "error": "station_id, date_start, date_end required"})
+
+    try:
+        from datetime import date as date_cls, timedelta as _td
+        start = date_cls.fromisoformat(date_start)
+        end   = date_cls.fromisoformat(date_end)
+        if end < start:
+            start, end = end, start
+        dates = []
+        cur = start
+        while cur <= end:
+            dates.append(cur.isoformat())
+            cur = cur + _td(days=1)
+
+        db = asos.load_asos_forecasts_db()
+        entries = asos.get_single_event_station_detail(db, station_id, dates, lead_time)
+
+        station_meta = db.get('stations', {}).get(station_id, {})
+        return jsonify({
+            "success": True,
+            "station_id": station_id,
+            "station_name": station_meta.get('name', station_id),
+            "state": station_meta.get('state', ''),
+            "lead_time": lead_time,
+            "entries": entries,
+        })
+
+    except Exception as e:
+        import traceback
+        logger.error(f"Error getting single-event station detail: {e}\n{traceback.format_exc()}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/asos/single-event-station-matrix')
+def api_asos_single_event_station_matrix():
+    """
+    Get per-valid-time obs + per-model data for all lead times for one station.
+    Query params: station_id, date_start (YYYY-MM-DD), date_end (YYYY-MM-DD)
+    """
+    station_id = request.args.get('station_id', '')
+    date_start = request.args.get('date_start', '')
+    date_end   = request.args.get('date_end', '')
+
+    if not station_id or not date_start or not date_end:
+        return jsonify({"success": False, "error": "station_id, date_start, date_end required"})
+
+    try:
+        from datetime import date as date_cls, timedelta as _td
+        start = date_cls.fromisoformat(date_start)
+        end   = date_cls.fromisoformat(date_end)
+        if end < start:
+            start, end = end, start
+        dates = []
+        cur = start
+        while cur <= end:
+            dates.append(cur.isoformat())
+            cur = cur + _td(days=1)
+
+        lead_times = [6, 12, 24, 48, 72, 120, 168, 240, 288, 360]
+        db = asos.load_asos_forecasts_db()
+        matrix = asos.get_single_event_station_matrix(db, station_id, dates, lead_times)
+
+        return jsonify({
+            "success": True,
+            "station_id": station_id,
+            "lead_times": lead_times,
+            "matrix": matrix,
+        })
+    except Exception as e:
+        import traceback
+        logger.error(f"Error getting single-event station matrix: {e}\n{traceback.format_exc()}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/asos/forecast-evolution')
+def api_asos_forecast_evolution():
+    """
+    For a specific station and valid time, return how each model's forecast for
+    that valid time evolved across different initialization times (lead times).
+
+    Query params: station_id, valid_time (ISO8601), variable (temp/dewpoint/mslp/precip)
+    """
+    station_id = request.args.get('station_id', '')
+    valid_time  = request.args.get('valid_time', '')
+    variable    = request.args.get('variable', 'temp')
+
+    if not station_id or not valid_time:
+        return jsonify({"success": False, "error": "station_id and valid_time required"})
+
+    try:
+        db = asos.load_asos_forecasts_db()
+        result = asos.get_forecast_evolution(db, station_id, valid_time, variable)
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        logger.error(f"Error getting forecast evolution: {e}")
+        return jsonify({"success": False, "error": str(e)})
 
 
 if __name__ == '__main__':

@@ -302,8 +302,9 @@ def extract_timeseries_data() -> dict:
                 if 'error' in gfs:
                     continue
 
+                dates = gfs.get('dates', [])
                 combo = {
-                    'dates': gfs.get('dates', []),
+                    'dates': dates,
                     'gfs':  {'mae': gfs.get('mae', []),   'wmae': gfs.get('wmae', gfs.get('mae', [])),   'bias': gfs.get('bias', [])},
                     'aifs': {'mae': aifs_d.get('mae', []), 'wmae': aifs_d.get('wmae', aifs_d.get('mae', [])), 'bias': aifs_d.get('bias', [])},
                     'kenny': {'mae': kenny_d.get('mae', []), 'wmae': kenny_d.get('wmae', kenny_d.get('mae', [])), 'bias': kenny_d.get('bias', [])},
@@ -311,6 +312,14 @@ def extract_timeseries_data() -> dict:
                 }
                 if include_nws and 'error' not in nws_d:
                     combo['nws'] = {'mae': nws_d.get('mae', []), 'wmae': nws_d.get('wmae', nws_d.get('mae', [])), 'bias': nws_d.get('bias', [])}
+
+                # Per-station winner percentages aligned with dates
+                winner_pcts_by_date = asos.get_winner_pcts_from_cache(var, lt)
+                model_keys = ['gfs', 'aifs', 'kenny', 'ifs', 'nws']
+                combo['daily_winner_pcts'] = {
+                    m: [winner_pcts_by_date.get(d, {}).get(m) for d in dates]
+                    for m in model_keys
+                }
 
                 ts[var][str(lt)] = combo
             except Exception as e:
@@ -858,6 +867,7 @@ thead tr:nth-child(2) th {{ background: white; }}
       <span class="ms-2"><span class="badge bg-secondary">Tie</span> <span id="tsTieWins">0</span> days</span>
     </div>
     <div style="position:relative;height:350px"><canvas id="tsChart"></canvas></div>
+    <div id="tsWinnerPctContainer" class="d-none" style="position:relative;height:180px;margin-top:4px"><canvas id="tsWinnerPctChart"></canvas></div>
   </div>
 </div>
 
@@ -896,7 +906,8 @@ thead tr:nth-child(2) th {{ background: white; }}
         <option value="48">48h+</option>
       </select>
     </div>
-    <div style="position:relative;height:260px"><canvas id="pmMaeChart"></canvas></div>
+    <div style="position:relative;height:200px"><canvas id="pmMaeChart"></canvas></div>
+    <div style="position:relative;height:85px;margin-top:2px"><canvas id="pmVolChart"></canvas></div>
   </div>
   <div class="card-header border-top d-flex align-items-center gap-2 py-1" style="background:#eef2ff;">
     <small class="text-muted me-2" style="font-size:0.75rem;">Lead-time verification by city:</small>
@@ -925,12 +936,14 @@ let asosMap = null, markers = [];
 let droughtLayer = null;
 let dtCharts = {{}};
 let tsChart = null;
+let tsWinnerPctChart = null;
 let detailSt = null, detailIsMonthly = false;
 let OBS_DATA = null;
 let obsCharts = {{}};
 let obsSid = null;
 let PM_DATA = null;
 let pmMaeChart = null;
+let pmVolChart = null;
 
 const DROUGHT_COLORS = {{0:'#FFFF00',1:'#FCD37F',2:'#FFAA00',3:'#E60000',4:'#730000'}};
 
@@ -1222,8 +1235,8 @@ function renderObsCharts(sid, lt) {{
 
   const labels = records.map(r => {{
     const d = new Date(r.t);
-    const md = d.toLocaleDateString('en-US', {{month:'numeric', day:'numeric'}});
-    const hh = d.toLocaleTimeString('en-US', {{hour:'2-digit', hour12:false}});
+    const md = d.toLocaleDateString('en-US', {{month:'numeric', day:'numeric', timeZone:'UTC'}});
+    const hh = d.toLocaleTimeString('en-US', {{hour:'2-digit', hour12:false, timeZone:'UTC'}});
     return `${{md}} ${{hh}}Z`;
   }});
 
@@ -1598,6 +1611,88 @@ function renderTs() {{
       }}
     }}
   }});
+
+  // --- Winner % subplot ---
+  const wpContainer = document.getElementById('tsWinnerPctContainer');
+  if (tsWinnerPctChart) {{ tsWinnerPctChart.destroy(); tsWinnerPctChart = null; }}
+  const dwp = (resolvedMetric === 'mae' || resolvedMetric === 'wmae') ? combo.daily_winner_pcts : null;
+  if (!dwp || !labels.length) {{
+    wpContainer.classList.add('d-none');
+  }} else {{
+    wpContainer.classList.remove('d-none');
+    const WP_STYLES = {{
+      gfs:   {{color:'#0d6efd', label:'GFS'}},
+      aifs:  {{color:'#0dcaf0', label:'AIFS'}},
+      kenny: {{color:'#fd7e14', label:'Kenny'}},
+      ifs:   {{color:'#20c997', label:'IFS'}},
+      nws:   {{color:'#6c757d', label:'NWS'}},
+    }};
+    const wpModels = ['gfs','aifs','kenny','ifs','nws'].filter(m => dwp[m] && dwp[m].some(v => v != null));
+    const nRanks = wpModels.length;
+    const rankData  = Array.from({{length:nRanks}}, () => []);
+    const rankBg    = Array.from({{length:nRanks}}, () => []);
+    const rankBorder= Array.from({{length:nRanks}}, () => []);
+    const rankModel = Array.from({{length:nRanks}}, () => []);
+    for (let i = 0; i < labels.length; i++) {{
+      const entries = wpModels
+        .map(m => ({{m, v: dwp[m][startIdx + i]}}))
+        .filter(e => e.v != null)
+        .sort((a, b) => a.v - b.v);  // ascending: smallest → rank 0 (drawn on top by Chart.js)
+      for (let r = 0; r < nRanks; r++) {{
+        const e = entries[r];
+        if (e) {{
+          rankData[r].push(e.v);
+          rankBg[r].push(WP_STYLES[e.m].color);
+          rankBorder[r].push(WP_STYLES[e.m].color);
+          rankModel[r].push(e.m);
+        }} else {{
+          rankData[r].push(null);
+          rankBg[r].push('rgba(0,0,0,0)');
+          rankBorder[r].push('rgba(0,0,0,0)');
+          rankModel[r].push(null);
+        }}
+      }}
+    }}
+    const wpDatasets = rankData.map((data, r) => ({{
+      label: `Layer ${{r+1}}`,
+      data,
+      backgroundColor: rankBg[r],
+      borderColor: rankBorder[r],
+      borderWidth: 1,
+      grouped: false,
+      barPercentage: 0.95,
+      categoryPercentage: 1.0,
+      _rankModels: rankModel[r],
+    }}));
+    tsWinnerPctChart = new Chart(document.getElementById('tsWinnerPctChart'), {{
+      type: 'bar',
+      data: {{labels, datasets: wpDatasets}},
+      options: {{
+        responsive: true, maintainAspectRatio: false,
+        datasets: {{bar: {{grouped: false}}}},
+        interaction: {{mode:'index', intersect:false}},
+        plugins: {{
+          legend: {{display:false}},
+          tooltip: {{
+            callbacks: {{
+              title: c => c[0].label,
+              label: c => {{
+                const m = c.dataset._rankModels?.[c.dataIndex];
+                const lbl = m ? (WP_STYLES[m]?.label || m.toUpperCase()) : c.dataset.label;
+                return c.parsed.y != null ? `${{lbl}}: ${{c.parsed.y.toFixed(1)}}% of stations` : null;
+              }}
+            }}
+          }}
+        }},
+        scales: {{
+          x: {{grid:{{display:false}}, ticks:{{maxRotation:45, minRotation:45, font:{{size:10}}}}}},
+          y: {{min:0, max:60, grid:{{color:'#e0e0e0'}},
+               title:{{display:true, text:'% stations won'}},
+               ticks:{{callback: v => v + '%'}}}}
+        }}
+      }}
+    }});
+  }}
 }}
 
 // ============================================================
@@ -1644,6 +1739,7 @@ function buildPmAllCitiesChart(selectedBucket) {{
 
   const cities = PM_DATA._cities || [];
   const byDate = {{}};
+  const volByDate = {{}};
   cities.forEach(c => {{
     const cityData = PM_DATA[c.key];
     if (!cityData) return;
@@ -1651,6 +1747,9 @@ function buildPmAllCitiesChart(selectedBucket) {{
       if (!entry.resolved || entry.observed_high == null) return;
       const obs   = entry.observed_high;
       const snaps = (entry.snapshots || []).filter(s => s.lead_hours != null && s.lead_hours >= 0);
+      // Accumulate total volume (max across snapshots = final traded volume)
+      const maxVol = snaps.reduce((mx, s) => Math.max(mx, s.volume || 0), 0);
+      if (maxVol > 0) volByDate[d] = (volByDate[d] || 0) + maxVol;
       const selected = snaps.filter(s => pmGetBucket(s.lead_hours) === bucketNum);
       if (!selected.length) return;
       if (!byDate[d]) byDate[d] = {{mErrs:[], nErrs:[]}};
@@ -1665,10 +1764,12 @@ function buildPmAllCitiesChart(selectedBucket) {{
   if (!dates.length) return;
   const sec = document.getElementById('pmChartSection');
   if (sec) sec.style.display = '';
-  const labels = dates.map(fmtPmDate);
-  const mMAE   = dates.map(d => avg(byDate[d].mErrs));
-  const nMAE   = dates.map(d => avg(byDate[d].nErrs));
+  const labels  = dates.map(fmtPmDate);
+  const mMAE    = dates.map(d => avg(byDate[d].mErrs));
+  const nMAE    = dates.map(d => avg(byDate[d].nErrs));
+  const volData = dates.map(d => volByDate[d] || null);
   if (pmMaeChart) {{ pmMaeChart.destroy(); pmMaeChart = null; }}
+  if (pmVolChart) {{ pmVolChart.destroy(); pmVolChart = null; }}
   pmMaeChart = new Chart(el.getContext('2d'), {{
     type: 'line',
     data: {{
@@ -1689,12 +1790,41 @@ function buildPmAllCitiesChart(selectedBucket) {{
           ? ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '\u00b0F' : null}}}},
       }},
       scales:{{
-        x:{{grid:{{display:false}}, title:{{display:true, text:'Date'}},
-           ticks:{{maxRotation:45, minRotation:45}}}},
+        x:{{grid:{{color:'#e5e7eb'}}, ticks:{{display:false}}, title:{{display:false}}}},
         y:{{min:0, grid:{{color:'#e5e7eb'}}, title:{{display:true, text:'Avg MAE (\u00b0F)'}}}},
       }},
     }},
   }});
+  const volEl = document.getElementById('pmVolChart');
+  if (volEl) {{
+    pmVolChart = new Chart(volEl.getContext('2d'), {{
+      type: 'bar',
+      data: {{
+        labels,
+        datasets: [{{ label:'Total Volume', data:volData,
+           backgroundColor:'rgba(156,163,175,0.5)', borderColor:'rgba(107,114,128,0.7)',
+           borderWidth:1 }}],
+      }},
+      options: {{
+        responsive:true, maintainAspectRatio:false,
+        interaction:{{mode:'index', intersect:false}},
+        plugins:{{
+          legend:{{display:false}},
+          tooltip:{{callbacks:{{label:ctx => {{
+            const v = ctx.parsed.y;
+            if (v == null) return null;
+            return 'Volume: $' + (v >= 1000 ? (v/1000).toFixed(1)+'k' : v.toFixed(0));
+          }}}}}},
+        }},
+        scales:{{
+          x:{{grid:{{display:false}}, ticks:{{maxRotation:45, minRotation:45, font:{{size:10}}}}}},
+          y:{{min:0, grid:{{color:'#e5e7eb'}},
+             title:{{display:true, text:'Volume ($)', font:{{size:10}}}},
+             ticks:{{callback:v => '$'+(v>=1000?(v/1000).toFixed(0)+'k':v), font:{{size:10}}}}}},
+        }},
+      }},
+    }});
+  }}
 }}
 
 function buildPmLeadTimeTable(resolvedDates, markets) {{

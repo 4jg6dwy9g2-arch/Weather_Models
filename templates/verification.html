@@ -85,6 +85,24 @@
 </div>
 
 <div id="verificationContent" class="d-none">
+
+    <!-- Sub-Tab Navigation -->
+    <ul class="nav nav-tabs mb-3" id="verificationTabs" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="asosNetworkTab" data-bs-toggle="tab" data-bs-target="#asosNetworkPane" type="button" role="tab">
+                <i class="bi bi-geo-alt"></i> ASOS Network
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="singleEventTab" data-bs-toggle="tab" data-bs-target="#singleEventPane" type="button" role="tab" onclick="onSingleEventTabOpen()">
+                <i class="bi bi-calendar-event"></i> Single Event Error
+            </button>
+        </li>
+    </ul>
+
+    <div class="tab-content" id="verificationTabContent">
+    <div class="tab-pane fade show active" id="asosNetworkPane" role="tabpanel">
+
     <!-- ASOS Station Verification Map -->
     <div class="row mb-4">
         <div class="col-12">
@@ -181,7 +199,13 @@
                             </div>
                             <div class="col-lg-6 mb-4">
                                 <div class="card h-100">
-                                    <div class="card-header"><i class="bi bi-cloud-rain"></i> Precipitation Accuracy</div>
+                                    <div class="card-header d-flex align-items-center justify-content-between">
+                                        <span><i class="bi bi-cloud-rain"></i> Precipitation Accuracy</span>
+                                        <div class="btn-group btn-group-sm" role="group" id="precipChartMetricToggle">
+                                            <button type="button" class="btn btn-outline-secondary active" id="precipChartMaeBtn" onclick="setStationPrecipMetric('mae')">MAE</button>
+                                            <button type="button" class="btn btn-outline-secondary" id="precipChartWmaeBtn" onclick="setStationPrecipMetric('wmae')">WMAE</button>
+                                        </div>
+                                    </div>
                                     <div class="card-body chart-container chart-container-small">
                                         <canvas id="asosPrecipVerificationChart"></canvas>
                                     </div>
@@ -380,6 +404,9 @@
                                     <div class="chart-container" style="position: relative; height: 400px;">
                                         <canvas id="timeSeriesChart"></canvas>
                                     </div>
+                                    <div id="winnerPctContainer" class="d-none" style="position: relative; height: 180px; margin-top: 4px;">
+                                        <canvas id="winnerPctChart"></canvas>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -405,6 +432,168 @@
         </div>
     </div>
 
+    </div><!-- end #asosNetworkPane -->
+
+    <!-- ================================================================
+         Single Event Error Tab
+         ================================================================ -->
+    <div class="tab-pane fade" id="singleEventPane" role="tabpanel">
+        <div class="row mb-3">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                        <div><i class="bi bi-calendar-event"></i> Single Event Error Map</div>
+                        <div class="d-flex gap-2 flex-wrap align-items-center">
+                            <label class="form-label mb-0 small text-muted">From</label>
+                            <input type="date" class="form-control form-control-sm" id="seStartDate" style="width: auto;">
+                            <label class="form-label mb-0 small text-muted">To</label>
+                            <input type="date" class="form-control form-control-sm" id="seEndDate" style="width: auto;">
+                            <button class="btn btn-sm btn-primary" onclick="loadSingleEventMap()">Load</button>
+                            <button class="btn btn-sm btn-outline-secondary" id="seExportHtmlBtn" onclick="openSeExportModal()" title="Export current tab data as HTML"><i class="bi bi-download"></i> Export HTML</button>
+                            <select class="form-select form-select-sm" id="seModel" style="width: auto;" onchange="renderSingleEventDateMap()">
+                                <option value="gfs">GFS</option>
+                                <option value="aifs">AIFS</option>
+                                <option value="kenny">Kenny</option>
+                                <option value="ifs">IFS</option>
+                                <option value="nws">NWS</option>
+                            </select>
+                            <select class="form-select form-select-sm" id="seVariable" style="width: auto;" onchange="loadSingleEventMapDebounced()">
+                                <option value="temp">Temperature</option>
+                                <option value="mslp">Pressure</option>
+                                <option value="precip">Precipitation (6hr)</option>
+                                <option value="dewpoint">Dew Point</option>
+                            </select>
+                            <select class="form-select form-select-sm" id="seMetric" style="width: auto;" onchange="loadSingleEventMapDebounced()">
+                                <option value="mae">MAE</option>
+                                <option value="bias">Bias</option>
+                            </select>
+                            <select class="form-select form-select-sm" id="seLeadTime" style="width: auto;" onchange="renderSingleEventDateMap()">
+                                <option value="6">6h</option>
+                                <option value="12">12h</option>
+                                <option value="24" selected>24h</option>
+                                <option value="48">48h</option>
+                                <option value="72">72h</option>
+                                <option value="120">5d</option>
+                                <option value="168">7d</option>
+                                <option value="240">10d</option>
+                                <option value="288">12d</option>
+                                <option value="360">15d</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <!-- Date navigation bar -->
+                        <div id="seDateNav" class="d-none d-flex align-items-center gap-3 px-3 py-2 border-bottom bg-light">
+                            <button class="btn btn-sm btn-outline-secondary" onclick="navigateSingleEvent(-1)"><i class="bi bi-chevron-left"></i></button>
+                            <span id="seDateNavLabel" class="fw-semibold"></span>
+                            <button class="btn btn-sm btn-outline-secondary" onclick="navigateSingleEvent(1)"><i class="bi bi-chevron-right"></i></button>
+                            <span id="seStationCount" class="badge bg-secondary ms-2">-- stations</span>
+                        </div>
+
+                        <!-- Map -->
+                        <div id="seMapContainer" style="height: 450px; position: relative;">
+                            <div id="seMap" style="height: 100%; width: 100%;"></div>
+                            <div id="seMapLoading" class="position-absolute top-50 start-50 translate-middle text-center d-none" style="z-index: 1000;">
+                                <div class="spinner-border text-primary" role="status"></div>
+                                <p class="mt-2 text-muted">Loading...</p>
+                            </div>
+                            <div id="seMapEmpty" class="position-absolute top-50 start-50 translate-middle text-center" style="z-index: 1000;">
+                                <i class="bi bi-calendar-event fs-1 text-muted"></i>
+                                <p class="mt-2 text-muted">Select a date range and click Load.</p>
+                            </div>
+                        </div>
+
+                        <!-- Color scale -->
+                        <div class="d-flex align-items-center justify-content-center gap-3 py-2 border-top bg-light">
+                            <span id="seColorMin" class="text-muted small">0</span>
+                            <div id="seColorScale" style="width: 200px; height: 12px; border-radius: 4px;"></div>
+                            <span id="seColorMax" class="text-muted small">10</span>
+                            <span id="seColorUnits" class="text-muted small ms-2"></span>
+                        </div>
+
+                        <!-- Station detail panel (hidden until click) -->
+                        <div id="seStationDetail" class="card-body border-top d-none">
+                            <div class="mb-3">
+                                <h5 class="mb-0"><i class="bi bi-pin-map"></i> <span id="seStationName">Station</span></h5>
+                            </div>
+                            <!-- Variable tabs -->
+                            <ul class="nav nav-pills nav-sm mb-3" id="seVarTabs">
+                                <li class="nav-item"><button class="nav-link active btn-sm py-1" data-se-var="temp" onclick="setSingleEventVar('temp')">Temp</button></li>
+                                <li class="nav-item"><button class="nav-link btn-sm py-1" data-se-var="dewpoint" onclick="setSingleEventVar('dewpoint')">Dew Point</button></li>
+                                <li class="nav-item"><button class="nav-link btn-sm py-1" data-se-var="precip" onclick="setSingleEventVar('precip')">Precip</button></li>
+                                <li class="nav-item"><button class="nav-link btn-sm py-1" data-se-var="mslp" onclick="setSingleEventVar('mslp')">Pressure</button></li>
+                            </ul>
+                            <!-- Forecast Evolution Chart -->
+                            <div class="row">
+                                <div class="col-12 mb-3">
+                                    <div class="card">
+                                        <div class="card-header small" id="seFcstEvolutionLabel">Forecast Evolution</div>
+                                        <div class="card-body">
+                                            <div style="position: relative; height: 260px;">
+                                                <canvas id="seFcstEvolutionChart"></canvas>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    <!-- Export Options Modal -->
+    <div id="seExportModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:2000;align-items:center;justify-content:center;">
+        <div style="background:#fff;border-radius:8px;padding:24px;max-width:460px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,0.25);">
+            <h6 class="mb-3"><i class="bi bi-sliders"></i> Export HTML Options</h6>
+
+            <div class="mb-3">
+                <div class="form-label fw-semibold small mb-2">Variables</div>
+                <div class="d-flex flex-wrap gap-3">
+                    <div class="form-check"><input class="form-check-input" type="checkbox" id="expOptTemp"     checked onchange="updateExpEstimate()"><label class="form-check-label small" for="expOptTemp">Temperature</label></div>
+                    <div class="form-check"><input class="form-check-input" type="checkbox" id="expOptDewpoint" checked onchange="updateExpEstimate()"><label class="form-check-label small" for="expOptDewpoint">Dew Point</label></div>
+                    <div class="form-check"><input class="form-check-input" type="checkbox" id="expOptMslp"     checked onchange="updateExpEstimate()"><label class="form-check-label small" for="expOptMslp">Pressure</label></div>
+                    <div class="form-check"><input class="form-check-input" type="checkbox" id="expOptPrecip"   checked onchange="updateExpEstimate()"><label class="form-check-label small" for="expOptPrecip">Precipitation</label></div>
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label fw-semibold small mb-2" for="expOptRegion">Region</label>
+                <select class="form-select form-select-sm" id="expOptRegion" onchange="onExpRegionChange()">
+                    <option value="conus">CONUS (Full US)</option>
+                    <option value="northeast">Northeast US</option>
+                    <option value="southeast">Southeast US</option>
+                    <option value="midwest">Midwest US</option>
+                    <option value="south">South US</option>
+                    <option value="plains">Plains</option>
+                    <option value="west">Western US</option>
+                    <option value="custom">Custom bounding box&hellip;</option>
+                </select>
+            </div>
+
+            <div id="expOptCustomBox" class="mb-3 d-none">
+                <div class="row g-2">
+                    <div class="col-6"><label class="form-label small mb-1">Lat min (°N)</label><input type="number" class="form-control form-control-sm" id="expOptLatMin" placeholder="e.g. 30" step="0.5"></div>
+                    <div class="col-6"><label class="form-label small mb-1">Lat max (°N)</label><input type="number" class="form-control form-control-sm" id="expOptLatMax" placeholder="e.g. 50" step="0.5"></div>
+                    <div class="col-6"><label class="form-label small mb-1">Lon min (°E)</label><input type="number" class="form-control form-control-sm" id="expOptLonMin" placeholder="e.g. -100" step="0.5"></div>
+                    <div class="col-6"><label class="form-label small mb-1">Lon max (°E)</label><input type="number" class="form-control form-control-sm" id="expOptLonMax" placeholder="e.g. -70" step="0.5"></div>
+                </div>
+            </div>
+
+            <div id="expOptEstimate" class="small text-muted mb-3"></div>
+
+            <div class="d-flex justify-content-end gap-2">
+                <button class="btn btn-sm btn-secondary" onclick="closeSeExportModal()">Cancel</button>
+                <button class="btn btn-sm btn-primary" id="seExportConfirmBtn" onclick="startSeExport()"><i class="bi bi-download"></i> Export</button>
+            </div>
+        </div>
+    </div>
+
+    </div><!-- end #singleEventPane -->
+
+    </div><!-- end .tab-content -->
+
+</div><!-- end #verificationContent -->
 
 {% endblock %}
 
@@ -422,6 +611,7 @@ let droughtLayer = null;
 
 let asosTempMaeChart, asosTempBiasChart, asosMslpMaeChart, asosMslpBiasChart;
 let timeSeriesChart = null;
+let winnerPctChartObj = null;
 
 // Dedup cache for the all-time mean verification fetch (period=all, no valid_hour)
 let _allTimeVerifData = null;
@@ -697,6 +887,8 @@ let currentAsosTempChart = null;
 let currentAsosPrecipChart = null;
 let currentAsosDewpointChart = null;
 let currentAsosObsTempChart = null;
+let stationPrecipMetric = 'mae'; // 'mae' or 'wmae'
+let _lastStationVerification = null; // {v, period} — for re-rendering on metric toggle
 let currentAsosObsTempBiasChart = null;
 let currentAsosObsPrecipChart = null;
 let currentAsosObsPrecipBiasChart = null;
@@ -759,6 +951,7 @@ async function loadAsosStationCharts(stationId, stationName) {
         }
 
         document.getElementById('asosStationMessage').classList.add('d-none');
+        _lastStationVerification = { v: data.verification, period };
         renderAsosVerificationCharts(data.verification, period);
         loadAsosStationObservations(stationId, period);
 
@@ -805,8 +998,8 @@ async function loadAsosStationObservations(stationId, period) {
 function renderAsosObsCharts(data) {
     const labels = data.times.map(t => {
         const date = new Date(t);
-        const md = date.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' });
-        const hh = date.toLocaleTimeString('en-US', { hour: '2-digit', hour12: false });
+        const md = date.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', timeZone: 'UTC' });
+        const hh = date.toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'UTC' });
         return `${md} ${hh}Z`;
     });
 
@@ -1193,19 +1386,111 @@ function renderAsosObsCharts(data) {
 }
 
 // Render detailed verification charts for a single ASOS station
+function setStationPrecipMetric(metric) {
+    stationPrecipMetric = metric;
+    document.getElementById('precipChartMaeBtn').classList.toggle('active', metric === 'mae');
+    document.getElementById('precipChartWmaeBtn').classList.toggle('active', metric === 'wmae');
+    if (_lastStationVerification) {
+        renderPrecipVerificationChart(_lastStationVerification.v, _lastStationVerification.period);
+    }
+}
+
+function renderPrecipVerificationChart(v, period = 'all') {
+    const periodSuffix = period === 'monthly' ? ' (20-day avg)' : '';
+    const precipIndices = v.lead_times
+        .map((_, i) => i)
+        .filter(i => v.precip_mae && (v.precip_mae[i] !== null || v.precip_bias[i] !== null));
+    const precipLabels = precipIndices.map(i => formatLeadTime(v.lead_times[i]));
+
+    const useWmae = stationPrecipMetric === 'wmae';
+    const metricData = useWmae
+        ? precipIndices.map(i => (v.precip_wmae && v.precip_wmae[i] != null) ? v.precip_wmae[i] : v.precip_mae[i])
+        : precipIndices.map(i => v.precip_mae[i]);
+    const metricLabel = useWmae ? `WMAE (in)${periodSuffix}` : `MAE (in)${periodSuffix}`;
+    const metricColor = useWmae ? '#f97316' : '#0ea5e9';
+    const metricBg = useWmae ? 'rgba(249,115,22,0.1)' : 'rgba(14,165,233,0.1)';
+
+    const precipDatasets = [
+        {
+            label: metricLabel,
+            data: metricData,
+            borderColor: metricColor,
+            backgroundColor: metricBg,
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            yAxisID: 'y'
+        },
+        {
+            label: `Bias (in)${periodSuffix}`,
+            data: precipIndices.map(i => v.precip_bias[i]),
+            borderColor: '#84cc16',
+            backgroundColor: 'rgba(132, 204, 22, 0.1)',
+            fill: false,
+            tension: 0.3,
+            pointRadius: 3,
+            borderWidth: 2,
+            borderDash: [5, 5],
+            yAxisID: 'y1'
+        }
+    ];
+
+    if (currentAsosPrecipChart) currentAsosPrecipChart.destroy();
+    currentAsosPrecipChart = new Chart(document.getElementById('asosPrecipVerificationChart'), {
+        type: 'line',
+        data: { labels: precipLabels, datasets: precipDatasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { position: 'top', labels: { usePointStyle: true, padding: 20 } },
+                tooltip: {
+                    callbacks: {
+                        footer: (items) => {
+                            const i = precipIndices[items[0].dataIndex];
+                            const count = v.precip_count ? v.precip_count[i] : null;
+                            return count != null ? `Samples: ${count}` : '';
+                        }
+                    }
+                },
+                annotation: {
+                    annotations: {
+                        zeroLine: {
+                            type: 'line', yMin: 0, yMax: 0,
+                            borderColor: '#999', borderWidth: 1, borderDash: [5, 5], yAxisID: 'y1'
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: { grid: { display: false }, title: { display: true, text: 'Lead Time' } },
+                y: {
+                    type: 'linear', display: true, position: 'left',
+                    grid: { color: '#e0e0e0' },
+                    title: { display: true, text: useWmae ? 'WMAE (in)' : 'MAE (in)' },
+                    min: 0
+                },
+                y1: {
+                    type: 'linear', display: true, position: 'right',
+                    grid: { drawOnChartArea: false },
+                    title: { display: true, text: 'Bias (in)' }
+                }
+            }
+        }
+    });
+}
+
 function renderAsosVerificationCharts(v, period = 'all') {
     const periodSuffix = period === 'monthly' ? ' (20-day avg)' : '';
     const tempIndices = v.lead_times
         .map((_, i) => i)
         .filter(i => v.temp_mae[i] !== null || v.temp_bias[i] !== null);
-    const precipIndices = v.lead_times
-        .map((_, i) => i)
-        .filter(i => v.precip_mae && (v.precip_mae[i] !== null || v.precip_bias[i] !== null));
     const dewpointIndices = v.lead_times
         .map((_, i) => i)
         .filter(i => v.dewpoint_mae && (v.dewpoint_mae[i] !== null || v.dewpoint_bias[i] !== null));
     const tempLabels = tempIndices.map(i => formatLeadTime(v.lead_times[i]));
-    const precipLabels = precipIndices.map(i => formatLeadTime(v.lead_times[i]));
     const dewpointLabels = dewpointIndices.map(i => formatLeadTime(v.lead_times[i]));
 
     // Temperature MAE and Bias Chart
@@ -1301,98 +1586,8 @@ function renderAsosVerificationCharts(v, period = 'all') {
         }
     });
 
-    // Precipitation MAE and Bias Chart
-    const precipDatasets = [
-        {
-            label: `MAE (in)${periodSuffix}`,
-            data: precipIndices.map(i => v.precip_mae[i]),
-            borderColor: '#0ea5e9',
-            backgroundColor: 'rgba(14, 165, 233, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            yAxisID: 'y'
-        },
-        {
-            label: `Bias (in)${periodSuffix}`,
-            data: precipIndices.map(i => v.precip_bias[i]),
-            borderColor: '#84cc16',
-            backgroundColor: 'rgba(132, 204, 22, 0.1)',
-            fill: false,
-            tension: 0.3,
-            pointRadius: 3,
-            borderWidth: 2,
-            borderDash: [5, 5],
-            yAxisID: 'y1'
-        }
-    ];
-
-    if (currentAsosPrecipChart) currentAsosPrecipChart.destroy();
-    currentAsosPrecipChart = new Chart(document.getElementById('asosPrecipVerificationChart'), {
-        type: 'line',
-        data: { labels: precipLabels, datasets: precipDatasets },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: {
-                mode: 'index',
-                intersect: false
-            },
-            plugins: {
-                legend: {
-                    position: 'top',
-                    labels: {
-                        usePointStyle: true,
-                        padding: 20
-                    }
-                },
-                tooltip: {
-                    callbacks: {
-                        footer: (items) => {
-                            const i = precipIndices[items[0].dataIndex];
-                            const count = v.precip_count ? v.precip_count[i] : null;
-                            return count != null ? `Samples: ${count}` : '';
-                        }
-                    }
-                },
-                annotation: {
-                    annotations: {
-                        zeroLine: {
-                            type: 'line',
-                            yMin: 0,
-                            yMax: 0,
-                            borderColor: '#999',
-                            borderWidth: 1,
-                            borderDash: [5, 5],
-                            yAxisID: 'y1'
-                        }
-                    }
-                }
-            },
-            scales: {
-                x: {
-                    grid: { display: false },
-                    title: { display: true, text: 'Lead Time' }
-                },
-                y: {
-                    type: 'linear',
-                    display: true,
-                    position: 'left',
-                    grid: { color: '#e0e0e0' },
-                    title: { display: true, text: 'MAE (in)' },
-                    min: 0
-                },
-                y1: {
-                    type: 'linear',
-                    display: true,
-                    position: 'right',
-                    grid: { drawOnChartArea: false },
-                    title: { display: true, text: 'Bias (in)' }
-                }
-            }
-        }
-    });
+    // Precipitation MAE/WMAE and Bias Chart (rendered via renderPrecipVerificationChart for toggle support)
+    renderPrecipVerificationChart(v, period);
 
     // Dewpoint MAE and Bias Chart
     const dewpointDatasets = [
@@ -2222,6 +2417,110 @@ function renderTimeSeriesChart(data, metric, allTimeAvgs = null) {
             }
         }
     });
+
+    // --- Winner % subplot ---
+    const winnerPctContainer = document.getElementById('winnerPctContainer');
+    if (winnerPctChartObj) {
+        winnerPctChartObj.destroy();
+        winnerPctChartObj = null;
+    }
+
+    const dwp = (metric === 'mae' || metric === 'wmae') ? data.daily_winner_pcts : null;
+    if (!dwp || !labels.length) {
+        winnerPctContainer.classList.add('d-none');
+    } else {
+        winnerPctContainer.classList.remove('d-none');
+
+        // Model style lookup — solid colors matching SE_MODEL_STYLES to avoid muddy blending
+        const WP_STYLES = {
+            gfs:   { color: '#0d6efd', label: 'GFS' },
+            aifs:  { color: '#0dcaf0', label: 'AIFS' },
+            kenny: { color: '#fd7e14', label: 'Kenny' },
+            ifs:   { color: '#20c997', label: 'IFS' },
+            nws:   { color: '#6c757d', label: 'NWS' },
+        };
+        const wpModels = ['gfs','aifs','kenny','ifs','nws'].filter(m => dwp[m] && dwp[m].some(v => v != null));
+        const nRanks = wpModels.length;
+
+        // Per-date rank-based datasets: Chart.js draws dataset[0] on top (last painted),
+        // so rank 0 = smallest value (drawn on top/in front), rank N-1 = largest (drawn behind).
+        // Each smaller bar covers the bottom of all larger bars, leaving a unique visible slice.
+        const rankData  = Array.from({length: nRanks}, () => []);
+        const rankBg    = Array.from({length: nRanks}, () => []);
+        const rankBorder= Array.from({length: nRanks}, () => []);
+        const rankModel = Array.from({length: nRanks}, () => []);
+
+        for (let i = 0; i < labels.length; i++) {
+            const entries = wpModels
+                .map(m => ({ m, v: dwp[m][i] }))
+                .filter(e => e.v != null)
+                .sort((a, b) => a.v - b.v);  // ascending: smallest → rank 0 (drawn on top)
+            for (let r = 0; r < nRanks; r++) {
+                const e = entries[r];
+                if (e) {
+                    rankData[r].push(e.v);
+                    rankBg[r].push(WP_STYLES[e.m].color);
+                    rankBorder[r].push(WP_STYLES[e.m].color);
+                    rankModel[r].push(e.m);
+                } else {
+                    rankData[r].push(null);
+                    rankBg[r].push('rgba(0,0,0,0)');
+                    rankBorder[r].push('rgba(0,0,0,0)');
+                    rankModel[r].push(null);
+                }
+            }
+        }
+
+        const wpDatasets = rankData.map((data, r) => ({
+            label: `Layer ${r + 1}`,
+            data,
+            backgroundColor: rankBg[r],
+            borderColor: rankBorder[r],
+            borderWidth: 1,
+            grouped: false,
+            barPercentage: 0.95,
+            categoryPercentage: 1.0,
+            _rankModels: rankModel[r],
+        }));
+
+        const wpCtx = document.getElementById('winnerPctChart');
+        winnerPctChartObj = new Chart(wpCtx, {
+            type: 'bar',
+            data: { labels, datasets: wpDatasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                datasets: { bar: { grouped: false } },
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            title: ctx => ctx[0].label,
+                            label: ctx => {
+                                const m = ctx.dataset._rankModels?.[ctx.dataIndex];
+                                const label = m ? (WP_STYLES[m]?.label || m.toUpperCase()) : ctx.dataset.label;
+                                return ctx.parsed.y != null ? `${label}: ${ctx.parsed.y.toFixed(1)}% of stations` : null;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        grid: { display: false },
+                        ticks: { maxRotation: 45, minRotation: 45, font: { size: 10 } }
+                    },
+                    y: {
+                        min: 0,
+                        max: 60,
+                        grid: { color: '#e0e0e0' },
+                        title: { display: true, text: '% stations won' },
+                        ticks: { callback: v => v + '%' }
+                    }
+                }
+            }
+        });
+    }
 }
 
 // Event listeners for ASOS controls
@@ -2305,6 +2604,984 @@ document.addEventListener('DOMContentLoaded', function() {
     loadMeanAsosVerification(period);
     loadTimeSeriesChart();
 });
+
+
+// ============================================================================
+// Single Event Error Tab
+// ============================================================================
+
+let seMap = null;
+let seMarkers = [];
+let seAvailableDates = [];     // sorted list of date strings
+let seLoadedSteps = [];        // [{date, hour}] for every synoptic time in the loaded range
+let seCurrentStepIdx = 0;     // index into seLoadedSteps
+let seCurrentStationId = null;
+let seCurrentStationName = null;
+let seCurrentVar = 'temp';
+let seFcstEvolutionChart = null;
+
+// JS-side cache: (date + leadTime + model) → full API response
+// Changing variable/metric only re-colors markers from this cache — no fetch needed.
+const seMapCache = {};
+let seLastFetchKey = null;   // key of the last fetched (or cached) data
+let seCurrentStations = [];  // stations array from the last fetch for re-coloring
+let seDebounceTimer = null;
+
+function initSingleEventMap() {
+    if (seMap) return;
+    seMap = L.map('seMap', {
+        center: [39.5, -98.5],
+        zoom: 4,
+        minZoom: 3,
+        maxZoom: 10
+    });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 19
+    }).addTo(seMap);
+}
+
+function clearSeMarkers() {
+    for (const m of seMarkers) seMap.removeLayer(m);
+    seMarkers = [];
+}
+
+function updateSeColorScale() {
+    const variable = document.getElementById('seVariable').value;
+    const metric   = document.getElementById('seMetric').value;
+    const scale = document.getElementById('seColorScale');
+    const minSpan = document.getElementById('seColorMin');
+    const maxSpan = document.getElementById('seColorMax');
+    const unitSpan = document.getElementById('seColorUnits');
+    const units = { temp: '°F', mslp: 'mb', precip: 'in', precip_24hr: 'in', dewpoint: '°F' };
+    unitSpan.textContent = units[variable] || '';
+    if (metric === 'bias') {
+        const fixedMax = (variable === 'precip' || variable === 'precip_24hr') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+        minSpan.textContent = (-fixedMax).toFixed(1);
+        maxSpan.textContent = fixedMax.toFixed(1);
+        if (variable === 'precip' || variable === 'precip_24hr' || variable === 'dewpoint') {
+            scale.style.background = 'linear-gradient(to right, #8b4513, #ffffff 50%, #22c55e)';
+        } else {
+            scale.style.background = 'linear-gradient(to right, #3b82f6, #ffffff 50%, #ef4444)';
+        }
+    } else {
+        const fixedMax = (variable === 'precip' || variable === 'precip_24hr') ? 0.3 : (variable === 'temp' || variable === 'dewpoint') ? 20 : 10;
+        minSpan.textContent = '0.0';
+        maxSpan.textContent = fixedMax.toFixed(1);
+        scale.style.background = 'linear-gradient(to right, #22c55e, #eab308 50%, #ef4444)';
+    }
+}
+
+async function loadSingleEventAvailableDates() {
+    try {
+        const res = await fetch('/api/asos/single-event-available-dates');
+        const data = await res.json();
+        if (!data.success || !data.dates.length) return;
+        seAvailableDates = data.dates;
+        const last = seAvailableDates[seAvailableDates.length - 1];
+        const first = seAvailableDates[0];
+        const startEl = document.getElementById('seStartDate');
+        const endEl   = document.getElementById('seEndDate');
+        startEl.min = first;
+        startEl.max = last;
+        endEl.min = first;
+        endEl.max = last;
+        if (!startEl.value) startEl.value = first;
+        if (!endEl.value)   endEl.value   = last;
+    } catch(e) {
+        console.error('Failed to load single-event available dates', e);
+    }
+}
+
+
+function _stepsInRange(start, end) {
+    const steps = [];
+    let cur = new Date(start + 'T00:00:00Z');
+    const endD = new Date(end + 'T00:00:00Z');
+    while (cur <= endD) {
+        const date = cur.toISOString().slice(0, 10);
+        for (const h of [0, 6, 12, 18]) steps.push({ date, hour: h });
+        cur = new Date(cur.getTime() + 86400000);
+    }
+    return steps;
+}
+
+function loadSingleEventMap() {
+    const startDate = document.getElementById('seStartDate').value;
+    const endDate   = document.getElementById('seEndDate').value;
+    if (!startDate || !endDate) return;
+
+    const newSteps = _stepsInRange(startDate, endDate);
+    if (!newSteps.length) return;
+
+    // Stay at the same position if possible, else go to last step
+    const prev = seLoadedSteps[seCurrentStepIdx];
+    seLoadedSteps = newSteps;
+    if (prev) {
+        const idx = newSteps.findIndex(s => s.date === prev.date && s.hour === prev.hour);
+        seCurrentStepIdx = idx >= 0 ? idx : newSteps.length - 1;
+    } else {
+        seCurrentStepIdx = newSteps.length - 1;
+    }
+
+    renderSingleEventDateMap();
+}
+
+// Debounced version for dropdown onchange handlers that only affect coloring
+function loadSingleEventMapDebounced() {
+    clearTimeout(seDebounceTimer);
+    seDebounceTimer = setTimeout(renderSingleEventDateMap, 80);
+}
+
+async function renderSingleEventDateMap() {
+    if (!seLoadedSteps.length) return;
+
+    const { date, hour } = seLoadedSteps[seCurrentStepIdx];
+    const model    = document.getElementById('seModel').value;
+    const variable = document.getElementById('seVariable').value;
+    const metric   = document.getElementById('seMetric').value;
+    const leadTime = document.getElementById('seLeadTime').value;
+
+    // Update nav label
+    document.getElementById('seDateNav').classList.remove('d-none');
+    document.getElementById('seDateNavLabel').textContent =
+        `${date} ${String(hour).padStart(2,'0')}Z  (${seCurrentStepIdx + 1} of ${seLoadedSteps.length})`;
+
+    const fetchKey = `${date}_${hour}_${leadTime}_${model}`;
+
+    // If we already have this data, just re-color without a fetch
+    if (seMapCache[fetchKey]) {
+        _renderSeMarkers(seMapCache[fetchKey], variable, metric);
+        return;
+    }
+
+    // Need a fresh fetch
+    document.getElementById('seMapLoading').classList.remove('d-none');
+    document.getElementById('seMapEmpty').classList.add('d-none');
+    clearSeMarkers();
+
+    try {
+        const params = new URLSearchParams({ date, valid_hour: hour, lead_time: leadTime, model });
+        const res  = await fetch('/api/asos/single-event-map?' + params);
+        const data = await res.json();
+
+        document.getElementById('seMapLoading').classList.add('d-none');
+
+        if (!data.success || !data.stations.length) {
+            document.getElementById('seMapEmpty').classList.remove('d-none');
+            document.getElementById('seStationCount').textContent = '0 stations';
+            updateSeColorScale();
+            return;
+        }
+
+        seMapCache[fetchKey] = data;
+        _renderSeMarkers(data, variable, metric);
+
+    } catch(e) {
+        console.error('Single event map error', e);
+        document.getElementById('seMapLoading').classList.add('d-none');
+        document.getElementById('seMapEmpty').classList.remove('d-none');
+    }
+}
+
+function _renderSeMarkers(data, variable, metric) {
+    clearSeMarkers();
+
+    const units = { temp: '°F', mslp: 'mb', precip: 'in', precip_24hr: 'in', dewpoint: '°F' };
+    const unit = units[variable] || '';
+    const metricLabel = metric === 'bias' ? 'Bias' : 'MAE';
+
+    // Compute value range for color scale
+    const values = [];
+    for (const st of data.stations) {
+        const v = st.variables?.[variable]?.[metric];
+        if (v != null) values.push(v);
+    }
+
+    if (!values.length) {
+        document.getElementById('seMapEmpty').classList.remove('d-none');
+        document.getElementById('seStationCount').textContent = '0 stations';
+        updateSeColorScale();
+        return;
+    }
+
+    let minVal, maxVal;
+    if (metric === 'bias') {
+        const maxAbs = Math.max(Math.abs(Math.min(...values)), Math.abs(Math.max(...values)), 0.1);
+        minVal = -maxAbs; maxVal = maxAbs;
+    } else {
+        minVal = 0; maxVal = Math.max(...values);
+    }
+
+    document.getElementById('seStationCount').textContent = values.length + ' stations';
+    updateSeColorScale();
+
+    for (const st of data.stations) {
+        if (st.lat == null || st.lon == null) continue;
+        const varStats = st.variables?.[variable];
+        if (!varStats) continue;
+        const value = varStats[metric];
+        if (value == null) continue;
+
+        const color = getMarkerColor(value, metric, minVal, maxVal, variable);
+        const marker = L.circleMarker([st.lat, st.lon], {
+            radius: 5,
+            fillColor: color,
+            color: '#333',
+            weight: 0.5,
+            opacity: 0.8,
+            fillOpacity: 0.85,
+        });
+        marker.bindTooltip(
+            `<strong>${st.name} (${st.station_id})</strong><br>` +
+            `${metricLabel}: ${value.toFixed(2)} ${unit}<br>` +
+            `n=${varStats.count}`,
+            { sticky: true }
+        );
+        marker.on('click', () => loadSingleEventStationDetail(st.station_id, st.name));
+        marker.addTo(seMap);
+        seMarkers.push(marker);
+    }
+}
+
+function navigateSingleEvent(dir) {
+    if (!seLoadedSteps.length) return;
+    seCurrentStepIdx = Math.max(0, Math.min(seLoadedSteps.length - 1, seCurrentStepIdx + dir));
+    renderSingleEventDateMap();
+    if (seCurrentStationId) refreshSingleEventStation();
+}
+
+function loadSingleEventStationDetail(stationId, stationName) {
+    const startDate = document.getElementById('seStartDate').value;
+    const endDate   = document.getElementById('seEndDate').value;
+
+    seCurrentStationId   = stationId;
+    seCurrentStationName = stationName;
+
+    document.getElementById('seStationName').textContent = stationName + ' (' + stationId + ')';
+    document.getElementById('seStationDetail').classList.remove('d-none');
+
+    loadSingleEventForecastEvolution(stationId, seCurrentVar);
+}
+
+function refreshSingleEventStation() {
+    if (seCurrentStationId) {
+        loadSingleEventStationDetail(seCurrentStationId, seCurrentStationName || '');
+    }
+}
+
+function setSingleEventVar(varName) {
+    seCurrentVar = varName;
+    document.querySelectorAll('[data-se-var]').forEach(btn => {
+        const active = btn.dataset.seVar === varName;
+        btn.classList.toggle('active', active);
+    });
+    if (seCurrentStationId) loadSingleEventForecastEvolution(seCurrentStationId, varName);
+}
+
+
+const SE_MODEL_STYLES = {
+    gfs:   { label: 'GFS',   color: '#0d6efd' },
+    aifs:  { label: 'AIFS',  color: '#0dcaf0' },
+    kenny: { label: 'Kenny', color: '#fd7e14' },
+    ifs:   { label: 'IFS',   color: '#20c997' },
+    nws:   { label: 'NWS',   color: '#6c757d' },
+};
+const SE_MODEL_ORDER = ['gfs', 'aifs', 'kenny', 'ifs', 'nws'];
+
+// ============================================================================
+// Single Event Error — Export Modal
+// ============================================================================
+
+const SE_EXPORT_REGIONS = {
+    conus:     { latMin: 24,  latMax: 50,  lonMin: -126, lonMax: -65  },
+    northeast: { latMin: 37,  latMax: 48,  lonMin: -83,  lonMax: -66  },
+    southeast: { latMin: 24,  latMax: 37,  lonMin: -95,  lonMax: -75  },
+    midwest:   { latMin: 36,  latMax: 50,  lonMin: -105, lonMax: -80  },
+    south:     { latMin: 24,  latMax: 37,  lonMin: -106, lonMax: -88  },
+    plains:    { latMin: 29,  latMax: 50,  lonMin: -106, lonMax: -90  },
+    west:      { latMin: 31,  latMax: 50,  lonMin: -126, lonMax: -103 },
+};
+
+function openSeExportModal() {
+    if (!document.getElementById('seStartDate').value || !document.getElementById('seEndDate').value) {
+        alert('Select a date range first.'); return;
+    }
+    updateExpEstimate();
+    document.getElementById('seExportModal').style.display = 'flex';
+}
+
+function closeSeExportModal() {
+    document.getElementById('seExportModal').style.display = 'none';
+}
+
+function onExpRegionChange() {
+    const val = document.getElementById('expOptRegion').value;
+    document.getElementById('expOptCustomBox').classList.toggle('d-none', val !== 'custom');
+    updateExpEstimate();
+}
+
+function updateExpEstimate() {
+    const startDate = document.getElementById('seStartDate').value;
+    const endDate   = document.getElementById('seEndDate').value;
+    if (!startDate || !endDate) return;
+    const steps    = _stepsInRange(startDate, endDate).length;
+    const vars     = ['expOptTemp','expOptDewpoint','expOptMslp','expOptPrecip'].filter(id => document.getElementById(id)?.checked).length;
+    const regionKey = document.getElementById('expOptRegion').value;
+    const regionStations = { conus:2400, northeast:300, southeast:350, midwest:500, south:350, plains:400, west:450, custom:1200 };
+    const approxStations = regionStations[regionKey] || 1200;
+    const totalRequests  = steps * 5 * 10;  // steps × models × lead times
+    const approxMB = ((approxStations * vars * 4 * 6 * totalRequests) / 1e6).toFixed(0);
+    document.getElementById('expOptEstimate').textContent =
+        `~${totalRequests} API requests · ~${approxStations} stations · ~${approxMB} MB estimated file size`;
+}
+
+async function startSeExport() {
+    const selectedVars = [];
+    if (document.getElementById('expOptTemp').checked)     selectedVars.push('temp');
+    if (document.getElementById('expOptDewpoint').checked) selectedVars.push('dewpoint');
+    if (document.getElementById('expOptMslp').checked)     selectedVars.push('mslp');
+    if (document.getElementById('expOptPrecip').checked)   selectedVars.push('precip');
+    if (!selectedVars.length) { alert('Select at least one variable.'); return; }
+
+    const regionKey = document.getElementById('expOptRegion').value;
+    let region;
+    if (regionKey === 'custom') {
+        region = {
+            latMin: parseFloat(document.getElementById('expOptLatMin').value) || -90,
+            latMax: parseFloat(document.getElementById('expOptLatMax').value) ||  90,
+            lonMin: parseFloat(document.getElementById('expOptLonMin').value) || -180,
+            lonMax: parseFloat(document.getElementById('expOptLonMax').value) ||  180,
+        };
+    } else {
+        region = SE_EXPORT_REGIONS[regionKey] || null;
+    }
+
+    closeSeExportModal();
+    await exportSingleEventHTML({ selectedVars, region });
+}
+
+// ============================================================================
+// Single Event Error — HTML Export
+// ============================================================================
+
+async function exportSingleEventHTML({ selectedVars = ['temp','dewpoint','mslp','precip'], region = null } = {}) {
+    const startDate = document.getElementById('seStartDate').value;
+    const endDate   = document.getElementById('seEndDate').value;
+    const leadTime  = document.getElementById('seLeadTime').value;
+
+    if (!startDate || !endDate) { alert('Select a date range first.'); return; }
+
+    const allSteps = _stepsInRange(startDate, endDate);
+    if (!allSteps.length) { alert('No steps in range.'); return; }
+
+    const btn = document.getElementById('seExportHtmlBtn');
+    const origInner = btn.innerHTML;
+    btn.disabled = true;
+
+    const MODELS     = ['gfs', 'aifs', 'kenny', 'ifs', 'nws'];
+    const LEAD_TIMES = Array.from({length: 60}, (_, i) => (i + 1) * 6); // 6, 12, 18, ..., 360
+    const MODEL_MAX_LT = { gfs: 360, aifs: 360, kenny: 360, ifs: 240, nws: 168 };
+    const allData = {};
+
+    // Seed from existing JS-side cache (bias data; obs will be fetched below)
+    for (const [k, v] of Object.entries(seMapCache)) allData[k] = v;
+
+    // Build flat task list, skipping lead times beyond each model's max forecast range
+    const tasks = [];
+    for (const step of allSteps)
+        for (const mdl of MODELS)
+            for (const lt of LEAD_TIMES)
+                if (lt <= (MODEL_MAX_LT[mdl] ?? 360)) tasks.push({ step, mdl, lt });
+
+    let done = 0;
+    const total = tasks.length;
+    let taskIdx = 0;
+
+    // Worker-pool: CONCURRENCY workers pull from shared task queue
+    const CONCURRENCY = 8;
+    async function worker() {
+        while (taskIdx < tasks.length) {
+            const { step, mdl, lt } = tasks[taskIdx++];
+            const key = `${step.date}_${step.hour}_${lt}_${mdl}`;
+            const hasObs = allData[key]?.stations?.some(
+                s => Object.values(s.variables || {}).some(v => v.obs != null)
+            );
+            if (!allData[key] || !hasObs) {
+                try {
+                    const params = new URLSearchParams({ date: step.date, valid_hour: step.hour, lead_time: lt, model: mdl, include_obs: 'true' });
+                    const res  = await fetch('/api/asos/single-event-map?' + params);
+                    const data = await res.json();
+                    if (data.success) allData[key] = data;
+                } catch(e) { /* skip */ }
+            }
+            done++;
+            btn.innerHTML = `<i class="bi bi-hourglass-split"></i> ${done}/${total}`;
+        }
+    }
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+    btn.innerHTML = origInner;
+    btn.disabled = false;
+
+    // Filter to selected variables and region
+    const filteredData = _filterExportData(allData, selectedVars, region);
+    const html = _generateSingleEventExportHTML(filteredData, allSteps, startDate, endDate, leadTime, selectedVars);
+    const blob = new Blob([html], { type: 'text/html' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `single-event-error-${startDate}-to-${endDate}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+function _filterExportData(allData, selectedVars, region) {
+    const filtered = {};
+    for (const [key, data] of Object.entries(allData)) {
+        if (!data || !data.stations) { filtered[key] = data; continue; }
+        let stations = data.stations;
+        if (region) {
+            stations = stations.filter(st =>
+                st.lat != null && st.lon != null &&
+                st.lat >= region.latMin && st.lat <= region.latMax &&
+                st.lon >= region.lonMin && st.lon <= region.lonMax
+            );
+        }
+        stations = stations.map(st => {
+            const vars = {};
+            for (const v of selectedVars) { if (st.variables?.[v] != null) vars[v] = st.variables[v]; }
+            return Object.keys(vars).length ? { ...st, variables: vars } : null;
+        }).filter(Boolean);
+        if (stations.length) filtered[key] = { ...data, stations };
+    }
+    return filtered;
+}
+
+function _generateSingleEventExportHTML(allData, allSteps, startDate, endDate, leadTime, selectedVars = ['temp','dewpoint','mslp','precip']) {
+    const ltLabel  = {6:'6h',12:'12h',24:'24h',48:'48h',72:'72h',120:'5d',168:'7d',240:'10d',288:'12d',360:'15d'}[leadTime] || leadTime + 'h';
+    const dataJson = JSON.stringify(allData);
+    const stepsJson = JSON.stringify(allSteps);
+
+    // Build lead time selector options (canonical set for map display)
+    const LT_OPTIONS = [6,12,24,48,72,120,168,240,288,360];
+    const LT_LABELS  = {6:'6h',12:'12h',24:'24h',48:'48h',72:'72h',120:'5d',168:'7d',240:'10d',288:'12d',360:'15d'};
+    const ltOpts = LT_OPTIONS.map(v =>
+        `<option value="${v}"${v == leadTime ? ' selected' : ''}>${LT_LABELS[v]}</option>`
+    ).join('');
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Single Event Error: ${startDate} \u2013 ${endDate}</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#212529;font-size:.875rem;}
+.page{max-width:1400px;margin:0 auto;padding:16px;}
+.card{background:#fff;border:1px solid #dee2e6;border-radius:6px;margin-bottom:16px;overflow:hidden;}
+.card-header{background:#f8f9fa;border-bottom:1px solid #dee2e6;padding:10px 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;}
+.card-title{font-weight:600;font-size:.9rem;}
+.controls{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+select,input{font-size:.8rem;padding:3px 8px;border:1px solid #ced4da;border-radius:4px;background:#fff;height:30px;}
+.btn{font-size:.8rem;padding:4px 10px;border-radius:4px;border:1px solid transparent;cursor:pointer;height:30px;line-height:1;background:transparent;}
+.btn-nav{border-color:#6c757d;color:#6c757d;}
+.btn-nav:hover{background:#6c757d;color:#fff;}
+#expDateNav{padding:8px 16px;border-bottom:1px solid #dee2e6;background:#f8f9fa;display:flex;align-items:center;gap:12px;}
+#expMap{height:450px;width:100%;}
+.color-bar{display:flex;align-items:center;justify-content:center;gap:12px;padding:8px 16px;border-top:1px solid #dee2e6;background:#f8f9fa;font-size:.78rem;color:#666;}
+#expColorScale{width:180px;height:12px;border-radius:4px;}
+.station-detail{border-top:1px solid #dee2e6;padding:16px;}
+.station-detail h5{font-size:1rem;font-weight:600;margin-bottom:12px;}
+.detail-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;}
+.nav-pills{display:flex;gap:4px;margin-bottom:12px;}
+.nav-pills button{font-size:.75rem;padding:3px 10px;border-radius:16px;border:1px solid #dee2e6;background:transparent;cursor:pointer;}
+.nav-pills button.active{background:#0d6efd;color:#fff;border-color:#0d6efd;}
+.chart-card{border:1px solid #dee2e6;border-radius:4px;margin-bottom:12px;}
+.chart-card-header{font-size:.8rem;padding:6px 12px;background:#f8f9fa;border-bottom:1px solid #dee2e6;}
+.chart-card-body{padding:12px;}
+.badge{font-size:.72rem;padding:3px 7px;border-radius:4px;background:#6c757d;color:#fff;}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #dee2e6;border-top-color:#0d6efd;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;}
+@keyframes spin{to{transform:rotate(360deg)}}
+.matrix-wrap{overflow-x:auto;max-height:480px;overflow-y:auto;}
+table.mx{border-collapse:collapse;font-size:.72rem;width:100%;}
+table.mx th,table.mx td{border:1px solid #dee2e6;padding:4px 8px;}
+table.mx thead th{background:#f8f9fa;white-space:nowrap;position:sticky;top:0;}
+.meta-bar{font-size:.82rem;color:#555;padding:10px 16px;background:#e8f0fe;border-bottom:1px solid #c5d5f5;}
+.meta-bar strong{color:#1a1a1a;}
+#expMapEmpty{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#aaa;pointer-events:none;font-size:.9rem;}
+#expMapWrap{position:relative;}
+.matrix-radio-group{display:flex;gap:10px;align-items:center;}
+.matrix-radio-group label{font-size:.75rem;display:flex;align-items:center;gap:4px;cursor:pointer;}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="meta-bar">
+    <strong>Single Event Error Export</strong> &nbsp;\u2014&nbsp;
+    Date range: <strong>${startDate}</strong> to <strong>${endDate}</strong> &nbsp;\u2014&nbsp;
+    Lead time: <strong>${ltLabel}</strong> &nbsp;\u2014&nbsp;
+    Exported: ${new Date().toLocaleString()}
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <div class="card-header">
+      <span class="card-title"><i class="bi bi-calendar-event"></i> Single Event Error Map</span>
+      <div class="controls">
+        <select id="expModel" onchange="renderExpMap()">
+          <option value="gfs">GFS</option>
+          <option value="aifs">AIFS</option>
+          <option value="kenny">Kenny</option>
+          <option value="ifs">IFS</option>
+          <option value="nws">NWS</option>
+        </select>
+        <select id="expVariable" onchange="renderExpMap()">
+          ${(()=>{const opts={temp:'Temperature',dewpoint:'Dew Point',mslp:'Pressure',precip:'Precipitation (6hr)'};return selectedVars.map((v,i)=>`<option value="${v}"${i===0?' selected':''}>${opts[v]||v}</option>`).join('');})()}
+        </select>
+        <select id="expMetric" onchange="renderExpMap()">
+          <option value="mae">MAE</option>
+          <option value="bias">Bias</option>
+        </select>
+        <select id="expLeadTime" onchange="onExpLeadTimeChange()">
+          ${ltOpts}
+        </select>
+      </div>
+    </div>
+
+    <div id="expDateNav">
+      <button class="btn btn-nav" onclick="navigateExp(-1)"><i class="bi bi-chevron-left"></i></button>
+      <span id="expDateNavLabel" style="font-weight:600;min-width:220px;"></span>
+      <button class="btn btn-nav" onclick="navigateExp(1)"><i class="bi bi-chevron-right"></i></button>
+      <span id="expStationCount" class="badge">-- stations</span>
+    </div>
+
+    <div id="expMapWrap">
+      <div id="expMap"></div>
+      <div id="expMapEmpty"><i class="bi bi-calendar-event" style="font-size:2.5rem;display:block;margin-bottom:8px;"></i>No data for this step.</div>
+    </div>
+
+    <div class="color-bar">
+      <span id="expColorMin">0</span>
+      <div id="expColorScale"></div>
+      <span id="expColorMax">10</span>
+      <span id="expColorUnits" style="margin-left:4px;"></span>
+    </div>
+
+    <div id="expStationDetail" class="station-detail" style="display:none;">
+      <div class="detail-header">
+        <h5><i class="bi bi-pin-map"></i> <span id="expStationName">Station</span></h5>
+      </div>
+
+      <div class="nav-pills" id="expVarTabs">
+        ${(()=>{const labels={temp:'Temp',dewpoint:'Dew Point',precip:'Precip',mslp:'Pressure'};return selectedVars.map((v,i)=>`<button class="${i===0?'active':''}" data-exp-var="${v}" onclick="setExpVar('${v}')">${labels[v]||v}</button>`).join('');})()}
+      </div>
+
+
+      <div class="chart-card">
+        <div class="chart-card-header" id="expFcstEvolutionLabel">Forecast Evolution</div>
+        <div class="chart-card-body">
+          <div style="position:relative;height:260px;"><canvas id="expFcstEvolutionChart"></canvas></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"><\/script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"><\/script>
+<script>
+const ALL_STEPS = ${stepsJson};
+const MAP_DATA  = ${dataJson};
+
+let currentLeadTime = ${leadTime};
+let expMap = null, expMarkers = [], expCurrentStepIdx = ALL_STEPS.length - 1;
+let expCurrentStationId = null, expCurrentStationName = null, expCurrentVar = ${JSON.stringify(selectedVars[0] || 'temp')};
+let expEvolutionChart = null;
+let expEvoData = null;
+
+const EXP_MODEL_STYLES = { gfs:{label:'GFS',color:'#0d6efd'}, aifs:{label:'AIFS',color:'#0dcaf0'}, kenny:{label:'Kenny',color:'#fd7e14'}, ifs:{label:'IFS',color:'#20c997'}, nws:{label:'NWS',color:'#6c757d'} };
+const EXP_MODEL_ORDER  = ['gfs','aifs','kenny','ifs','nws'];
+
+// ── Color helpers ─────────────────────────────────────────────────────────────
+function getMaeColor(v, variable) {
+    const mx = (variable==='precip_24hr')?1.0:(variable==='precip')?0.3:(variable==='temp'||variable==='dewpoint')?20:10;
+    const r  = Math.max(0, Math.min(1, v/mx));
+    if (r < 0.5) { const t=r*2; return \`rgb(\${~~(34+t*(234-34))},\${~~(197+t*(179-197))},\${~~(94+t*(8-94))})\`; }
+    const t=(r-0.5)*2; return \`rgb(\${~~(234+t*(239-234))},\${~~(179+t*(68-179))},\${~~(8+t*(68-8))})\`;
+}
+function getBiasColor(v, variable) {
+    const mx = (variable==='precip_24hr')?1.0:(variable==='precip')?0.3:(variable==='temp'||variable==='dewpoint')?20:10;
+    const r  = Math.max(-1, Math.min(1, v/mx));
+    if (variable==='precip'||variable==='precip_24hr'||variable==='dewpoint') {
+        const g=(r+1)/2;
+        if (g<0.5){const t=g*2; return \`rgb(\${~~(139+t*116)},\${~~(69+t*186)},\${~~(19+t*236)})\`;}
+        const t=(g-.5)*2; return \`rgb(\${~~(255-t*221)},\${~~(255-t*116)},\${~~(255-t*221)})\`;
+    }
+    if (r<0){const t=1+r; return \`rgb(\${~~(59+t*196)},\${~~(130+t*125)},\${~~(246+t*9)})\`;}
+    return \`rgb(\${~~(255+r*(239-255))},\${~~(255+r*(68-255))},\${~~(255+r*(68-255))})\`;
+}
+function markerColor(v, metric, variable) { return metric==='bias' ? getBiasColor(v,variable) : getMaeColor(v,variable); }
+
+// ── Map ───────────────────────────────────────────────────────────────────────
+function initExpMap() {
+    expMap = L.map('expMap', { center:[39.5,-98.5], zoom:4, minZoom:3, maxZoom:10 });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap contributors', maxZoom:19 }).addTo(expMap);
+}
+
+function clearExpMarkers() { expMarkers.forEach(m => expMap.removeLayer(m)); expMarkers = []; }
+
+function updateExpColorScale() {
+    const variable = document.getElementById('expVariable').value;
+    const metric   = document.getElementById('expMetric').value;
+    const units = {temp:'°F',mslp:'mb',precip:'in',precip_24hr:'in',dewpoint:'°F'};
+    document.getElementById('expColorUnits').textContent = units[variable]||'';
+    const mx = (variable==='precip'||variable==='precip_24hr')?0.3:(variable==='temp'||variable==='dewpoint')?20:10;
+    if (metric==='bias') {
+        document.getElementById('expColorMin').textContent = (-mx).toFixed(1);
+        document.getElementById('expColorMax').textContent = mx.toFixed(1);
+        document.getElementById('expColorScale').style.background =
+            (variable==='precip'||variable==='precip_24hr'||variable==='dewpoint')
+            ? 'linear-gradient(to right,#8b4513,#fff 50%,#22c55e)'
+            : 'linear-gradient(to right,#3b82f6,#fff 50%,#ef4444)';
+    } else {
+        document.getElementById('expColorMin').textContent = '0.0';
+        document.getElementById('expColorMax').textContent = mx.toFixed(1);
+        document.getElementById('expColorScale').style.background = 'linear-gradient(to right,#22c55e,#eab308 50%,#ef4444)';
+    }
+}
+
+function navigateExp(dir) {
+    expCurrentStepIdx = Math.max(0, Math.min(ALL_STEPS.length-1, expCurrentStepIdx+dir));
+    renderExpMap();
+    if (expCurrentStationId) refreshExpStation();
+}
+
+function renderExpMap() {
+    const {date, hour} = ALL_STEPS[expCurrentStepIdx];
+    const model    = document.getElementById('expModel').value;
+    const variable = document.getElementById('expVariable').value;
+    const metric   = document.getElementById('expMetric').value;
+    const key      = \`\${date}_\${hour}_\${currentLeadTime}_\${model}\`;
+
+    document.getElementById('expDateNavLabel').textContent =
+        \`\${date} \${String(hour).padStart(2,'0')}Z  (\${expCurrentStepIdx+1} of \${ALL_STEPS.length})\`;
+
+    clearExpMarkers();
+    const data = MAP_DATA[key];
+    if (!data || !data.stations || !data.stations.length) {
+        document.getElementById('expMapEmpty').style.display = 'block';
+        document.getElementById('expStationCount').textContent = '0 stations';
+        updateExpColorScale(); return;
+    }
+    document.getElementById('expMapEmpty').style.display = 'none';
+
+    const stations = data.stations;
+    const values   = stations.map(st => st.variables?.[variable]?.[metric]).filter(v => v != null);
+    if (!values.length) { updateExpColorScale(); return; }
+
+    let minVal, maxVal;
+    if (metric==='bias') { const ma=Math.max(Math.abs(Math.min(...values)),Math.abs(Math.max(...values)),.1); minVal=-ma; maxVal=ma; }
+    else { minVal=0; maxVal=Math.max(...values); }
+
+    document.getElementById('expStationCount').textContent = values.length + ' stations';
+    updateExpColorScale();
+
+    const units = {temp:'°F',mslp:'mb',precip:'in',precip_24hr:'in',dewpoint:'°F'};
+    const unit  = units[variable]||'';
+    const mLabel = metric==='bias' ? 'Bias' : 'MAE';
+
+    for (const st of stations) {
+        if (st.lat==null||st.lon==null) continue;
+        const vs = st.variables?.[variable]; if (!vs) continue;
+        const v  = vs[metric]; if (v==null) continue;
+        const m  = L.circleMarker([st.lat,st.lon],{radius:5,fillColor:markerColor(v,metric,variable),color:'#333',weight:.5,opacity:.8,fillOpacity:.85});
+        m.bindTooltip(\`<strong>\${st.name} (\${st.station_id})</strong><br>\${mLabel}: \${v.toFixed(2)} \${unit}<br>n=\${vs.count}\`,{sticky:true});
+        m.on('click', () => loadExpStationDetail(st.station_id, st.name));
+        m.addTo(expMap); expMarkers.push(m);
+    }
+}
+
+// ── Station index (pre-built for O(1) lookup) ─────────────────────────────────
+const MAP_INDEX = {};
+for (const [key, data] of Object.entries(MAP_DATA)) {
+    if (data.stations) {
+        MAP_INDEX[key] = {};
+        for (const st of data.stations) MAP_INDEX[key][st.station_id] = st;
+    }
+}
+
+// ── Lead time change ──────────────────────────────────────────────────────────
+function onExpLeadTimeChange() {
+    currentLeadTime = parseInt(document.getElementById('expLeadTime').value);
+    renderExpMap();
+    if (expCurrentStationId) refreshExpStation();
+}
+
+// ── Station detail ────────────────────────────────────────────────────────────
+function loadExpStationDetail(stationId, stationName) {
+    expCurrentStationId = stationId; expCurrentStationName = stationName;
+    document.getElementById('expStationName').textContent = stationName + ' (' + stationId + ')';
+    document.getElementById('expStationDetail').style.display = 'block';
+    if (expEvolutionChart){ expEvolutionChart.destroy(); expEvolutionChart = null; }
+    // Build evolution chart from embedded MAP_DATA
+    const { date, hour } = ALL_STEPS[expCurrentStepIdx];
+    expEvoData = buildExpEvoData(stationId, date, hour);
+    renderExpEvolutionChart(expEvoData, expCurrentVar);
+}
+
+function refreshExpStation() { if (expCurrentStationId) loadExpStationDetail(expCurrentStationId, expCurrentStationName||''); }
+
+function setExpVar(varName) {
+    expCurrentVar = varName;
+    document.querySelectorAll('[data-exp-var]').forEach(b => b.classList.toggle('active', b.dataset.expVar===varName));
+    if (expEvoData) renderExpEvolutionChart(expEvoData, varName);
+}
+
+// ── Matrix (not available in offline export) ───────────────────────────────────
+// The all-lead-times matrix requires the live server. It is omitted from exports.
+
+// ── Forecast Evolution ────────────────────────────────────────────────────────
+// Build evolution data from embedded MAP_DATA (fixed valid-time, vary lead time)
+function buildExpEvoData(stationId, date, hour) {
+    const validTimeMs = Date.UTC(
+        parseInt(date.slice(0,4)), parseInt(date.slice(5,7))-1, parseInt(date.slice(8,10)), hour, 0, 0
+    );
+    // Dynamically find all lead times with data in MAP_INDEX for this valid date/hour
+    const prefix = \`\${date}_\${hour}_\`;
+    const ltSet = new Set();
+    for (const key of Object.keys(MAP_INDEX)) {
+        if (key.startsWith(prefix)) {
+            const lt = parseInt(key.split('_')[2]);
+            if (!isNaN(lt)) ltSet.add(lt);
+        }
+    }
+    const sortedLts = [...ltSet].sort((a, b) => b - a); // descending = oldest init first
+    const entries = [];
+    for (const lt of sortedLts) {
+        const initDate  = new Date(validTimeMs - lt * 3600000);
+        const initLabel = initDate.toLocaleDateString('en-US',{month:'numeric',day:'numeric',timeZone:'UTC'})
+                        + ' ' + String(initDate.getUTCHours()).padStart(2,'0') + 'Z';
+        const entry = { lead_hours: lt, init_label: initLabel, models: {} };
+        let hasData = false;
+        for (const mdl of EXP_MODEL_ORDER) {
+            const st = MAP_INDEX[\`\${date}_\${hour}_\${lt}_\${mdl}\`]?.[stationId];
+            if (!st) continue;
+            const mdlData = {};
+            for (const varName of ['temp','mslp','precip','dewpoint']) {
+                const v = st.variables?.[varName];
+                if (v?.bias != null) {
+                    mdlData[varName] = { bias: v.bias, obs: v.obs ?? null };
+                    if (v.obs != null) mdlData[varName].fcst = Math.round((v.obs + v.bias) * 100) / 100;
+                }
+            }
+            if (Object.keys(mdlData).length) { entry.models[mdl] = mdlData; hasData = true; }
+        }
+        if (hasData) entries.push(entry);
+    }
+    return { valid_time_ms: validTimeMs, entries };
+}
+
+function renderExpEvolutionChart(evoData, varName) {
+    const varLabels = {temp:'Temp (°F)',dewpoint:'Dew Point (°F)',mslp:'Pressure (mb)',precip:'Precip (in)'};
+    if (!evoData || !evoData.entries.length) return;
+    const { valid_time_ms, entries } = evoData;
+    const labels   = entries.map(e => e.init_label);
+    const datasets = [];
+    for (const mdl of EXP_MODEL_ORDER) {
+        const pts = entries.map(e => e.models[mdl]?.[varName]?.fcst ?? null);
+        if (pts.every(v => v == null)) continue;
+        const s = EXP_MODEL_STYLES[mdl];
+        datasets.push({label:s.label, data:pts, borderColor:s.color, backgroundColor:'transparent', borderWidth:2, pointRadius:3, tension:.15, spanGaps:true});
+    }
+    // Find obs value (consistent across entries for this variable)
+    let obs = null;
+    outer: for (const e of entries) for (const mdl of EXP_MODEL_ORDER) { const v=e.models[mdl]?.[varName]?.obs; if(v!=null){obs=v;break outer;} }
+    if (obs != null) {
+        datasets.push({label:'Observed',data:Array(labels.length).fill(obs),borderColor:'#212529',backgroundColor:'transparent',borderWidth:1.5,borderDash:[6,4],pointRadius:0,order:-1});
+    }
+    const d = new Date(valid_time_ms);
+    const vtLabel = d.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'})+' '+String(d.getUTCHours()).padStart(2,'0')+'Z';
+    document.getElementById('expFcstEvolutionLabel').textContent =
+        \`Forecast Evolution \u2014 target: \${vtLabel}\${obs!=null?' (obs: '+obs.toFixed(1)+')':''}\`;
+    if (expEvolutionChart) { expEvolutionChart.destroy(); expEvolutionChart = null; }
+    expEvolutionChart = new Chart(document.getElementById('expFcstEvolutionChart'), {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: {
+                legend: {position:'top',labels:{usePointStyle:true,padding:8,font:{size:11}}},
+                tooltip: {callbacks:{title(items){const e=entries[items[0]?.dataIndex];return e?\`Init: \${e.init_label}  (\${e.lead_hours}h lead)\`:''}}},
+                annotation: {annotations:{vtLine:{type:'line',xMin:labels.length-1,xMax:labels.length-1,borderColor:'#adb5bd',borderWidth:1,borderDash:[4,3]}}}
+            },
+            scales: {
+                x: {ticks:{maxRotation:45,minRotation:30,font:{size:10}},grid:{display:false},title:{display:true,text:'Forecast Init Time (oldest \u2192 newest)',font:{size:10}}},
+                y: {title:{display:true,text:varLabels[varName]||''}}
+            }
+        }
+    });
+}
+
+// ── Keyboard nav ───────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft')  navigateExp(-1);
+    if (e.key === 'ArrowRight') navigateExp(1);
+});
+
+// ── Boot ───────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => { initExpMap(); renderExpMap(); });
+<\/script>
+</body>
+</html>`;
+}
+
+// ============================================================================
+// Forecast Evolution Chart
+// ============================================================================
+
+async function loadSingleEventForecastEvolution(stationId, varName) {
+    if (!seLoadedSteps.length) return;
+    const { date, hour } = seLoadedSteps[seCurrentStepIdx];
+    const validTime = `${date}T${String(hour).padStart(2, '0')}:00:00Z`;
+
+    document.getElementById('seFcstEvolutionLabel').textContent = 'Forecast Evolution — loading…';
+
+    try {
+        const params = new URLSearchParams({ station_id: stationId, valid_time: validTime, variable: varName });
+        const res  = await fetch('/api/asos/forecast-evolution?' + params);
+        const data = await res.json();
+        if (!data.success) return;
+        renderForecastEvolutionChart(data, varName);
+    } catch(e) {
+        console.error('Failed to load forecast evolution', e);
+    }
+}
+
+function renderForecastEvolutionChart(data, varName) {
+    const varLabels = { temp: 'Temp (°F)', dewpoint: 'Dew Point (°F)', mslp: 'Pressure (mb)', precip: 'Precip (in)' };
+    const obs = data.obs;
+
+    // Label the chart header with the target valid time
+    const d = new Date(data.valid_time);
+    const vtLabel = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+                  + ' ' + String(d.getUTCHours()).padStart(2, '0') + 'Z';
+    document.getElementById('seFcstEvolutionLabel').textContent =
+        `Forecast Evolution — target: ${vtLabel}  (obs: ${obs != null ? obs.toFixed(1) : '?'})`;
+
+    if (seFcstEvolutionChart) { seFcstEvolutionChart.destroy(); seFcstEvolutionChart = null; }
+
+    const models = data.models || {};
+    const legendOpts = { position: 'top', labels: { usePointStyle: true, padding: 8, font: { size: 11 } } };
+
+    const datasets = [];
+    for (const mdl of SE_MODEL_ORDER) {
+        const pts = models[mdl];
+        if (!pts || !pts.length) continue;
+        const style = SE_MODEL_STYLES[mdl];
+        datasets.push({
+            label: style.label,
+            data:  pts.map(p => p.fcst),
+            borderColor:     style.color,
+            backgroundColor: 'transparent',
+            borderWidth: 2,
+            pointRadius: 3,
+            tension: 0.15,
+            spanGaps: true,
+        });
+    }
+
+    // Build X-axis labels from the first model that has data (all share same init_times)
+    const firstPts = Object.values(models)[0] || [];
+    const labels = firstPts.map(p => {
+        const t = new Date(p.init_time);
+        const md = t.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', timeZone: 'UTC' });
+        const hh = String(t.getUTCHours()).padStart(2, '0');
+        return `${md} ${hh}Z`;
+    });
+
+    // Observed value as a constant line dataset
+    if (obs != null) {
+        datasets.push({
+            label: 'Observed',
+            data:  Array(labels.length).fill(obs),
+            borderColor:     '#212529',
+            backgroundColor: 'transparent',
+            borderWidth: 1.5,
+            borderDash: [6, 4],
+            pointRadius: 0,
+            order: -1,
+        });
+    }
+
+    // Lead-time annotations on X-axis ticks (every 5th tick label)
+    const tickCallback = (val, idx) => {
+        const pt = firstPts[idx];
+        if (!pt) return '';
+        const lead = pt.lead_hours;
+        // Show every ~48h step to avoid crowding
+        if (lead % 48 === 0 || lead === 6 || lead === firstPts[firstPts.length - 1]?.lead_hours) {
+            const t = new Date(pt.init_time);
+            return t.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', timeZone: 'UTC' })
+                 + ' ' + String(t.getUTCHours()).padStart(2, '0') + 'Z';
+        }
+        return '';
+    };
+
+    seFcstEvolutionChart = new Chart(document.getElementById('seFcstEvolutionChart'), {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: legendOpts,
+                tooltip: {
+                    callbacks: {
+                        title(items) {
+                            const idx = items[0]?.dataIndex;
+                            const pt  = firstPts[idx];
+                            if (!pt) return labels[idx] || '';
+                            return `Init: ${labels[idx]}  (${pt.lead_hours}h lead)`;
+                        }
+                    }
+                },
+                annotation: {
+                    annotations: {
+                        validTimeLine: {
+                            type: 'line',
+                            xMin: labels.length - 1,
+                            xMax: labels.length - 1,
+                            borderColor: '#adb5bd',
+                            borderWidth: 1,
+                            borderDash: [4, 3],
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    ticks: { callback: tickCallback, maxRotation: 45, minRotation: 30, font: { size: 10 }, autoSkip: false },
+                    grid: { display: false },
+                    title: { display: true, text: 'Forecast Init Time (oldest → newest)', font: { size: 10 } },
+                },
+                y: { title: { display: true, text: varLabels[varName] || '' } },
+            }
+        }
+    });
+}
+
+function onSingleEventTabOpen() {
+    initSingleEventMap();
+    loadSingleEventAvailableDates();
+    // Force Leaflet map to recalculate size (it may be hidden on load)
+    setTimeout(() => { if (seMap) seMap.invalidateSize(); }, 200);
+}
 
 
 </script>

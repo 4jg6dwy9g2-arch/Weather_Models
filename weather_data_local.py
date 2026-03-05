@@ -330,7 +330,7 @@ def get_daily_summaries(start_date: datetime, end_date: datetime) -> list[dict]:
                 return None
 
         rain_values = group["rain"].dropna() if "rain" in group else []
-        daily_rain = round(rain_values.max(), 2) if len(rain_values) > 0 else 0
+        daily_rain = round(rain_values.sum(), 2) if len(rain_values) > 0 else 0
 
         daylight_solar = group["solar_rad"].dropna() if "solar_rad" in group else []
         daylight_solar = daylight_solar[daylight_solar > 0] if len(daylight_solar) > 0 else []

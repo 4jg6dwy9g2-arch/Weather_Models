@@ -125,16 +125,22 @@ def _extract_bracket(question: str) -> str | None:
     return None
 
 
-def _bracket_midpoint(bracket: str) -> float | None:
+def _bracket_midpoint(bracket: str, nws_high: float | None = None) -> float | None:
     b = bracket.strip()
     if "or below" in b:
         try:
-            return float(b.split("°")[0]) - 1.0
+            threshold = float(b.split("°")[0])
+            if nws_high is not None and nws_high <= threshold:
+                return nws_high
+            return threshold - 1.0
         except ValueError:
             return None
     if "or higher" in b:
         try:
-            return float(b.split("°")[0]) + 1.0
+            threshold = float(b.split("°")[0])
+            if nws_high is not None and nws_high >= threshold:
+                return nws_high
+            return threshold + 1.0
         except ValueError:
             return None
     if "-" in b and "°F" in b:
@@ -146,11 +152,11 @@ def _bracket_midpoint(bracket: str) -> float | None:
     return None
 
 
-def _market_implied_temp(brackets: list[str], prices: list[float]) -> float | None:
+def _market_implied_temp(brackets: list[str], prices: list[float], nws_high: float | None = None) -> float | None:
     total_prob = 0.0
     weighted   = 0.0
     for bracket, p in zip(brackets, prices):
-        mid = _bracket_midpoint(bracket)
+        mid = _bracket_midpoint(bracket, nws_high)
         if mid is not None:
             weighted   += mid * p
             total_prob += p
@@ -364,7 +370,7 @@ def update_polymarket_cache() -> dict:
 
             found   += 1
             nws_high = get_nws_daily_high(target, city)
-            implied  = _market_implied_temp(market_data["brackets"], market_data["prices"])
+            implied  = _market_implied_temp(market_data["brackets"], market_data["prices"], nws_high)
 
             # Lead time in hours (float) so 6-hourly syncs produce distinct points.
             # Target "event time" is midnight UTC of the following day (i.e. end of
@@ -398,6 +404,7 @@ def update_polymarket_cache() -> dict:
             entry["resolved"]        = market_data["resolved"]
             entry["winning_bracket"] = market_data["winning_bracket"]
             entry["brackets"]        = market_data["brackets"]
+            entry["prices"]          = market_data["prices"]
             entry["snapshots"].append(snapshot)
             updated += 1
 

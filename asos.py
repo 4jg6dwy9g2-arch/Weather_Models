@@ -104,6 +104,98 @@ def _is_implausible_dewpoint_value(val_f: float) -> bool:
     return not math.isfinite(val_f) or val_f < _DEWPOINT_MIN_F or val_f > _DEWPOINT_MAX_F
 
 
+# Spatial neighbor outlier filtering constants
+_NEIGHBOR_TEMP_THRESHOLD = 25.0   # °F — flag obs if it differs from neighbor median by more than this
+_NEIGHBOR_DEW_THRESHOLD = 25.0    # °F
+_NEIGHBOR_MIN_COUNT = 3           # need at least this many neighbors to apply filter
+_NEIGHBOR_MAX_CHECK = 10          # check up to this many nearest neighbors
+
+# Module-level cache: populated once per process (or rebuilt when stations change)
+_neighbor_table: dict = {}        # {station_id: [neighbor_id, ...]} sorted nearest-first
+
+
+def _build_neighbor_table(stations_dict: dict, n: int = 30) -> dict:
+    """
+    Build a lookup table of the N nearest stations for each station.
+    Uses Euclidean lat/lon distance (adequate for CONUS inter-station comparisons).
+    O(N²) but called once per process; ~2400 stations → <1 second.
+    """
+    station_coords = [
+        (sid, sdata.get('lat'), sdata.get('lon'))
+        for sid, sdata in stations_dict.items()
+        if sdata.get('lat') is not None and sdata.get('lon') is not None
+    ]
+    table = {}
+    for sid, lat, lon in station_coords:
+        dists = []
+        for other_sid, other_lat, other_lon in station_coords:
+            if other_sid == sid:
+                continue
+            d = ((other_lat - lat) ** 2 + (other_lon - lon) ** 2) ** 0.5
+            dists.append((d, other_sid))
+        dists.sort()
+        table[sid] = [other_sid for _, other_sid in dists[:n]]
+    return table
+
+
+def _get_or_build_neighbor_table(stations_dict: dict) -> dict:
+    """Return the cached neighbor table, building it if needed."""
+    global _neighbor_table
+    if not _neighbor_table and stations_dict:
+        _neighbor_table = _build_neighbor_table(stations_dict)
+    return _neighbor_table
+
+
+def _slow_neighbor_filter(
+    observations_data: dict,
+    neighbor_table: dict,
+    station_id: str,
+    value: float,
+    target_time: datetime,
+    var_key: str,
+    threshold: float,
+) -> Optional[float]:
+    """
+    Spatial outlier check using raw obs dict iteration.
+    Returns None if value is an outlier vs neighbor median, else returns value unchanged.
+    Used in get_stored_observation / get_composite_observation (non-hot paths).
+    """
+    neighbors = neighbor_table.get(station_id, [])
+    if not neighbors:
+        return value
+
+    tol = timedelta(minutes=30)
+    tol_total = tol.total_seconds()
+    neighbor_vals = []
+    for n_id in neighbors:
+        n_obs = observations_data.get(n_id, {})
+        best_val = None
+        best_delta = tol_total + 1.0
+        for ts_str, n_obs_data in n_obs.items():
+            try:
+                n_time = datetime.fromisoformat(ts_str)
+                delta = abs((n_time - target_time).total_seconds())
+                if delta < best_delta:
+                    v = n_obs_data.get(var_key)
+                    if v is not None:
+                        best_val = v
+                        best_delta = delta
+            except (ValueError, TypeError):
+                continue
+        if best_val is not None:
+            neighbor_vals.append(best_val)
+        if len(neighbor_vals) >= _NEIGHBOR_MAX_CHECK:
+            break
+
+    if len(neighbor_vals) < _NEIGHBOR_MIN_COUNT:
+        return value  # not enough neighbors to make a call
+
+    median = sorted(neighbor_vals)[len(neighbor_vals) // 2]
+    if abs(value - median) > threshold:
+        return None
+    return value
+
+
 def should_include_precip(fcst_val, obs_val) -> bool:
     """
     Include precip verification only for meaningful precipitation events.
@@ -270,6 +362,38 @@ def _compute_kenny_station_biases(db: dict, variable: str = "temp") -> tuple[dic
     return station_biases, global_bias
 
 
+def _compute_kenny_station_biases_cached(db: dict, variable: str = "temp") -> tuple:
+    """
+    Return Kenny station biases, reading from the persisted verification cache when available.
+    The verification cache stores pre-computed biases after every sync, so this is normally
+    an instant dict lookup.  Falls back to live computation only if the cache is missing or
+    doesn't yet contain the 'kenny_biases' key (e.g. first run before any sync).
+    """
+    global _kenny_bias_cache
+    mtime = _asos_forecasts_db_mtime or 0.0
+    key = (variable, mtime)
+    if key in _kenny_bias_cache:
+        return _kenny_bias_cache[key]
+
+    # Try reading from the persisted verification cache first
+    ver_cache = load_verification_cache()
+    kb = (ver_cache or {}).get("kenny_biases", {}).get(variable)
+    if kb is not None:
+        station_biases = kb.get("station", {})
+        global_bias_raw = kb.get("global", {})
+        # Keys were stored as strings; convert back to int
+        global_bias = {int(k): v for k, v in global_bias_raw.items()}
+        result = (station_biases, global_bias)
+        _kenny_bias_cache[key] = result
+        return result
+
+    # Verification cache missing or predates kenny_biases — compute live (slow path)
+    logger.info(f"Kenny biases not in cache, computing live for variable={variable}...")
+    result = _compute_kenny_station_biases(db, variable)
+    _kenny_bias_cache[key] = result
+    return result
+
+
 def _apply_model_value_adjustment(
     model: str,
     variable: str,
@@ -359,6 +483,10 @@ _asos_forecasts_db_mtime: float | None = None
 
 _verification_cache_data: dict | None = None
 _verification_cache_mtime: float | None = None
+
+# Cache for _compute_kenny_station_biases results, keyed by (variable, db_mtime).
+# Invalidated whenever the DB file changes (i.e. after a sync).
+_kenny_bias_cache: dict = {}  # {(variable, mtime): (station_biases, global_bias)}
 
 _asos_metar_pressure_cache: dict | None = None
 _asos_metar_pressure_mtime: float | None = None
@@ -1106,6 +1234,112 @@ def accumulate_stats_from_run(
                         stats["sum_weighted_abs_errors"] += abs(error) * weight
                         stats["sum_weights"] += weight
 
+    # Kenny: bias-corrected AIFS temp and dewpoint accumulated under 'kenny' key
+    aifs_data_for_kenny = run_data.get('aifs')
+    if aifs_data_for_kenny:
+        temp_station_biases, temp_global_bias = _compute_kenny_station_biases(data, 'temp')
+        dew_station_biases, dew_global_bias = _compute_kenny_station_biases(data, 'dewpoint')
+
+        if 'kenny' not in cumulative_by_lead_time:
+            cumulative_by_lead_time['kenny'] = {}
+        if 'kenny' not in cumulative_by_lt_by_vh:
+            cumulative_by_lt_by_vh['kenny'] = {}
+
+        for station_id, fcst_data in aifs_data_for_kenny.items():
+            if station_id not in stations:
+                continue
+            if station_id not in cumulative_by_station:
+                cumulative_by_station[station_id] = {}
+            if 'kenny' not in cumulative_by_station[station_id]:
+                cumulative_by_station[station_id]['kenny'] = {}
+
+            for i, lt in enumerate(forecast_hours):
+                valid_time = init_time + timedelta(hours=lt)
+                if valid_time >= now:
+                    continue
+
+                obs = get_stored_observation(data, station_id, valid_time)
+                if not obs:
+                    continue
+
+                lt_str = str(lt)
+                vh_str = str(valid_time.hour)
+                valid_hour = valid_time.hour
+
+                # All 5 variables: bias-corrected for temp/dewpoint, raw AIFS for the rest
+                for var, fcst_key, obs_key in [
+                    ('temp', 'temps', 'temp'),
+                    ('dewpoint', 'dewpoints', 'dewpoint'),
+                    ('mslp', 'mslps', 'mslp'),
+                    ('precip', 'precips', 'precip_6hr'),
+                    ('precip_24hr', 'precips_24hr', 'precip_24hr'),
+                ]:
+                    fcst_values = fcst_data.get(fcst_key, [])
+                    if i >= len(fcst_values) or fcst_values[i] is None:
+                        continue
+                    if obs.get(obs_key) is None:
+                        continue
+
+                    raw_fcst = fcst_values[i]
+                    obs_val = obs[obs_key]
+
+                    if var == 'precip' and (station_id, i) not in qualifying_precip and obs_val < 0.01:
+                        continue
+                    if var == 'precip_24hr' and (station_id, i) not in qualifying_precip_24hr and obs_val < 0.01:
+                        continue
+
+                    # Apply bias correction for temp and dewpoint; use raw value otherwise
+                    if var == 'temp':
+                        station_bias = (temp_station_biases.get(station_id) or {}).get(valid_hour)
+                        bias = station_bias if station_bias is not None else temp_global_bias.get(valid_hour, 0.0)
+                        kenny_val = raw_fcst - bias
+                    elif var == 'dewpoint':
+                        station_bias = (dew_station_biases.get(station_id) or {}).get(valid_hour)
+                        bias = station_bias if station_bias is not None else dew_global_bias.get(valid_hour, 0.0)
+                        kenny_val = raw_fcst - bias
+                    else:
+                        kenny_val = raw_fcst
+
+                    error = kenny_val - obs_val
+                    abs_error = abs(error)
+
+                    def _acc(d, key, val, ae):
+                        if key not in d:
+                            d[key] = {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                      'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0}
+                        d[key]['sum_abs_errors'] += ae
+                        d[key]['sum_errors'] += val
+                        d[key]['count'] += 1
+                        if _is_precip_var(var):
+                            w = _precip_weight(obs_val)
+                            d[key]['sum_weighted_abs_errors'] += ae * w
+                            d[key]['sum_weights'] += w
+
+                    # by_station
+                    if var not in cumulative_by_station[station_id]['kenny']:
+                        cumulative_by_station[station_id]['kenny'][var] = {}
+                    _acc(cumulative_by_station[station_id]['kenny'][var], lt_str, error, abs_error)
+
+                    # by_lead_time
+                    if var not in cumulative_by_lead_time['kenny']:
+                        cumulative_by_lead_time['kenny'][var] = {}
+                    _acc(cumulative_by_lead_time['kenny'][var], lt_str, error, abs_error)
+
+                    # by_lead_time_by_valid_hour
+                    if var not in cumulative_by_lt_by_vh['kenny']:
+                        cumulative_by_lt_by_vh['kenny'][var] = {}
+                    if lt_str not in cumulative_by_lt_by_vh['kenny'][var]:
+                        cumulative_by_lt_by_vh['kenny'][var][lt_str] = {}
+                    _acc(cumulative_by_lt_by_vh['kenny'][var][lt_str], vh_str, error, abs_error)
+
+                    # by_station_by_valid_hour
+                    s_vh = (cumulative_by_station_by_vh
+                            .setdefault(station_id, {})
+                            .setdefault('kenny', {})
+                            .setdefault(var, {})
+                            .setdefault(lt_str, {}))
+                    _acc(s_vh, vh_str, error, abs_error)
+
 
 def cleanup_old_runs(data: dict) -> dict:
     """
@@ -1495,6 +1729,20 @@ def get_stored_observation(db: dict, station_id: str, target_time: datetime, max
             continue
 
     if best_delta <= timedelta(minutes=max_delta_minutes):
+        # Spatial outlier filter for temp and dewpoint
+        observations_data = db.get("observations", {})
+        nb_table = _get_or_build_neighbor_table(db.get("stations", {}))
+        if best_match.get('temp') is not None:
+            best_match['temp'] = _slow_neighbor_filter(
+                observations_data, nb_table, station_id, best_match['temp'],
+                target_time, 'temp', _NEIGHBOR_TEMP_THRESHOLD
+            )
+        if best_match.get('dewpoint') is not None:
+            best_match['dewpoint'] = _slow_neighbor_filter(
+                observations_data, nb_table, station_id, best_match['dewpoint'],
+                target_time, 'dewpoint', _NEIGHBOR_DEW_THRESHOLD
+            )
+
         # Add 6-hour accumulated precipitation
         # Check if target_time aligns with a 6-hour synoptic time (00Z, 06Z, 12Z, 18Z)
         if target_time.hour % 6 == 0:
@@ -1567,11 +1815,27 @@ def get_composite_observation(
     if all(v[0] is None for v in (best_temp, best_mslp, best_precip, best_dew)):
         return None
 
+    # Spatial outlier filter for temp and dewpoint before compositing
+    observations_data = db.get("observations", {})
+    nb_table = _get_or_build_neighbor_table(db.get("stations", {}))
+    temp_val = best_temp[0]
+    if temp_val is not None:
+        temp_val = _slow_neighbor_filter(
+            observations_data, nb_table, station_id, temp_val,
+            target_time, 'temp', _NEIGHBOR_TEMP_THRESHOLD
+        )
+    dew_val = best_dew[0]
+    if dew_val is not None:
+        dew_val = _slow_neighbor_filter(
+            observations_data, nb_table, station_id, dew_val,
+            target_time, 'dewpoint', _NEIGHBOR_DEW_THRESHOLD
+        )
+
     composite = {
-        "temp": best_temp[0],
+        "temp": temp_val,
         "mslp": best_mslp[0],
         "precip": best_precip[0],
-        "dewpoint": best_dew[0],
+        "dewpoint": dew_val,
     }
 
     if target_time.hour % 6 == 0:
@@ -2146,43 +2410,6 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
 
     Returns a flat structure with lead_times, temp_mae, temp_bias, mslp_mae, mslp_bias lists.
     """
-    if (model or "").lower() == "kenny":
-        # Kenny temperature applies cycle-dependent forecast adjustment; compute directly.
-        detailed = get_station_detail(station_id, model)
-        if "data" not in detailed:
-            return {"error": "No verification data for this station"}
-        lead_times = detailed.get("lead_times", [])
-        temp_mae, temp_bias, temp_count = [], [], []
-        precip_mae, precip_bias, precip_count = [], [], []
-        dew_mae, dew_bias, dew_count = [], [], []
-        for lt in lead_times:
-            mdata = detailed.get("data", {}).get(lt, {}).get("kenny", {})
-            t = mdata.get("temp")
-            p = mdata.get("precip")
-            d = mdata.get("dewpoint")
-            temp_mae.append(t.get("mae") if t else None)
-            temp_bias.append(t.get("bias") if t else None)
-            temp_count.append(t.get("count", 0) if t else 0)
-            precip_mae.append(p.get("mae") if p else None)
-            precip_bias.append(p.get("bias") if p else None)
-            precip_count.append(p.get("count", 0) if p else 0)
-            dew_mae.append(d.get("mae") if d else None)
-            dew_bias.append(d.get("bias") if d else None)
-            dew_count.append(d.get("count", 0) if d else 0)
-        return {
-            "station": detailed.get("station", {}),
-            "lead_times": lead_times,
-            "temp_mae": temp_mae,
-            "temp_bias": temp_bias,
-            "temp_count": temp_count,
-            "precip_mae": precip_mae,
-            "precip_bias": precip_bias,
-            "precip_count": precip_count,
-            "dewpoint_mae": dew_mae,
-            "dewpoint_bias": dew_bias,
-            "dewpoint_count": dew_count,
-        }
-
     cache = load_verification_cache()
     if cache is None:
         return {"error": "Verification cache not available. Run a sync to rebuild it."}
@@ -2197,8 +2424,9 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
         return {"error": "Station not found"}
 
     source_model = _source_model_for_verification(model)
+    cache_model = (model or source_model).lower()
     station_data = cache.get("by_station", {}).get(station_id, {})
-    model_data = station_data.get(source_model, {})
+    model_data = station_data.get(cache_model, {})
 
     if not model_data:
         return {"error": "No verification data for this station"}
@@ -2208,6 +2436,7 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
     temp_mae = []
     temp_bias = []
     precip_mae = []
+    precip_wmae = []
     precip_bias = []
     dewpoint_mae = []
     dewpoint_bias = []
@@ -2227,6 +2456,7 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
 
         precip = lt_data.get('precip')
         precip_mae.append(precip['mae'] if precip else None)
+        precip_wmae.append(precip.get('wmae') if precip else None)
         precip_bias.append(_bias_corrected_metric_value(model, "precip_bias", precip['mae'] if precip else None, precip['bias'] if precip else None) if precip else None)
         precip_count.append(precip['count'] if precip else 0)
 
@@ -2242,6 +2472,7 @@ def get_station_detail_from_cache(station_id: str, model: str) -> dict:
         "temp_bias": temp_bias,
         "temp_count": temp_count,
         "precip_mae": precip_mae,
+        "precip_wmae": precip_wmae,
         "precip_bias": precip_bias,
         "precip_count": precip_count,
         "dewpoint_mae": dewpoint_mae,
@@ -2511,6 +2742,11 @@ def get_mean_verification_by_lead_time(
         for var in ['temp', 'mslp', 'precip', 'dewpoint']:
             var_stats = model_cumulative.get(var, {})
             all_forecast_hours.update(int(lt) for lt in var_stats.keys())
+        # Also include lead times from Kenny cumulative (for temp/dewpoint)
+        if model.lower() == 'kenny':
+            kenny_lt_data = cumulative_by_lead_time.get('kenny', {})
+            for var in ['temp', 'dewpoint']:
+                all_forecast_hours.update(int(lt) for lt in kenny_lt_data.get(var, {}).keys())
 
         logger.debug(f"Raw all_forecast_hours: {sorted(list(all_forecast_hours))}")
 
@@ -2536,10 +2772,15 @@ def get_mean_verification_by_lead_time(
 
         # Start with cumulative stats
         include_cumulative = (valid_hour is None and cutoff is None)
+        # For Kenny, all vars come from 'kenny' cumulative
+        kenny_cumulative = cumulative_by_lead_time.get('kenny', {}) if model.lower() == 'kenny' else {}
         for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
-            if _is_kenny_bias_corrected_var(model, var) or not include_cumulative:
+            if not include_cumulative:
                 continue
-            var_cumulative = model_cumulative.get(var, {})
+            if model.lower() == 'kenny':
+                var_cumulative = kenny_cumulative.get(var, {})
+            else:
+                var_cumulative = model_cumulative.get(var, {})
             for lt_str, stats in var_cumulative.items():
                 lt = int(lt_str)
                 if lt in aggregated_stats:
@@ -2813,6 +3054,54 @@ def precompute_verification_cache() -> dict:
         obs_sorted_keys[station_id] = [p[1] for p in pairs]
     logger.info(f"Built sorted index for {len(obs_sorted_ts)} stations")
 
+    # Build spatial neighbor table for outlier filtering (fast path, reused in closure)
+    # Also update the module-level cache so slow paths (get_composite_observation etc) stay in sync.
+    global _neighbor_table
+    logger.info("Building station neighbor table for spatial outlier filtering...")
+    cache_neighbor_table = _build_neighbor_table(stations)
+    _neighbor_table = cache_neighbor_table
+    logger.info(f"Built neighbor table for {len(cache_neighbor_table)} stations")
+
+    def _fast_neighbor_val(n_id: str, target_ts: float, window_s: float, var_key: str):
+        """Get nearest valid observation value from a neighbor station using sorted index."""
+        n_sorted_ts = obs_sorted_ts.get(n_id)
+        n_sorted_keys = obs_sorted_keys.get(n_id)
+        n_cache = obs_cache.get(n_id)
+        if not n_sorted_ts or n_cache is None:
+            return None
+        lo = bisect.bisect_left(n_sorted_ts, target_ts - window_s)
+        hi = bisect.bisect_right(n_sorted_ts, target_ts + window_s)
+        best_val = None
+        best_delta = window_s + 1.0
+        for idx in range(lo, hi):
+            obs_data = n_cache.get(n_sorted_keys[idx])
+            if obs_data is None:
+                continue
+            v = obs_data.get(var_key)
+            if v is not None:
+                delta = abs(n_sorted_ts[idx] - target_ts)
+                if delta < best_delta:
+                    best_val = v
+                    best_delta = delta
+        return best_val
+
+    def _fast_neighbor_filter(station_id: str, value: float, target_ts: float, window_s: float, var_key: str, threshold: float):
+        """Return None if value is a spatial outlier vs neighbor median, else return value."""
+        neighbors = cache_neighbor_table.get(station_id, [])
+        neighbor_vals = []
+        for n_id in neighbors:
+            v = _fast_neighbor_val(n_id, target_ts, window_s, var_key)
+            if v is not None:
+                neighbor_vals.append(v)
+            if len(neighbor_vals) >= _NEIGHBOR_MAX_CHECK:
+                break
+        if len(neighbor_vals) < _NEIGHBOR_MIN_COUNT:
+            return value
+        median = sorted(neighbor_vals)[len(neighbor_vals) // 2]
+        if abs(value - median) > threshold:
+            return None
+        return value
+
     # Phase 2: Eagerly accumulate mature runs (>16 days old) into cumulative_stats so
     # they can be skipped in the fresh-computation loop on this and all future syncs.
     MATURE_RUN_HOURS = 16 * 24
@@ -3051,6 +3340,16 @@ def precompute_verification_cache() -> dict:
                 best_dewpoint_val = v
                 best_dewpoint_delta = delta
 
+        # Spatial outlier filter for temp and dewpoint
+        if best_temp_val is not None:
+            best_temp_val = _fast_neighbor_filter(
+                station_id, best_temp_val, target_ts, window_s, 'temp', _NEIGHBOR_TEMP_THRESHOLD
+            )
+        if best_dewpoint_val is not None:
+            best_dewpoint_val = _fast_neighbor_filter(
+                station_id, best_dewpoint_val, target_ts, window_s, 'dewpoint', _NEIGHBOR_DEW_THRESHOLD
+            )
+
         if best_temp_val is None and best_mslp_val is None and best_precip_val is None and best_dewpoint_val is None:
             return None
 
@@ -3112,6 +3411,7 @@ def precompute_verification_cache() -> dict:
             'aifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
             'ifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
             'nws': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
+            'kenny': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         }
 
     # Structure: aggregated_stats[model][var][lt_str] = {sum_abs_errors, sum_errors, count}
@@ -3120,6 +3420,7 @@ def precompute_verification_cache() -> dict:
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'ifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'nws': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
+        'kenny': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
     }
     # Structure: hourly_aggregated_stats[model][var][lt_str][vh_str] = {sum_abs, sum, count}
     hourly_aggregated_stats = {
@@ -3127,6 +3428,7 @@ def precompute_verification_cache() -> dict:
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'ifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'nws': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
+        'kenny': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
     }
     # Structure: station_hourly_stats[station_id][model][var][snapped_lt_str][vh_str] = {sum_abs, sum, count}
     # Pre-seeded from accumulated by_station_by_valid_hour, then fresh runs added on top,
@@ -3185,6 +3487,20 @@ def precompute_verification_cache() -> dict:
                         'sum_weighted_abs_errors': 0.0,
                         'sum_weights': 0.0,
                     }
+    # Kenny: all 5 variables (temp/dewpoint bias-corrected, rest raw AIFS)
+    for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+        for lt in lead_times:
+            lt_str = str(lt)
+            aggregated_stats['kenny'][var][lt_str] = {
+                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0,
+            }
+            hourly_aggregated_stats['kenny'][var][lt_str] = {}
+            for station_id in stations:
+                station_stats[station_id]['kenny'][var][lt_str] = {
+                    'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                    'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0,
+                }
 
     logger.info(f"Loading cumulative stats for {len(stations)} stations...")
 
@@ -3202,6 +3518,16 @@ def precompute_verification_cache() -> dict:
                             station_stats[station_id][model][var][lt_str]['count'] += stats.get('count', 0)
                             station_stats[station_id][model][var][lt_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
                             station_stats[station_id][model][var][lt_str]['sum_weights'] += stats.get('sum_weights', 0.0)
+            # Kenny cumulative: all 5 vars
+            kenny_cumulative = cumulative_by_station[station_id].get('kenny', {})
+            for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+                for lt_str, stats in kenny_cumulative.get(var, {}).items():
+                    if int(lt_str) in lead_times:
+                        station_stats[station_id]['kenny'][var][lt_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
+                        station_stats[station_id]['kenny'][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
+                        station_stats[station_id]['kenny'][var][lt_str]['count'] += stats.get('count', 0)
+                        station_stats[station_id]['kenny'][var][lt_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
+                        station_stats[station_id]['kenny'][var][lt_str]['sum_weights'] += stats.get('sum_weights', 0.0)
 
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
         model_cumulative = cumulative_by_lead_time.get(model, {})
@@ -3214,6 +3540,16 @@ def precompute_verification_cache() -> dict:
                     aggregated_stats[model][var][lt_str]['count'] += stats.get('count', 0)
                     aggregated_stats[model][var][lt_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
                     aggregated_stats[model][var][lt_str]['sum_weights'] += stats.get('sum_weights', 0.0)
+    # Kenny cumulative by_lead_time: all 5 vars
+    kenny_lt_cumulative = cumulative_by_lead_time.get('kenny', {})
+    for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+        for lt_str, stats in kenny_lt_cumulative.get(var, {}).items():
+            if int(lt_str) in lead_times:
+                aggregated_stats['kenny'][var][lt_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
+                aggregated_stats['kenny'][var][lt_str]['sum_errors'] += stats.get('sum_errors', 0.0)
+                aggregated_stats['kenny'][var][lt_str]['count'] += stats.get('count', 0)
+                aggregated_stats['kenny'][var][lt_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
+                aggregated_stats['kenny'][var][lt_str]['sum_weights'] += stats.get('sum_weights', 0.0)
 
     # Load cumulative hourly breakdown (snap any non-canonical LT to nearest canonical)
     cumulative_by_lt_by_vh = db.get("cumulative_stats", {}).get("by_lead_time_by_valid_hour", {})
@@ -3237,9 +3573,32 @@ def precompute_verification_cache() -> dict:
                     hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['count'] += stats.get('count', 0)
                     hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
                     hourly_aggregated_stats[model][var][snapped_lt_str][vh_str]['sum_weights'] += stats.get('sum_weights', 0.0)
+    # Kenny cumulative hourly: all 5 vars
+    kenny_ltvh_cumulative = cumulative_by_lt_by_vh.get('kenny', {})
+    for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+        for lt_str, vh_data in kenny_ltvh_cumulative.get(var, {}).items():
+            snapped = _snap_to_canonical_lt(int(lt_str))
+            if snapped is None:
+                continue
+            snapped_lt_str = str(snapped)
+            for vh_str, stats in vh_data.items():
+                if vh_str not in hourly_aggregated_stats['kenny'][var][snapped_lt_str]:
+                    hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str] = {
+                        'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                        'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0,
+                    }
+                hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_abs_errors'] += stats.get('sum_abs_errors', 0.0)
+                hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_errors'] += stats.get('sum_errors', 0.0)
+                hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['count'] += stats.get('count', 0)
+                hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_weighted_abs_errors'] += stats.get('sum_weighted_abs_errors', 0.0)
+                hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_weights'] += stats.get('sum_weights', 0.0)
 
     fresh_run_count = sum(1 for k in runs if k not in accumulated_run_keys)
     logger.info(f"Computing fresh stats from {fresh_run_count} current runs (skipping {len(accumulated_run_keys)} accumulated)...")
+
+    # Precompute Kenny biases once before the fresh-run loop
+    kenny_temp_station_biases, kenny_temp_global_bias = _compute_kenny_station_biases(db, 'temp')
+    kenny_dew_station_biases, kenny_dew_global_bias = _compute_kenny_station_biases(db, 'dewpoint')
 
     # Add fresh calculations from current runs (skip mature runs already in cumulative_stats)
     for run_key, run_data in runs.items():
@@ -3356,6 +3715,109 @@ def precompute_verification_cache() -> dict:
                             s_h_station[vh_str]['sum_weighted_abs_errors'] += abs_error * weight
                             s_h_station[vh_str]['sum_weights'] += weight
 
+        # Kenny fresh-run block: all 5 vars (temp/dew bias-corrected, rest raw AIFS)
+        aifs_model_data = run_data.get('aifs')
+        if aifs_model_data:
+            lead_times_set = set(lead_times)
+            for station_id, fcst_data in aifs_model_data.items():
+                if station_id not in stations:
+                    continue
+
+                for i, lt in enumerate(forecast_hours):
+                    is_canonical = lt in lead_times_set
+                    snapped_lt = lt if is_canonical else _snap_to_canonical_lt(lt)
+                    if not is_canonical and snapped_lt is None:
+                        continue
+
+                    valid_time = init_time + timedelta(hours=lt)
+                    if valid_time >= now:
+                        continue
+
+                    obs = get_cached_observation(station_id, valid_time)
+                    if not obs:
+                        continue
+
+                    lt_str = str(lt)
+                    snapped_lt_str = str(snapped_lt)
+                    vh_str = str(valid_time.hour)
+                    valid_hour = valid_time.hour
+
+                    for var, (fcst_key, obs_key) in var_map.items():
+                        fcst_values = fcst_data.get(fcst_key, [])
+                        if i >= len(fcst_values) or fcst_values[i] is None:
+                            continue
+                        if obs.get(obs_key) is None:
+                            continue
+
+                        raw_fcst = fcst_values[i]
+                        obs_val = obs[obs_key]
+
+                        if var == 'precip' and (station_id, i) not in qualifying_precip and obs_val < 0.01:
+                            continue
+                        if var == 'precip_24hr' and (station_id, i) not in qualifying_precip_24hr and obs_val < 0.01:
+                            continue
+
+                        # Apply bias correction for temp/dew; raw otherwise
+                        if var == 'temp':
+                            station_bias = (kenny_temp_station_biases.get(station_id) or {}).get(valid_hour)
+                            kenny_fcst_val = raw_fcst - (station_bias if station_bias is not None else kenny_temp_global_bias.get(valid_hour, 0.0))
+                        elif var == 'dewpoint':
+                            station_bias = (kenny_dew_station_biases.get(station_id) or {}).get(valid_hour)
+                            kenny_fcst_val = raw_fcst - (station_bias if station_bias is not None else kenny_dew_global_bias.get(valid_hour, 0.0))
+                        else:
+                            kenny_fcst_val = raw_fcst
+
+                        error = kenny_fcst_val - obs_val
+                        abs_error = abs(error)
+
+                        if is_canonical:
+                            station_stats[station_id]['kenny'][var][lt_str]['sum_abs_errors'] += abs_error
+                            station_stats[station_id]['kenny'][var][lt_str]['sum_errors'] += error
+                            station_stats[station_id]['kenny'][var][lt_str]['count'] += 1
+                            if _is_precip_var(var):
+                                weight = _precip_weight(obs_val)
+                                station_stats[station_id]['kenny'][var][lt_str]['sum_weighted_abs_errors'] += abs_error * weight
+                                station_stats[station_id]['kenny'][var][lt_str]['sum_weights'] += weight
+
+                            aggregated_stats['kenny'][var][lt_str]['sum_abs_errors'] += abs_error
+                            aggregated_stats['kenny'][var][lt_str]['sum_errors'] += error
+                            aggregated_stats['kenny'][var][lt_str]['count'] += 1
+                            if _is_precip_var(var):
+                                weight = _precip_weight(obs_val)
+                                aggregated_stats['kenny'][var][lt_str]['sum_weighted_abs_errors'] += abs_error * weight
+                                aggregated_stats['kenny'][var][lt_str]['sum_weights'] += weight
+
+                        if vh_str not in hourly_aggregated_stats['kenny'][var][snapped_lt_str]:
+                            hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str] = {
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0,
+                            }
+                        hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_abs_errors'] += abs_error
+                        hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_errors'] += error
+                        hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['count'] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_weighted_abs_errors'] += abs_error * weight
+                            hourly_aggregated_stats['kenny'][var][snapped_lt_str][vh_str]['sum_weights'] += weight
+
+                        s_h_station = (station_hourly_stats
+                                       .setdefault(station_id, {})
+                                       .setdefault('kenny', {})
+                                       .setdefault(var, {})
+                                       .setdefault(snapped_lt_str, {}))
+                        if vh_str not in s_h_station:
+                            s_h_station[vh_str] = {
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0,
+                            }
+                        s_h_station[vh_str]['sum_abs_errors'] += abs_error
+                        s_h_station[vh_str]['sum_errors'] += error
+                        s_h_station[vh_str]['count'] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            s_h_station[vh_str]['sum_weighted_abs_errors'] += abs_error * weight
+                            s_h_station[vh_str]['sum_weights'] += weight
+
     logger.info("Finalizing cache data...")
 
     # Precompute time series data (all historical data) using cached observations
@@ -3386,6 +3848,25 @@ def precompute_verification_cache() -> dict:
                         }
                     else:
                         cache_data["by_station"][station_id][model][lt_str][var] = None
+        # Kenny by_station: all 5 vars from kenny stats
+        cache_data["by_station"][station_id]['kenny'] = {}
+        for lt in lead_times:
+            lt_str = str(lt)
+            cache_data["by_station"][station_id]['kenny'][lt_str] = {}
+            for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+                stats = station_stats[station_id]['kenny'][var][lt_str]
+                if stats['count'] > 0:
+                    mae = stats['sum_abs_errors'] / stats['count']
+                    entry = {
+                        'mae': round(mae, 2),
+                        'bias': round(stats['sum_errors'] / stats['count'], 2),
+                        'count': stats['count'],
+                    }
+                    if _is_precip_var(var):
+                        entry['wmae'] = round(_stats_wmae(stats, fallback_mae=mae), 2)
+                    cache_data["by_station"][station_id]['kenny'][lt_str][var] = entry
+                else:
+                    cache_data["by_station"][station_id]['kenny'][lt_str][var] = None
 
     # Convert to final cache format - by_lead_time
     for model in ['gfs', 'aifs', 'ifs', 'nws']:
@@ -3412,6 +3893,28 @@ def precompute_verification_cache() -> dict:
                         'bias': None,
                         **({'wmae': None} if _is_precip_var(var) else {}),
                     }
+    # Kenny by_lead_time: all 5 vars from kenny stats
+    cache_data["by_lead_time"]['kenny'] = {}
+    for lt in lead_times:
+        lt_str = str(lt)
+        cache_data["by_lead_time"]['kenny'][lt_str] = {}
+        for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+            stats = aggregated_stats['kenny'][var][lt_str]
+            if stats['count'] > 0:
+                mae = stats['sum_abs_errors'] / stats['count']
+                entry = {
+                    'mae': round(mae, 2),
+                    'bias': round(stats['sum_errors'] / stats['count'], 2),
+                }
+                if _is_precip_var(var):
+                    entry['wmae'] = round(_stats_wmae(stats, fallback_mae=mae), 2)
+                cache_data["by_lead_time"]['kenny'][lt_str][var] = entry
+            else:
+                cache_data["by_lead_time"]['kenny'][lt_str][var] = {
+                    'mae': None,
+                    'bias': None,
+                    **({'wmae': None} if _is_precip_var(var) else {}),
+                }
 
     # Convert hourly_aggregated_stats to final format
     cache_data["by_lead_time_by_valid_hour"] = {}
@@ -3438,6 +3941,27 @@ def precompute_verification_cache() -> dict:
                         }
                     else:
                         entry[var] = {'mae': None, 'bias': None, **({'wmae': None} if _is_precip_var(var) else {})}
+    # Kenny by_lead_time_by_valid_hour: all 5 vars from kenny stats
+    cache_data["by_lead_time_by_valid_hour"]['kenny'] = {}
+    for lt in lead_times:
+        lt_str = str(lt)
+        cache_data["by_lead_time_by_valid_hour"]['kenny'][lt_str] = {}
+        for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
+            for vh_str, stats in hourly_aggregated_stats['kenny'][var][lt_str].items():
+                if vh_str not in cache_data["by_lead_time_by_valid_hour"]['kenny'][lt_str]:
+                    cache_data["by_lead_time_by_valid_hour"]['kenny'][lt_str][vh_str] = {}
+                entry = cache_data["by_lead_time_by_valid_hour"]['kenny'][lt_str][vh_str]
+                if stats['count'] > 0:
+                    mae = stats['sum_abs_errors'] / stats['count']
+                    var_entry = {
+                        'mae': round(mae, 2),
+                        'bias': round(stats['sum_errors'] / stats['count'], 2),
+                    }
+                    if _is_precip_var(var):
+                        var_entry['wmae'] = round(_stats_wmae(stats, fallback_mae=mae), 2)
+                    entry[var] = var_entry
+                else:
+                    entry[var] = {'mae': None, 'bias': None, **({'wmae': None} if _is_precip_var(var) else {})}
 
     # Convert station_hourly_stats to final format - by_station_by_valid_hour
     # (covers fresh/non-accumulated runs; grows over time as runs remain unaccumulated)
@@ -3467,6 +3991,32 @@ def precompute_verification_cache() -> dict:
 
     # Add time series data to cache
     cache_data["time_series"] = time_series_data
+
+    # Compute and store Kenny station biases so they don't need recomputation on startup
+    logger.info("Computing Kenny station biases for cache...")
+    try:
+        temp_sb, temp_gb = _compute_kenny_station_biases(db, "temp")
+        dew_sb, dew_gb = _compute_kenny_station_biases(db, "dewpoint")
+        cache_data["kenny_biases"] = {
+            "temp": {"station": temp_sb, "global": {str(k): v for k, v in temp_gb.items()}},
+            "dewpoint": {"station": dew_sb, "global": {str(k): v for k, v in dew_gb.items()}},
+        }
+        logger.info(f"Kenny biases computed for {len(temp_sb)} stations")
+    except Exception as e:
+        logger.error(f"Failed to compute Kenny biases for cache: {e}")
+
+    # Compute per-station winner percentages for the time series charts
+    logger.info("Computing per-station winner percentages for time series...")
+    try:
+        winner_pcts = _compute_ts_winner_pcts(
+            db, lead_times, accumulated_run_keys, get_cached_observation,
+            temp_sb, temp_gb, dew_sb, dew_gb
+        )
+        cache_data["winner_pcts"] = winner_pcts
+        logger.info("Per-station winner percentages computed")
+    except Exception as e:
+        import traceback
+        logger.error(f"Failed to compute winner percentages: {e}\n{traceback.format_exc()}")
 
     # Save to file (atomic write — never leave the cache in a half-written state)
     try:
@@ -3509,6 +4059,169 @@ def load_verification_cache() -> Optional[dict]:
     except Exception as e:
         logger.error(f"Error loading verification cache: {e}")
         return None
+
+
+def _compute_ts_winner_pcts(db, lead_times, skip_run_keys, get_cached_obs_fn,
+                            kenny_temp_sb, kenny_temp_gb, kenny_dew_sb, kenny_dew_gb):
+    """
+    Compute per-station winner percentages for each (var, lt, date).
+
+    For each day in the time series and each (variable, lead_time) combination,
+    determines what % of ASOS stations each model won (had the lowest MAE).
+    Processes one (var, lt) at a time to keep peak memory bounded.
+
+    Returns:
+        {var: {lt_str: {date_str: {model: pct_float}}}}
+    """
+    runs = db.get("runs", {})
+    stations = db.get("stations", {})
+    now = datetime.now(timezone.utc)
+
+    var_map = {
+        'temp': ('temps', 'temp'),
+        'mslp': ('mslps', 'mslp'),
+        'precip': ('precips', 'precip_6hr'),
+        'precip_24hr': ('precips_24hr', 'precip_24hr'),
+        'dewpoint': ('dewpoints', 'dewpoint'),
+    }
+
+    all_models = ['gfs', 'aifs', 'ifs', 'nws', 'kenny']
+    N = len(all_models)
+    model_idx = {m: i for i, m in enumerate(all_models)}
+
+    result = {}  # {var: {lt_str: {date: {model: pct}}}}
+
+    for var in var_map:
+        result[var] = {}
+        fcst_key, obs_key = var_map[var]
+
+        for lt in lead_times:
+            lt_str = str(lt)
+            # Compact per-station-date accumulator for this (var, lt):
+            # key=(date_key, station_id) → list of N sum_abs_errors + N counts
+            station_date = {}
+
+            for run_key, run_data in runs.items():
+                if skip_run_keys and run_key in skip_run_keys:
+                    continue
+                try:
+                    init_time = datetime.fromisoformat(run_key)
+                    if init_time.tzinfo is None:
+                        init_time = init_time.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+
+                forecast_hours = run_data.get("forecast_hours", [])
+                if lt not in forecast_hours:
+                    continue
+
+                fcst_idx = forecast_hours.index(lt)
+                valid_time = init_time + timedelta(hours=lt)
+                if valid_time >= now:
+                    continue
+
+                date_key = valid_time.date().isoformat()
+                valid_hour = valid_time.hour
+                qualifying_precip, qualifying_precip_24hr = _qualifying_precip_sets(run_data, stations)
+
+                # Standard models
+                for model in ['gfs', 'aifs', 'ifs', 'nws']:
+                    model_data = run_data.get(model, {})
+                    mi = model_idx[model]
+                    for station_id, fcst_data in model_data.items():
+                        if station_id not in stations:
+                            continue
+                        obs = get_cached_obs_fn(station_id, valid_time)
+                        if not obs:
+                            continue
+                        fcst_values = fcst_data.get(fcst_key, [])
+                        if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                            continue
+                        if obs.get(obs_key) is None:
+                            continue
+                        fcst_val = fcst_values[fcst_idx]
+                        obs_val = obs[obs_key]
+                        if var == 'precip' and (station_id, fcst_idx) not in qualifying_precip and obs_val < 0.01:
+                            continue
+                        if var == 'precip_24hr' and (station_id, fcst_idx) not in qualifying_precip_24hr and obs_val < 0.01:
+                            continue
+                        abs_error = abs(fcst_val - obs_val)
+                        k = (date_key, station_id)
+                        if k not in station_date:
+                            station_date[k] = [0.0] * N + [0] * N
+                        station_date[k][mi] += abs_error
+                        station_date[k][N + mi] += 1
+
+                # Kenny (AIFS + bias correction)
+                aifs_run_data = run_data.get('aifs', {})
+                mi = model_idx['kenny']
+                for station_id, fcst_data in aifs_run_data.items():
+                    if station_id not in stations:
+                        continue
+                    obs = get_cached_obs_fn(station_id, valid_time)
+                    if not obs:
+                        continue
+                    fcst_values = fcst_data.get(fcst_key, [])
+                    if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                        continue
+                    if obs.get(obs_key) is None:
+                        continue
+                    raw_fcst = fcst_values[fcst_idx]
+                    obs_val = obs[obs_key]
+                    if var == 'precip' and (station_id, fcst_idx) not in qualifying_precip and obs_val < 0.01:
+                        continue
+                    if var == 'precip_24hr' and (station_id, fcst_idx) not in qualifying_precip_24hr and obs_val < 0.01:
+                        continue
+                    if var == 'temp':
+                        sbias = (kenny_temp_sb.get(station_id) or {}).get(valid_hour)
+                        kenny_fcst = raw_fcst - (sbias if sbias is not None else kenny_temp_gb.get(valid_hour, 0.0))
+                    elif var == 'dewpoint':
+                        sbias = (kenny_dew_sb.get(station_id) or {}).get(valid_hour)
+                        kenny_fcst = raw_fcst - (sbias if sbias is not None else kenny_dew_gb.get(valid_hour, 0.0))
+                    else:
+                        kenny_fcst = raw_fcst
+                    abs_error = abs(kenny_fcst - obs_val)
+                    k = (date_key, station_id)
+                    if k not in station_date:
+                        station_date[k] = [0.0] * N + [0] * N
+                    station_date[k][mi] += abs_error
+                    station_date[k][N + mi] += 1
+
+            # Group by date and compute winner percentages
+            date_groups = {}
+            for (date_key, station_id), data in station_date.items():
+                if date_key not in date_groups:
+                    date_groups[date_key] = []
+                date_groups[date_key].append(data)
+
+            lt_pcts = {}
+            for date_key, entries in date_groups.items():
+                model_wins = [0] * N
+                total = 0
+                for data in entries:
+                    maes = [(i, data[i] / data[N + i]) for i in range(N) if data[N + i] > 0]
+                    if len(maes) < 2:
+                        continue
+                    min_mae = min(m[1] for m in maes)
+                    winners = [m[0] for m in maes if m[1] == min_mae]
+                    if len(winners) == 1:
+                        model_wins[winners[0]] += 1
+                    total += 1
+                if total > 0:
+                    lt_pcts[date_key] = {all_models[i]: round(100 * model_wins[i] / total, 1) for i in range(N)}
+
+            result[var][lt_str] = lt_pcts
+            station_date.clear()
+
+    return result
+
+
+def get_winner_pcts_from_cache(variable: str, lead_time: int) -> dict:
+    """Return {date_str: {model: pct}} for the given variable/lead_time."""
+    cache = load_verification_cache()
+    if cache is None:
+        return {}
+    return cache.get("winner_pcts", {}).get(variable, {}).get(str(lead_time), {})
 
 
 def precompute_verification_time_series(db: dict, lead_times: list, days_back: int = None, obs_cache: dict = None, get_cached_obs_fn=None, skip_run_keys: dict = None) -> dict:
@@ -3555,10 +4268,11 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'ifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'nws': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
+        'kenny': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
     }
 
     # Initialize for all lead times
-    for model in ['gfs', 'aifs', 'ifs', 'nws']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws', 'kenny']:
         for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
             for lt in lead_times:
                 time_series[model][var][lt] = {}
@@ -3593,6 +4307,18 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
                                 "sum_weights": 0.0,
                             }
                     time_series[model][var][lt] = merged
+
+    # Kenny: inherit AIFS cumulative for mslp/precip/precip_24hr (identical, no bias correction)
+    # temp/dewpoint: start empty — only fresh runs have bias-corrected Kenny values
+    for var in ['mslp', 'precip', 'precip_24hr']:
+        for lt in lead_times:
+            aifs_daily = time_series['aifs'][var][lt]
+            if aifs_daily:
+                time_series['kenny'][var][lt] = {k: dict(v) for k, v in aifs_daily.items()}
+
+    # Precompute Kenny biases once for the fresh-run time series loop below
+    kenny_temp_sb, kenny_temp_gb = _compute_kenny_station_biases(db, 'temp')
+    kenny_dew_sb, kenny_dew_gb = _compute_kenny_station_biases(db, 'dewpoint')
 
     # Collect errors by date from current runs (skip mature runs already in cumulative)
     for run_key, run_data in runs.items():
@@ -3679,15 +4405,83 @@ def precompute_verification_time_series(db: dict, lead_times: list, days_back: i
                             daily["sum_weighted_abs_errors"] += abs(error) * weight
                             daily["sum_weights"] += weight
 
+        # Kenny fresh-run block: AIFS forecasts with bias-corrected temp/dewpoint
+        aifs_model_data = run_data.get('aifs')
+        if aifs_model_data:
+            for lt in lead_times:
+                if lt not in forecast_hours:
+                    continue
+                fcst_idx = forecast_hours.index(lt)
+                valid_time = init_time + timedelta(hours=lt)
+                if valid_time >= now:
+                    continue
+                date_key = valid_time.date().isoformat()
+                valid_hour = valid_time.hour
+
+                for station_id, fcst_data in aifs_model_data.items():
+                    if station_id not in stations:
+                        continue
+
+                    if get_cached_obs_fn:
+                        obs = get_cached_obs_fn(station_id, valid_time)
+                    else:
+                        obs = get_stored_observation(db, station_id, valid_time)
+                    if not obs:
+                        continue
+
+                    for var, (fcst_key, obs_key) in var_map.items():
+                        fcst_values = fcst_data.get(fcst_key, [])
+                        if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                            continue
+                        if obs.get(obs_key) is None:
+                            continue
+
+                        raw_fcst = fcst_values[fcst_idx]
+                        obs_val = obs[obs_key]
+                        if var == 'precip' and (station_id, fcst_idx) not in qualifying_precip and obs_val < 0.01:
+                            continue
+                        if var == 'precip_24hr' and (station_id, fcst_idx) not in qualifying_precip_24hr and obs_val < 0.01:
+                            continue
+
+                        # Apply bias correction for temp/dewpoint; raw for others
+                        if var == 'temp':
+                            station_bias = (kenny_temp_sb.get(station_id) or {}).get(valid_hour)
+                            kenny_fcst = raw_fcst - (station_bias if station_bias is not None else kenny_temp_gb.get(valid_hour, 0.0))
+                        elif var == 'dewpoint':
+                            station_bias = (kenny_dew_sb.get(station_id) or {}).get(valid_hour)
+                            kenny_fcst = raw_fcst - (station_bias if station_bias is not None else kenny_dew_gb.get(valid_hour, 0.0))
+                        else:
+                            kenny_fcst = raw_fcst
+
+                        error = kenny_fcst - obs_val
+
+                        if date_key not in time_series['kenny'][var][lt]:
+                            time_series['kenny'][var][lt][date_key] = {
+                                "sum_abs_errors": 0.0,
+                                "sum_errors": 0.0,
+                                "count": 0,
+                                "sum_weighted_abs_errors": 0.0,
+                                "sum_weights": 0.0,
+                            }
+                        daily = time_series['kenny'][var][lt][date_key]
+                        daily["sum_abs_errors"] += abs(error)
+                        daily["sum_errors"] += error
+                        daily["count"] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            daily["sum_weighted_abs_errors"] += abs(error) * weight
+                            daily["sum_weights"] += weight
+
     # Convert to final format with MAE/bias per day
     result = {
         'gfs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'aifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'ifs': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
         'nws': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
+        'kenny': {'temp': {}, 'mslp': {}, 'precip': {}, 'precip_24hr': {}, 'dewpoint': {}},
     }
 
-    for model in ['gfs', 'aifs', 'ifs', 'nws']:
+    for model in ['gfs', 'aifs', 'ifs', 'nws', 'kenny']:
         for var in ['temp', 'mslp', 'precip', 'precip_24hr', 'dewpoint']:
             for lt in lead_times:
                 errors_by_date = time_series[model][var][lt]
@@ -3758,7 +4552,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
             lt: {
                 "temp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
                 "mslp": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
-                "precip": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
+                "precip": {"sum_abs": 0.0, "sum": 0.0, "count": 0, "sum_weighted_abs": 0.0, "sum_weights": 0.0},
                 "dewpoint": {"sum_abs": 0.0, "sum": 0.0, "count": 0},
             }
             for lt in lead_times
@@ -3814,6 +4608,9 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
                         stats[lt]["precip"]["sum_abs"] += abs(err)
                         stats[lt]["precip"]["sum"] += err
                         stats[lt]["precip"]["count"] += 1
+                        w = _precip_weight(ov)
+                        stats[lt]["precip"]["sum_weighted_abs"] += abs(err) * w
+                        stats[lt]["precip"]["sum_weights"] += w
 
                 dewpoints = fcst_data.get("dewpoints", [])
                 if i < len(dewpoints) and dewpoints[i] is not None and obs.get("dewpoint") is not None:
@@ -3828,7 +4625,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
 
         temp_mae, temp_bias = [], []
         mslp_mae, mslp_bias = [], []
-        precip_mae, precip_bias = [], []
+        precip_mae, precip_wmae, precip_bias = [], [], []
         dewpoint_mae, dewpoint_bias = [], []
 
         for lt in lead_times:
@@ -3845,6 +4642,15 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
                 else:
                     mae_out.append(None)
                     bias_out.append(None)
+            # WMAE for precip
+            c = stats[lt]["precip"]["count"]
+            sw = stats[lt]["precip"]["sum_weights"]
+            if c > 0 and sw > 0:
+                precip_wmae.append(round(stats[lt]["precip"]["sum_weighted_abs"] / sw, 2))
+            elif c > 0:
+                precip_wmae.append(precip_mae[-1])
+            else:
+                precip_wmae.append(None)
 
         return {
             "station": station,
@@ -3854,6 +4660,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
             "mslp_mae": mslp_mae,
             "mslp_bias": mslp_bias,
             "precip_mae": precip_mae,
+            "precip_wmae": precip_wmae,
             "precip_bias": precip_bias,
             "dewpoint_mae": dewpoint_mae,
             "dewpoint_bias": dewpoint_bias,
@@ -3885,6 +4692,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
     mslp_mae = []
     mslp_bias = []
     precip_mae = []
+    precip_wmae = []
     precip_bias = []
     dewpoint_mae = []
     dewpoint_bias = []
@@ -3913,10 +4721,17 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
         precip_stats = model_data.get("precip", {}).get(lt_str)
         if precip_stats and precip_stats.get("count", 0) > 0:
             count = precip_stats["count"]
-            precip_mae.append(round(precip_stats["sum_abs_errors"] / count, 2))
-            precip_bias.append(_bias_corrected_metric_value(model, "precip_bias", precip_mae[-1], round(precip_stats["sum_errors"] / count, 2)))
+            mae = round(precip_stats["sum_abs_errors"] / count, 2)
+            precip_mae.append(mae)
+            precip_bias.append(_bias_corrected_metric_value(model, "precip_bias", mae, round(precip_stats["sum_errors"] / count, 2)))
+            sw = precip_stats.get("sum_weights", 0.0) or 0.0
+            if sw > 0:
+                precip_wmae.append(round((precip_stats.get("sum_weighted_abs_errors", 0.0) or 0.0) / sw, 2))
+            else:
+                precip_wmae.append(mae)
         else:
             precip_mae.append(None)
+            precip_wmae.append(None)
             precip_bias.append(None)
 
         dewpoint_stats = model_data.get("dewpoint", {}).get(lt_str)
@@ -3936,6 +4751,7 @@ def get_station_detail_monthly(station_id: str, model: str, days_back: int = MON
         "mslp_mae": mslp_mae,
         "mslp_bias": mslp_bias,
         "precip_mae": precip_mae,
+        "precip_wmae": precip_wmae,
         "precip_bias": precip_bias,
         "dewpoint_mae": dewpoint_mae,
         "dewpoint_bias": dewpoint_bias,
@@ -4047,8 +4863,8 @@ def get_verification_data_from_cache(
         Dict mapping station_id to verification data (same format as get_verification_data)
     """
     source_model = _source_model_for_verification(model)
-    if _is_kenny_bias_corrected_var(model, variable):
-        return get_verification_data(model, variable, lead_time_hours, valid_hour=valid_hour)
+    # Use model key directly for cache lookups so 'kenny' reads from 'kenny' cache section
+    cache_model = model.lower() if model else source_model
     if source_model == 'nws' and lead_time_hours > 168:
         return {}
 
@@ -4065,7 +4881,7 @@ def get_verification_data_from_cache(
     if valid_hour is not None:
         vh_str = str(valid_hour)
         for station_id, model_data in cache.get("by_station_by_valid_hour", {}).items():
-            var_data = model_data.get(source_model, {}).get(lt_str, {}).get(vh_str, {}).get(variable)
+            var_data = model_data.get(cache_model, {}).get(lt_str, {}).get(vh_str, {}).get(variable)
             if var_data:
                 station_info = stations_info.get(station_id, {})
                 wmae = var_data.get('wmae')
@@ -4085,7 +4901,7 @@ def get_verification_data_from_cache(
                 }
     else:
         for station_id, station_data in cache.get("by_station", {}).items():
-            model_data = station_data.get(source_model, {})
+            model_data = station_data.get(cache_model, {})
             lt_data = model_data.get(lt_str, {})
             var_data = lt_data.get(variable)
 
@@ -4432,6 +5248,10 @@ def rebuild_monthly_station_cache(days_back: int = 20) -> None:
         'dewpoint': ('dewpoints', 'dewpoint'),
     }
 
+    # Precompute Kenny biases once for the bias-corrected monthly stats below
+    kenny_temp_sb, kenny_temp_gb = _compute_kenny_station_biases_cached(db, 'temp')
+    kenny_dew_sb, kenny_dew_gb = _compute_kenny_station_biases_cached(db, 'dewpoint')
+
     for run_key, run_data in runs.items():
         try:
             init_time = datetime.fromisoformat(run_key)
@@ -4527,6 +5347,82 @@ def rebuild_monthly_station_cache(days_back: int = 20) -> None:
                                 vh_stats['sum_weighted_abs_errors'] += abs(error) * weight
                                 vh_stats['sum_weights'] += weight
 
+            # Kenny: AIFS forecasts with bias-corrected temp/dewpoint
+            aifs_run_data = run_data.get('aifs')
+            if aifs_run_data:
+                valid_hour = valid_time.hour
+                for station_id, fcst_data in aifs_run_data.items():
+                    if station_id not in stations:
+                        continue
+
+                    # Reuse obs already fetched for the other models; fall back to fresh lookup
+                    obs = obs_for_time.get(station_id)
+                    if obs is None:
+                        obs = fast_get_obs(station_id, valid_time)
+                        obs_for_time[station_id] = obs
+                    if obs is None:
+                        continue
+
+                    for var, (fcst_key, obs_key) in var_map.items():
+                        fcst_values = fcst_data.get(fcst_key, [])
+                        if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                            continue
+                        obs_val = obs.get(obs_key)
+                        if obs_val is None:
+                            continue
+
+                        raw_fcst = fcst_values[fcst_idx]
+                        if var == 'precip' and (station_id, fcst_idx) not in qualifying_precip and obs_val < 0.01:
+                            continue
+                        if var == 'precip_24hr' and (station_id, fcst_idx) not in qualifying_precip_24hr and obs_val < 0.01:
+                            continue
+
+                        # Apply bias correction for temp/dewpoint; raw for others
+                        if var == 'temp':
+                            station_bias = (kenny_temp_sb.get(station_id) or {}).get(valid_hour)
+                            kenny_fcst = raw_fcst - (station_bias if station_bias is not None else kenny_temp_gb.get(valid_hour, 0.0))
+                        elif var == 'dewpoint':
+                            station_bias = (kenny_dew_sb.get(station_id) or {}).get(valid_hour)
+                            kenny_fcst = raw_fcst - (station_bias if station_bias is not None else kenny_dew_gb.get(valid_hour, 0.0))
+                        else:
+                            kenny_fcst = raw_fcst
+
+                        error = kenny_fcst - obs_val
+
+                        monthly.setdefault(station_id, {}).setdefault('kenny', {}).setdefault(var, {}).setdefault(
+                            lt_str, {
+                                'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0
+                            }
+                        )
+                        stats = monthly[station_id]['kenny'][var][lt_str]
+                        stats['sum_abs_errors'] += abs(error)
+                        stats['sum_errors'] += error
+                        stats['count'] += 1
+                        if _is_precip_var(var):
+                            weight = _precip_weight(obs_val)
+                            stats['sum_weighted_abs_errors'] += abs(error) * weight
+                            stats['sum_weights'] += weight
+
+                        # Also accumulate by valid hour, snapping to nearest canonical lt
+                        snapped_lt = _snap_lt(lead_time_hours)
+                        if snapped_lt is not None:
+                            vh_str = str(valid_hour)
+                            snapped_lt_str = str(snapped_lt)
+                            monthly_vh.setdefault(station_id, {}).setdefault('kenny', {}).setdefault(var, {}).setdefault(
+                                snapped_lt_str, {}).setdefault(vh_str, {
+                                    'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0,
+                                    'sum_weighted_abs_errors': 0.0, 'sum_weights': 0.0
+                                })
+                            vh_stats = monthly_vh[station_id]['kenny'][var][snapped_lt_str][vh_str]
+                            vh_stats['sum_abs_errors'] += abs(error)
+                            vh_stats['sum_errors'] += error
+                            vh_stats['count'] += 1
+                            if _is_precip_var(var):
+                                weight = _precip_weight(obs_val)
+                                vh_stats['sum_weighted_abs_errors'] += abs(error) * weight
+                                vh_stats['sum_weights'] += weight
+
     save_monthly_stats_cache({
         "by_station_monthly": monthly,
         "by_station_monthly_by_valid_hour": monthly_vh,
@@ -4554,8 +5450,8 @@ def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = Non
         return get_mean_verification_by_lead_time(model)
 
     source_model = _source_model_for_verification(model)
-    if (model or "").lower() == "kenny":
-        return get_mean_verification_by_lead_time(model, valid_hour=valid_hour)
+    # Use model key directly so 'kenny' reads from 'kenny' cache section
+    cache_model = (model or source_model).lower()
     lead_times = cache.get("lead_times", [])
     nws_max_lead = 168 if source_model == 'nws' else None
 
@@ -4577,7 +5473,7 @@ def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = Non
 
     if valid_hour is not None:
         vh_str = str(valid_hour)
-        model_vh_data = cache.get("by_lead_time_by_valid_hour", {}).get(source_model, {})
+        model_vh_data = cache.get("by_lead_time_by_valid_hour", {}).get(cache_model, {})
         for lt in lead_times:
             lt_str = str(lt)
             if nws_max_lead is not None and lt > nws_max_lead:
@@ -4609,7 +5505,7 @@ def get_mean_verification_from_cache(model: str, valid_hour: Optional[int] = Non
         return result
 
     # All hours — use existing by_lead_time data
-    model_data = cache.get("by_lead_time", {}).get(source_model, {})
+    model_data = cache.get("by_lead_time", {}).get(cache_model, {})
     for lt in lead_times:
         lt_str = str(lt)
         lt_data = model_data.get(lt_str, {})
@@ -4653,10 +5549,16 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         valid_hour: Optional UTC hour filter (0, 6, 12, 18). None = all hours.
     """
     source_model = _source_model_for_verification(model)
-    if (model or "").lower() == "kenny":
-        return get_mean_verification_by_lead_time(model, valid_hour=valid_hour, days_back=MONTHLY_WINDOW_DAYS)
+    # 'kenny' reads from 'kenny' key in monthly cache; old cache falls back to 'aifs'
+    cache_model = (model or source_model).lower()
     monthly_cache = load_monthly_stats_cache()
     nws_max_lead = 168 if source_model == 'nws' else None
+
+    # If monthly cache has no Kenny data yet, fall back to live computation (first run after upgrade)
+    if cache_model == 'kenny':
+        sample_station = next(iter(monthly_cache.get("by_station_monthly", {}).values()), {})
+        if 'kenny' not in sample_station:
+            return get_mean_verification_by_lead_time(model, valid_hour=valid_hour, days_back=MONTHLY_WINDOW_DAYS)
 
     canonical_lead_times = set(list(range(6, 25, 6)) + list(range(48, 361, 24)))
 
@@ -4667,7 +5569,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         # Collect lead times that have data for this model and valid hour
         lead_times = set()
         for station_data in monthly_vh_all.values():
-            model_data = station_data.get(source_model, {})
+            model_data = station_data.get(cache_model, station_data.get(source_model, {}))
             for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
                 for lt_str, vh_data in model_data.get(var, {}).items():
                     if vh_str in vh_data:
@@ -4697,7 +5599,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
             acc = {"temp": _init_acc(), "mslp": _init_acc(), "precip": _init_acc(), "precip_24hr": _init_acc(), "dewpoint": _init_acc()}
 
             for station_data in monthly_vh_all.values():
-                model_data = station_data.get(source_model, {})
+                model_data = station_data.get(cache_model, station_data.get(source_model, {}))
                 for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
                     stats = model_data.get(var, {}).get(lt_str, {}).get(vh_str)
                     if not stats or stats.get("count", 0) <= 0:
@@ -4739,7 +5641,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
     # Collect lead times available for this model, restricted to canonical set
     lead_times = set()
     for station_data in monthly.values():
-        model_data = station_data.get(source_model, {})
+        model_data = station_data.get(cache_model, station_data.get(source_model, {}))
         for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
             lead_times.update({int(k) for k in model_data.get(var, {}).keys()})
 
@@ -4778,7 +5680,7 @@ def get_mean_verification_from_monthly_cache(model: str, valid_hour: Optional[in
         }
 
         for station_data in monthly.values():
-            model_data = station_data.get(source_model, {})
+            model_data = station_data.get(cache_model, station_data.get(source_model, {}))
             for var in ["temp", "mslp", "precip", "precip_24hr", "dewpoint"]:
                 stats = model_data.get(var, {}).get(lt_str)
                 if not stats or stats.get("count", 0) <= 0:
@@ -4842,12 +5744,11 @@ def get_verification_time_series_from_cache(
         return get_verification_time_series(model, variable, lead_time_hours, days_back)
 
     source_model = _source_model_for_verification(model)
-    if _is_kenny_bias_corrected_var(model, variable):
-        return get_verification_time_series(model, variable, lead_time_hours, days_back)
+    cache_model = (model or source_model).lower()
 
-    # Extract from cache
+    # Extract from cache — for Kenny, try 'kenny' key first (all vars), fall back to 'aifs'
     time_series = cache.get("time_series", {})
-    model_data = time_series.get(source_model, {})
+    model_data = time_series.get(cache_model, time_series.get(source_model, {}))
     var_data = model_data.get(variable, {})
     lt_data = var_data.get(str(lead_time_hours))
 
@@ -5291,4 +6192,654 @@ def sync_asos_metar_pressure(lookback_hours: int = 28) -> dict:
     return {
         "status": "success",
         "stations_updated": updated_count,
+    }
+
+
+# ============================================================================
+# Single-Event Verification (per-date queries)
+# ============================================================================
+
+def get_single_event_available_dates(db: dict) -> list[str]:
+    """
+    Return sorted list of unique valid-time dates covered by runs in db["runs"].
+
+    For each run, valid times span from init + 6h to init + max_forecast_hour.
+    We return the dates of those valid times so the UI can constrain date pickers.
+    """
+    date_set: set[str] = set()
+    runs = db.get("runs", {})
+    for run_key, run_data in runs.items():
+        try:
+            init_time = datetime.fromisoformat(run_key)
+            if init_time.tzinfo is None:
+                init_time = init_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        forecast_hours = run_data.get("forecast_hours") or []
+        for fh in forecast_hours:
+            valid_time = init_time + timedelta(hours=fh)
+            date_set.add(valid_time.strftime("%Y-%m-%d"))
+    return sorted(date_set)
+
+
+def get_single_event_verification(
+    db: dict,
+    date_str: str,
+    lead_time_hours: int,
+    model: str,
+    valid_hour: int | None = None,
+    include_obs: bool = False,
+) -> dict:
+    """
+    Compute MAE/bias per station for synoptic times on a single date at a given lead time.
+
+    If valid_hour is given (0, 6, 12, or 18), only that synoptic time is processed.
+    Otherwise all four synoptic times (00/06/12/18Z) are included and averaged.
+
+    If include_obs is True, the first observed value for each variable is included in the
+    output (useful for offline exports that need to reconstruct forecast values).
+
+    Returns:
+        {station_id: {variables: {var: {mae, bias, count[, obs]}}, lat, lon, name, state}}
+    """
+    from bisect import bisect_left, bisect_right
+
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        date_objs = [date_obj]
+    except ValueError:
+        return {}
+
+    source_model = _source_model_for_verification(model)
+    stations = db.get("stations", {})
+    runs = db.get("runs", {})
+    if not stations:
+        return {}
+
+    if _is_kenny_bias_corrected_var(model, 'temp'):
+        kenny_station_biases_temp, kenny_global_bias_temp = _compute_kenny_station_biases_cached(db, 'temp')
+        kenny_station_biases_dew, kenny_global_bias_dew = _compute_kenny_station_biases_cached(db, 'dewpoint')
+    else:
+        kenny_station_biases_temp = kenny_global_bias_temp = None
+        kenny_station_biases_dew = kenny_global_bias_dew = None
+
+    var_map = {
+        'temp':       ('temps',       'temp'),
+        'mslp':       ('mslps',       'mslp'),
+        'precip':     ('precips',     'precip_6hr'),
+        'precip_24hr':('precips_24hr','precip_24hr'),
+        'dewpoint':   ('dewpoints',   'dewpoint'),
+    }
+
+    TOL = timedelta(minutes=30)
+
+    # -----------------------------------------------------------------------
+    # Build a per-station sorted obs index, filtered to the narrow time window
+    # we actually care about.  This is O(total_obs_in_window) once, vs O(n)
+    # per station per synoptic-time in the original approach.
+    #
+    # Window: 6.5h before first synoptic time (for precip_6hr look-back) to
+    # 30 min after the last.
+    # -----------------------------------------------------------------------
+    synoptic_hours = [valid_hour] if valid_hour is not None else [0, 6, 12, 18]
+    obs_window_start = date_obj.replace(hour=0) - timedelta(hours=6, minutes=30)
+    obs_window_end   = date_obj.replace(hour=18) + timedelta(minutes=30)
+
+    all_observations = db.get("observations", {})
+    station_sorted_obs: dict = {}  # station_id -> [(datetime, obs_data), ...]
+
+    for sid, station_obs in all_observations.items():
+        entries = []
+        for ts_str, obs_data in station_obs.items():
+            try:
+                t = datetime.fromisoformat(ts_str)
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                if obs_window_start <= t <= obs_window_end:
+                    entries.append((t, obs_data))
+            except ValueError:
+                continue
+        if entries:
+            entries.sort(key=lambda x: x[0])
+            station_sorted_obs[sid] = entries
+
+    # -----------------------------------------------------------------------
+    # Fast composite obs lookup: O(log n + candidates) per call using bisect.
+    # -----------------------------------------------------------------------
+    def fast_composite_obs(sid: str, target_time: datetime) -> Optional[dict]:
+        obs_list = station_sorted_obs.get(sid)
+        if not obs_list:
+            return None
+        times = [o[0] for o in obs_list]
+        lo = bisect_left(times, target_time - TOL)
+        hi = bisect_right(times, target_time + TOL)
+        if lo >= hi:
+            return None
+
+        best_temp   = (None, TOL + timedelta(seconds=1))
+        best_mslp   = (None, TOL + timedelta(seconds=1))
+        best_precip = (None, TOL + timedelta(seconds=1))
+        best_dew    = (None, TOL + timedelta(seconds=1))
+
+        for i in range(lo, hi):
+            t, obs_data = obs_list[i]
+            delta = abs(t - target_time)
+            v = obs_data.get('temp')
+            if v is not None and delta < best_temp[1]:
+                best_temp = (v, delta)
+            v = obs_data.get('mslp')
+            if v is not None and delta < best_mslp[1]:
+                best_mslp = (v, delta)
+            v = obs_data.get('precip')
+            if v is not None and delta < best_precip[1]:
+                best_precip = (v, delta)
+            v = obs_data.get('dewpoint')
+            if v is not None and delta < best_dew[1]:
+                best_dew = (v, delta)
+
+        if all(x[0] is None for x in (best_temp, best_mslp, best_precip, best_dew)):
+            return None
+        return {
+            'temp':     best_temp[0],
+            'mslp':     best_mslp[0],
+            'precip':   best_precip[0],
+            'dewpoint': best_dew[0],
+        }
+
+    # -----------------------------------------------------------------------
+    # Fast 6-hour precip: reuses the pre-built obs index instead of rescanning.
+    # -----------------------------------------------------------------------
+    def fast_6hr_precip(sid: str, end_time: datetime) -> Optional[float]:
+        if sid in PRECIP_EXCLUDE_STATIONS:
+            return None
+        obs_list = station_sorted_obs.get(sid)
+        if not obs_list:
+            return None
+        start_time = end_time - timedelta(hours=6)
+        times = [o[0] for o in obs_list]
+        lo = bisect_right(times, start_time)
+        hi = bisect_right(times, end_time)
+        if lo >= hi:
+            return None
+
+        window_obs = []
+        for i in range(lo, hi):
+            t, obs_data = obs_list[i]
+            p = obs_data.get('precip')
+            if p is not None and not _is_implausible_precip_value(sid, p):
+                window_obs.append((t, p))
+        if not window_obs:
+            return None
+
+        window_obs = [(t, p) for t, p in window_obs if not _is_overflow_value(p)]
+        if not window_obs:
+            return None
+
+        # Stuck-gauge detection
+        stuck_times: set = set()
+        for i in range(len(window_obs) - 1):
+            v0, v1 = window_obs[i][1], window_obs[i + 1][1]
+            if v0 > 0 and v0 == v1:
+                j = i
+                while j < len(window_obs) and window_obs[j][1] == v0:
+                    stuck_times.add(window_obs[j][0])
+                    j += 1
+
+        hourly_max: dict = {}
+        for t, p in window_obs:
+            if t in stuck_times:
+                continue
+            hk = t.replace(minute=0, second=0, microsecond=0)
+            if hk not in hourly_max or p > hourly_max[hk]:
+                hourly_max[hk] = p
+        if not hourly_max:
+            return None
+        total = sum(hourly_max.values())
+        if sid in PRECIP_MM_STATIONS:
+            total /= 25.4
+        return total
+
+    # -----------------------------------------------------------------------
+    # Main verification loop — obs lookups are now fast dict/bisect operations.
+    # -----------------------------------------------------------------------
+    station_stats: dict = {}
+
+    for synoptic_h in synoptic_hours:
+        valid_time = date_obj.replace(hour=synoptic_h)
+        init_time  = valid_time - timedelta(hours=lead_time_hours)
+        run_key    = init_time.isoformat()
+
+        run_data = runs.get(run_key)
+        if run_data is None:
+            run_key_naive = init_time.replace(tzinfo=None).isoformat()
+            run_data = runs.get(run_key_naive)
+        if run_data is None:
+            continue
+
+        forecast_hours = run_data.get("forecast_hours", [])
+        if lead_time_hours not in forecast_hours:
+            continue
+        fcst_idx = forecast_hours.index(lead_time_hours)
+
+        model_data = run_data.get(source_model)
+        if not model_data:
+            continue
+
+        for station_id, fcst_data in model_data.items():
+            if station_id not in stations:
+                continue
+
+            composite = fast_composite_obs(station_id, valid_time)
+            if composite is None:
+                continue
+
+            # Add 6hr precip to composite (all synoptic hours are % 6 == 0)
+            composite['precip_6hr'] = fast_6hr_precip(station_id, valid_time)
+            composite['precip_24hr'] = None  # not needed for single-event map
+
+            if station_id not in station_stats:
+                station_stats[station_id] = {}
+
+            for var, (fcst_key, obs_key) in var_map.items():
+                fcst_values = fcst_data.get(fcst_key, [])
+                if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                    continue
+                raw_fcst = fcst_values[fcst_idx]
+
+                if var == 'temp':
+                    fcst_val = _apply_model_value_adjustment(
+                        model, var, station_id, valid_time, raw_fcst,
+                        kenny_station_biases_temp, kenny_global_bias_temp
+                    )
+                elif var == 'dewpoint':
+                    fcst_val = _apply_model_value_adjustment(
+                        model, var, station_id, valid_time, raw_fcst,
+                        kenny_station_biases_dew, kenny_global_bias_dew
+                    )
+                else:
+                    fcst_val = raw_fcst
+
+                if fcst_val is None:
+                    continue
+                obs_val = composite.get(obs_key)
+                if obs_val is None:
+                    continue
+                if _is_precip_var(var) and not should_include_precip(fcst_val, obs_val):
+                    continue
+
+                error = fcst_val - obs_val
+                if var not in station_stats[station_id]:
+                    entry: dict = {'sum_abs_errors': 0.0, 'sum_errors': 0.0, 'count': 0}
+                    if include_obs:
+                        entry['obs_val'] = None
+                    station_stats[station_id][var] = entry
+                station_stats[station_id][var]['sum_abs_errors'] += abs(error)
+                station_stats[station_id][var]['sum_errors'] += error
+                station_stats[station_id][var]['count'] += 1
+                if include_obs and station_stats[station_id][var].get('obs_val') is None:
+                    station_stats[station_id][var]['obs_val'] = obs_val
+
+    # Aggregate results
+    results: dict = {}
+    for station_id, var_stats in station_stats.items():
+        station = stations.get(station_id, {})
+        per_var: dict = {}
+        for var, stats in var_stats.items():
+            if stats['count'] == 0:
+                continue
+            v: dict = {
+                'mae':   round(stats['sum_abs_errors'] / stats['count'], 2),
+                'bias':  round(stats['sum_errors']     / stats['count'], 2),
+                'count': stats['count'],
+            }
+            if include_obs and stats.get('obs_val') is not None:
+                v['obs'] = round(stats['obs_val'], 4)
+            per_var[var] = v
+        if not per_var:
+            continue
+        results[station_id] = {
+            'variables': per_var,
+            'lat':   station.get('lat'),
+            'lon':   station.get('lon'),
+            'name':  station.get('name', station_id),
+            'state': station.get('state', ''),
+        }
+
+    return results
+
+
+def get_single_event_station_detail(
+    db: dict,
+    station_id: str,
+    dates: list[str],
+    lead_time_hours: int,
+) -> list[dict]:
+    """
+    Return per-valid-time obs + per-model forecast/bias across a date range for one station.
+
+    All models (gfs, aifs, kenny, ifs, nws) are returned in a single pass.
+
+    Each entry:
+        {
+            valid_time: str,
+            obs_temp, obs_mslp, obs_precip, obs_dewpoint: float|None,
+            models: {
+                gfs:   {fcst_temp, bias_temp, fcst_mslp, bias_mslp, ...},
+                aifs:  {...},
+                kenny: {...},
+                ifs:   {...},
+                nws:   {...},
+            }
+        }
+    """
+    from bisect import bisect_left, bisect_right
+
+    try:
+        date_objects = [
+            datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            for d in dates
+        ]
+    except ValueError:
+        return []
+
+    stations = db.get("stations", {})
+    runs = db.get("runs", {})
+
+    if station_id not in stations:
+        return []
+
+    # Pre-compute Kenny biases (used for all 'kenny' model entries)
+    kenny_biases_temp, kenny_global_temp = _compute_kenny_station_biases_cached(db, 'temp')
+    kenny_biases_dew,  kenny_global_dew  = _compute_kenny_station_biases_cached(db, 'dewpoint')
+
+    ALL_MODELS = ('gfs', 'aifs', 'kenny', 'ifs', 'nws')
+
+    var_map = {
+        'temp':     ('temps',     'temp'),
+        'mslp':     ('mslps',     'mslp'),
+        'precip':   ('precips',   'precip_6hr'),
+        'dewpoint': ('dewpoints', 'dewpoint'),
+    }
+
+    TOL = timedelta(minutes=30)
+
+    # Build sorted obs index for this single station across the full date range
+    obs_window_start = min(date_objects).replace(hour=0) - timedelta(hours=6, minutes=30)
+    obs_window_end   = max(date_objects).replace(hour=18) + timedelta(minutes=30)
+
+    raw_obs = db.get("observations", {}).get(station_id, {})
+    sorted_obs = []
+    for ts_str, obs_data in raw_obs.items():
+        try:
+            t = datetime.fromisoformat(ts_str)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if obs_window_start <= t <= obs_window_end:
+                sorted_obs.append((t, obs_data))
+        except ValueError:
+            continue
+    sorted_obs.sort(key=lambda x: x[0])
+    times_list = [o[0] for o in sorted_obs]
+
+    def fast_composite(target_time: datetime) -> dict:
+        lo = bisect_left(times_list, target_time - TOL)
+        hi = bisect_right(times_list, target_time + TOL)
+        best = {k: (None, TOL + timedelta(seconds=1)) for k in ('temp', 'mslp', 'precip', 'dewpoint')}
+        for i in range(lo, hi):
+            t, obs_data = sorted_obs[i]
+            delta = abs(t - target_time)
+            for k in best:
+                v = obs_data.get(k)
+                if v is not None and delta < best[k][1]:
+                    best[k] = (v, delta)
+        result = {k: best[k][0] for k in best}
+        if target_time.hour % 6 == 0:
+            start6 = target_time - timedelta(hours=6)
+            lo6 = bisect_right(times_list, start6)
+            hi6 = bisect_right(times_list, target_time)
+            if station_id not in PRECIP_EXCLUDE_STATIONS and lo6 < hi6:
+                window = [(sorted_obs[i][0], sorted_obs[i][1].get('precip'))
+                          for i in range(lo6, hi6)
+                          if sorted_obs[i][1].get('precip') is not None
+                          and not _is_implausible_precip_value(station_id, sorted_obs[i][1]['precip'])
+                          and not _is_overflow_value(sorted_obs[i][1]['precip'])]
+                if window:
+                    stuck: set = set()
+                    for i in range(len(window) - 1):
+                        v0, v1 = window[i][1], window[i + 1][1]
+                        if v0 > 0 and v0 == v1:
+                            j = i
+                            while j < len(window) and window[j][1] == v0:
+                                stuck.add(window[j][0])
+                                j += 1
+                    hmax: dict = {}
+                    for t, p in window:
+                        if t in stuck:
+                            continue
+                        hk = t.replace(minute=0, second=0, microsecond=0)
+                        if hk not in hmax or p > hmax[hk]:
+                            hmax[hk] = p
+                    total = sum(hmax.values()) if hmax else None
+                    if total is not None and station_id in PRECIP_MM_STATIONS:
+                        total /= 25.4
+                    result['precip_6hr'] = total
+                else:
+                    result['precip_6hr'] = None
+            else:
+                result['precip_6hr'] = None
+        else:
+            result['precip_6hr'] = None
+        return result
+
+    entries: list[dict] = []
+
+    for date_obj in date_objects:
+        for synoptic_h in [0, 6, 12, 18]:
+            valid_time = date_obj.replace(hour=synoptic_h)
+            init_time  = valid_time - timedelta(hours=lead_time_hours)
+            run_key    = init_time.isoformat()
+
+            run_data = runs.get(run_key)
+            if run_data is None:
+                run_key_naive = init_time.replace(tzinfo=None).isoformat()
+                run_data = runs.get(run_key_naive)
+            if run_data is None:
+                continue
+
+            forecast_hours = run_data.get("forecast_hours", [])
+            if lead_time_hours not in forecast_hours:
+                continue
+            fcst_idx = forecast_hours.index(lead_time_hours)
+
+            # Compute obs once for this valid_time
+            obs = fast_composite(valid_time)
+            entry: dict = {
+                'valid_time': valid_time.isoformat(),
+                'obs_temp':     round(obs['temp'],      2) if obs.get('temp')      is not None else None,
+                'obs_mslp':     round(obs['mslp'],      2) if obs.get('mslp')      is not None else None,
+                'obs_precip':   round(obs['precip_6hr'],2) if obs.get('precip_6hr')is not None else None,
+                'obs_dewpoint': round(obs['dewpoint'],  2) if obs.get('dewpoint')  is not None else None,
+                'models': {},
+            }
+
+            any_model_data = False
+            for mdl in ALL_MODELS:
+                source = _source_model_for_verification(mdl)
+                model_run_data = run_data.get(source)
+                if not model_run_data:
+                    continue
+                fcst_data = model_run_data.get(station_id)
+                if not fcst_data:
+                    continue
+
+                mdl_entry: dict = {}
+                for var, (fcst_key, obs_key) in var_map.items():
+                    fcst_values = fcst_data.get(fcst_key, [])
+                    raw_fcst = fcst_values[fcst_idx] if fcst_idx < len(fcst_values) else None
+
+                    if mdl == 'kenny' and var == 'temp':
+                        fcst_val = _apply_model_value_adjustment(
+                            mdl, var, station_id, valid_time, raw_fcst,
+                            kenny_biases_temp, kenny_global_temp)
+                    elif mdl == 'kenny' and var == 'dewpoint':
+                        fcst_val = _apply_model_value_adjustment(
+                            mdl, var, station_id, valid_time, raw_fcst,
+                            kenny_biases_dew, kenny_global_dew)
+                    else:
+                        fcst_val = raw_fcst
+
+                    obs_val = obs.get(obs_key)
+                    mdl_entry[f'fcst_{var}'] = round(fcst_val, 2) if fcst_val is not None else None
+                    mdl_entry[f'bias_{var}'] = round(fcst_val - obs_val, 2) if fcst_val is not None and obs_val is not None else None
+
+                entry['models'][mdl] = mdl_entry
+                any_model_data = True
+
+            if any_model_data:
+                entries.append(entry)
+
+    entries.sort(key=lambda e: e['valid_time'])
+    return entries
+
+
+def get_forecast_evolution(
+    db: dict,
+    station_id: str,
+    valid_time_str: str,
+    variable: str,
+) -> dict:
+    """
+    For a specific station and valid time, return how each model's forecast for
+    that valid time evolved across different initialization times.
+
+    X-axis: init_time (oldest first = longest lead, newest last = shortest lead)
+    Y-axis: forecast value at valid_time
+
+    Returns:
+        {
+            valid_time: str,
+            obs: float | None,
+            models: {model: [{init_time, lead_hours, fcst}], ...}
+        }
+    """
+    try:
+        valid_time = datetime.fromisoformat(valid_time_str.replace('Z', '+00:00'))
+    except ValueError:
+        return {}
+
+    stations    = db.get('stations', {})
+    runs        = db.get('runs', {})
+    observations = db.get('observations', {})
+
+    if station_id not in stations:
+        return {}
+
+    var_map = {
+        'temp':     ('temps',       'temp'),
+        'mslp':     ('mslps',       'mslp'),
+        'precip':   ('precips',     'precip'),
+        'dewpoint': ('dewpoints',   'dewpoint'),
+    }
+    if variable not in var_map:
+        return {}
+    fcst_key, obs_key = var_map[variable]
+
+    # Nearest observed value at valid_time
+    obs_val = None
+    TOL = timedelta(minutes=30)
+    station_obs = observations.get(station_id, {})
+    if station_obs:
+        best_delta = TOL + timedelta(seconds=1)
+        for ts_str, obs_data in station_obs.items():
+            try:
+                t = datetime.fromisoformat(ts_str)
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                v = obs_data.get(obs_key)
+                if v is None:
+                    continue
+                delta = abs(t - valid_time)
+                if delta <= TOL and delta < best_delta:
+                    obs_val = v
+                    best_delta = delta
+            except ValueError:
+                continue
+
+    # Kenny bias setup
+    if _is_kenny_bias_corrected_var('kenny', variable):
+        kenny_biases, kenny_global = _compute_kenny_station_biases_cached(db, variable)
+    else:
+        kenny_biases = kenny_global = None
+
+    source_map = {'gfs': 'gfs', 'aifs': 'aifs', 'kenny': 'aifs', 'ifs': 'ifs', 'nws': 'nws'}
+    models_data: dict = {m: [] for m in source_map}
+
+    for lead_hours in range(6, 361, 6):
+        init_time = valid_time - timedelta(hours=lead_hours)
+        run_key = init_time.isoformat()
+        run_data = runs.get(run_key)
+        if run_data is None:
+            run_key_naive = init_time.replace(tzinfo=None).isoformat()
+            run_data = runs.get(run_key_naive)
+        if run_data is None:
+            continue
+
+        forecast_hours = run_data.get('forecast_hours', [])
+        if lead_hours not in forecast_hours:
+            continue
+        fcst_idx = forecast_hours.index(lead_hours)
+
+        for model, source in source_map.items():
+            model_run = run_data.get(source)
+            if not model_run:
+                continue
+            station_fcst = model_run.get(station_id)
+            if not station_fcst:
+                continue
+            fcst_values = station_fcst.get(fcst_key, [])
+            if fcst_idx >= len(fcst_values) or fcst_values[fcst_idx] is None:
+                continue
+
+            raw_fcst = fcst_values[fcst_idx]
+            fcst_val = _apply_model_value_adjustment(
+                model, variable, station_id, valid_time, raw_fcst,
+                kenny_biases, kenny_global
+            ) if model == 'kenny' else raw_fcst
+
+            if fcst_val is None:
+                continue
+
+            models_data[model].append({
+                'init_time':  init_time.replace(tzinfo=None).isoformat() + 'Z',
+                'lead_hours': lead_hours,
+                'fcst':       round(float(fcst_val), 2),
+            })
+
+    # Sort oldest init first (largest lead_hours first)
+    for m in models_data:
+        models_data[m].sort(key=lambda x: x['lead_hours'], reverse=True)
+
+    return {
+        'valid_time': valid_time.replace(tzinfo=None).isoformat() + 'Z',
+        'obs':    round(float(obs_val), 2) if obs_val is not None else None,
+        'models': {k: v for k, v in models_data.items() if v},
+    }
+
+
+def get_single_event_station_matrix(
+    db: dict,
+    station_id: str,
+    dates: list[str],
+    lead_times: list[int] | None = None,
+) -> dict:
+    """
+    Return per-valid-time obs + per-model data for multiple lead times in one call.
+    Returns {str(lead_time_hours): list_of_entries} — same entry format as
+    get_single_event_station_detail.
+    """
+    if lead_times is None:
+        lead_times = [6, 12, 24, 48, 72, 120, 168, 240, 288, 360]
+    return {
+        str(lt): get_single_event_station_detail(db, station_id, dates, lt)
+        for lt in lead_times
     }
