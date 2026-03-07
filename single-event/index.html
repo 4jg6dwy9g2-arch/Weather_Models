@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Single Event Error — Weather Model Verification</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#212529;font-size:.875rem;}
+.page{max-width:1400px;margin:0 auto;padding:16px;}
+.card{background:#fff;border:1px solid #dee2e6;border-radius:6px;margin-bottom:16px;overflow:hidden;}
+.card-header{background:#f8f9fa;border-bottom:1px solid #dee2e6;padding:10px 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;}
+.card-title{font-weight:600;font-size:.9rem;}
+.controls{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+select,input{font-size:.8rem;padding:3px 8px;border:1px solid #ced4da;border-radius:4px;background:#fff;height:30px;}
+.btn{font-size:.8rem;padding:4px 10px;border-radius:4px;border:1px solid transparent;cursor:pointer;height:30px;line-height:1;}
+.btn-primary{background:#0d6efd;color:#fff;border-color:#0d6efd;}
+.btn-primary:hover{background:#0b5ed7;}
+.btn-nav{border-color:#6c757d;color:#6c757d;background:transparent;}
+.btn-nav:hover{background:#6c757d;color:#fff;}
+#dateNav{padding:8px 16px;border-bottom:1px solid #dee2e6;background:#f8f9fa;display:none;align-items:center;gap:12px;}
+#map{height:450px;width:100%;}
+#mapWrap{position:relative;}
+#mapEmpty{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#aaa;pointer-events:none;font-size:.9rem;z-index:500;}
+#mapLoading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;z-index:1000;display:none;}
+.spinner{display:inline-block;width:28px;height:28px;border:3px solid #dee2e6;border-top-color:#0d6efd;border-radius:50%;animation:spin .7s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg)}}
+.color-bar{display:flex;align-items:center;justify-content:center;gap:12px;padding:8px 16px;border-top:1px solid #dee2e6;background:#f8f9fa;font-size:.78rem;color:#666;}
+#colorScale{width:180px;height:12px;border-radius:4px;}
+.station-detail{border-top:1px solid #dee2e6;padding:16px;}
+.station-detail h5{font-size:1rem;font-weight:600;margin-bottom:12px;}
+.nav-pills{display:flex;gap:4px;margin-bottom:12px;}
+.nav-pills button{font-size:.75rem;padding:3px 10px;border-radius:16px;border:1px solid #dee2e6;background:transparent;cursor:pointer;}
+.nav-pills button.active{background:#0d6efd;color:#fff;border-color:#0d6efd;}
+.chart-card{border:1px solid #dee2e6;border-radius:4px;margin-bottom:12px;}
+.chart-card-header{font-size:.8rem;padding:6px 12px;background:#f8f9fa;border-bottom:1px solid #dee2e6;}
+.chart-card-body{padding:12px;}
+.badge{font-size:.72rem;padding:3px 7px;border-radius:4px;background:#6c757d;color:#fff;}
+.info-bar{font-size:.82rem;color:#555;padding:10px 16px;background:#e8f0fe;border-bottom:1px solid #c5d5f5;}
+.info-bar a{color:#1a73e8;}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px;}
+.dot-ok{background:#22c55e;}
+.dot-err{background:#ef4444;}
+.dot-unknown{background:#adb5bd;}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="info-bar">
+    <strong>Weather Model Verification — Single Event Error</strong>
+    &nbsp;&mdash;&nbsp;
+    Select a date range to see per-station forecast errors across models and lead times.
+    &nbsp;&mdash;&nbsp;
+    <span id="serverStatus"><span class="status-dot dot-unknown" id="serverDot"></span><span id="serverStatusText">Checking data server…</span></span>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <div class="card-header">
+      <span class="card-title"><i class="bi bi-calendar-event"></i> Single Event Error Map</span>
+      <div class="controls">
+        <label style="font-size:.78rem;color:#6c757d;">From</label>
+        <input type="date" id="startDate">
+        <label style="font-size:.78rem;color:#6c757d;">To</label>
+        <input type="date" id="endDate">
+        <button class="btn btn-primary" onclick="loadMap()">Load</button>
+
+        <select id="selModel" onchange="onModelChange()">
+          <option value="gfs">GFS</option>
+          <option value="aifs">AIFS</option>
+          <option value="kenny">Kenny</option>
+          <option value="ifs">IFS</option>
+          <option value="nws">NWS</option>
+        </select>
+        <select id="selVariable" onchange="renderMap()">
+          <option value="temp">Temperature</option>
+          <option value="dewpoint">Dew Point</option>
+          <option value="mslp">Pressure</option>
+          <option value="precip">Precipitation (6hr)</option>
+        </select>
+        <select id="selMetric" onchange="renderMap()">
+          <option value="mae">MAE</option>
+          <option value="bias">Bias</option>
+        </select>
+        <select id="selLeadTime" onchange="onLeadTimeChange()">
+          <option value="6">6h</option>
+          <option value="12">12h</option>
+          <option value="24" selected>24h</option>
+          <option value="48">48h</option>
+          <option value="72">72h</option>
+          <option value="120">5d</option>
+          <option value="168">7d</option>
+          <option value="240">10d</option>
+          <option value="288">12d</option>
+          <option value="360">15d</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="dateNav">
+      <button class="btn btn-nav" onclick="navigate(-1)"><i class="bi bi-chevron-left"></i></button>
+      <span id="dateNavLabel" style="font-weight:600;min-width:220px;"></span>
+      <button class="btn btn-nav" onclick="navigate(1)"><i class="bi bi-chevron-right"></i></button>
+      <span id="stationCount" class="badge">-- stations</span>
+    </div>
+
+    <div id="mapWrap">
+      <div id="map"></div>
+      <div id="mapEmpty"><i class="bi bi-calendar-event" style="font-size:2.5rem;display:block;margin-bottom:8px;"></i>Select a date range and click Load.</div>
+      <div id="mapLoading"><div class="spinner"></div><p style="margin-top:8px;color:#6c757d;font-size:.8rem;">Loading…</p></div>
+    </div>
+
+    <div class="color-bar">
+      <span id="colorMin">0</span>
+      <div id="colorScale"></div>
+      <span id="colorMax">10</span>
+      <span id="colorUnits" style="margin-left:4px;"></span>
+    </div>
+
+    <div id="stationDetail" class="station-detail" style="display:none;">
+      <h5><i class="bi bi-pin-map"></i> <span id="stationName">Station</span></h5>
+
+      <div class="nav-pills" id="varTabs">
+        <button class="active" data-var="temp"     onclick="setVar('temp')">Temp</button>
+        <button data-var="dewpoint" onclick="setVar('dewpoint')">Dew Point</button>
+        <button data-var="precip"   onclick="setVar('precip')">Precip</button>
+        <button data-var="mslp"     onclick="setVar('mslp')">Pressure</button>
+      </div>
+
+      <div class="chart-card">
+        <div class="chart-card-header" id="evoLabel">Forecast Evolution</div>
+        <div class="chart-card-body">
+          <div style="position:relative;height:260px;"><canvas id="evoChart"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- .page -->
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+<script>
+// =============================================================================
+// CONFIG — update SERVER_URL after setting up your Cloudflare tunnel
+// =============================================================================
+const SERVER_URL = 'https://YOUR-TUNNEL-URL.trycloudflare.com';
+// =============================================================================
+
+const ALL_LEAD_TIMES = [6,12,24,48,72,120,168,240,288,360];
+const MODELS = ['gfs','aifs','kenny','ifs','nws'];
+const MODEL_MAX_LT = {gfs:360,aifs:360,kenny:360,ifs:240,nws:168};
+const MODEL_STYLES = {
+    gfs:   {label:'GFS',   color:'#0d6efd'},
+    aifs:  {label:'AIFS',  color:'#0dcaf0'},
+    kenny: {label:'Kenny', color:'#fd7e14'},
+    ifs:   {label:'IFS',   color:'#20c997'},
+    nws:   {label:'NWS',   color:'#6c757d'},
+};
+
+let theMap = null, markers = [], currentStepIdx = 0, steps = [];
+let mapData = {};   // key → response JSON
+let mapIndex = {};  // key → {station_id → station}
+let currentStationId = null, currentStationName = null, currentVar = 'temp';
+let evoChart = null, evoData = null;
+let availableDates = [];
+
+// ── Color helpers ─────────────────────────────────────────────────────────────
+function getMaeColor(v, variable) {
+    const mx = variable==='precip'?0.3:(variable==='temp'||variable==='dewpoint')?20:10;
+    const r = Math.max(0, Math.min(1, v/mx));
+    if (r < 0.5) { const t=r*2; return `rgb(${~~(34+t*(234-34))},${~~(197+t*(179-197))},${~~(94+t*(8-94))})`; }
+    const t=(r-0.5)*2; return `rgb(${~~(234+t*(239-234))},${~~(179+t*(68-179))},${~~(8+t*(68-8))})`;
+}
+function getBiasColor(v, variable) {
+    const mx = variable==='precip'?0.3:(variable==='temp'||variable==='dewpoint')?20:10;
+    const r = Math.max(-1, Math.min(1, v/mx));
+    if (variable==='precip'||variable==='dewpoint') {
+        const g=(r+1)/2;
+        if (g<0.5){const t=g*2; return `rgb(${~~(139+t*116)},${~~(69+t*186)},${~~(19+t*236)})`;}
+        const t=(g-.5)*2; return `rgb(${~~(255-t*221)},${~~(255-t*116)},${~~(255-t*221)})`;
+    }
+    if (r<0){const t=1+r; return `rgb(${~~(59+t*196)},${~~(130+t*125)},${~~(246+t*9)})`;}
+    return `rgb(${~~(255+r*(239-255))},${~~(255+r*(68-255))},${~~(255+r*(68-255))})`;
+}
+function markerColor(v, metric, variable) { return metric==='bias' ? getBiasColor(v,variable) : getMaeColor(v,variable); }
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+function initMap() {
+    theMap = L.map('map', {center:[39.5,-98.5], zoom:4, minZoom:3, maxZoom:10});
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'&copy; OpenStreetMap contributors',maxZoom:19}).addTo(theMap);
+}
+
+async function checkServer() {
+    try {
+        const res = await fetch(`${SERVER_URL}/dates.json`, {signal: AbortSignal.timeout(5000)});
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        availableDates = data.dates || [];
+        document.getElementById('serverDot').className = 'status-dot dot-ok';
+        document.getElementById('serverStatusText').textContent = `Data server online — ${availableDates.length} days available`;
+        populateDatePickers();
+    } catch(e) {
+        document.getElementById('serverDot').className = 'status-dot dot-err';
+        document.getElementById('serverStatusText').textContent = 'Data server offline — check back later';
+    }
+}
+
+function populateDatePickers() {
+    if (!availableDates.length) return;
+    const first = availableDates[0], last = availableDates[availableDates.length-1];
+    const startEl = document.getElementById('startDate');
+    const endEl   = document.getElementById('endDate');
+    startEl.min = endEl.min = first;
+    startEl.max = endEl.max = last;
+    // Default: last 3 days
+    const lastIdx = availableDates.length - 1;
+    const firstIdx = Math.max(0, lastIdx - 2);
+    if (!startEl.value) startEl.value = availableDates[firstIdx];
+    if (!endEl.value)   endEl.value   = availableDates[lastIdx];
+}
+
+// ── Steps ─────────────────────────────────────────────────────────────────────
+function stepsInRange(start, end) {
+    const out = [];
+    let cur = new Date(start + 'T00:00:00Z');
+    const endD = new Date(end + 'T00:00:00Z');
+    while (cur <= endD) {
+        const date = cur.toISOString().slice(0,10);
+        if (availableDates.includes(date)) {
+            for (const h of [0,6,12,18]) out.push({date, hour:h});
+        }
+        cur = new Date(cur.getTime() + 86400000);
+    }
+    return out;
+}
+
+// ── Load ──────────────────────────────────────────────────────────────────────
+function loadMap() {
+    const start = document.getElementById('startDate').value;
+    const end   = document.getElementById('endDate').value;
+    if (!start || !end) return;
+    steps = stepsInRange(start, end);
+    if (!steps.length) return;
+    currentStepIdx = steps.length - 1;
+    fetchAndRender();
+}
+
+// ── Fetch ─────────────────────────────────────────────────────────────────────
+function cacheKey(date, hour, lt, model) { return `${date}_${hour}_${lt}_${model}`; }
+
+async function fetchStep(date, hour, lt, model) {
+    const key = cacheKey(date, hour, lt, model);
+    if (mapData[key]) return mapData[key];
+    if (lt > (MODEL_MAX_LT[model] ?? 360)) return null;
+    try {
+        const res = await fetch(`${SERVER_URL}/map/${key}.json`);
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (data.success) {
+            mapData[key] = data;
+            // Index stations
+            mapIndex[key] = {};
+            for (const st of data.stations) mapIndex[key][st.station_id] = st;
+        }
+        return data.success ? data : null;
+    } catch { return null; }
+}
+
+async function fetchAndRender() {
+    if (!steps.length) return;
+    const {date, hour} = steps[currentStepIdx];
+    const lt    = parseInt(document.getElementById('selLeadTime').value);
+    const model = document.getElementById('selModel').value;
+    const key   = cacheKey(date, hour, lt, model);
+
+    document.getElementById('dateNav').style.display = 'flex';
+    document.getElementById('dateNavLabel').textContent =
+        `${date} ${String(hour).padStart(2,'0')}Z  (${currentStepIdx+1} of ${steps.length})`;
+
+    if (!mapData[key]) {
+        document.getElementById('mapLoading').style.display = 'block';
+        document.getElementById('mapEmpty').style.display   = 'none';
+        clearMarkers();
+        await fetchStep(date, hour, lt, model);
+        document.getElementById('mapLoading').style.display = 'none';
+    }
+
+    renderMap();
+    if (currentStationId) refreshStation();
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function clearMarkers() { markers.forEach(m => theMap.removeLayer(m)); markers = []; }
+
+function renderMap() {
+    if (!steps.length) return;
+    const {date, hour} = steps[currentStepIdx];
+    const lt       = parseInt(document.getElementById('selLeadTime').value);
+    const model    = document.getElementById('selModel').value;
+    const variable = document.getElementById('selVariable').value;
+    const metric   = document.getElementById('selMetric').value;
+    const key      = cacheKey(date, hour, lt, model);
+
+    document.getElementById('dateNavLabel').textContent =
+        `${date} ${String(hour).padStart(2,'0')}Z  (${currentStepIdx+1} of ${steps.length})`;
+
+    clearMarkers();
+    const data = mapData[key];
+    if (!data || !data.stations || !data.stations.length) {
+        document.getElementById('mapEmpty').style.display = 'block';
+        document.getElementById('stationCount').textContent = '0 stations';
+        updateColorScale(); return;
+    }
+    document.getElementById('mapEmpty').style.display = 'none';
+
+    const values = data.stations.map(st => st.variables?.[variable]?.[metric]).filter(v => v != null);
+    if (!values.length) { updateColorScale(); return; }
+
+    let minVal, maxVal;
+    if (metric === 'bias') { const ma=Math.max(Math.abs(Math.min(...values)),Math.abs(Math.max(...values)),.1); minVal=-ma; maxVal=ma; }
+    else { minVal=0; maxVal=Math.max(...values); }
+
+    document.getElementById('stationCount').textContent = values.length + ' stations';
+    updateColorScale();
+
+    const units = {temp:'°F',mslp:'mb',precip:'in',dewpoint:'°F'};
+    const unit  = units[variable]||'';
+    const mLabel = metric==='bias'?'Bias':'MAE';
+
+    for (const st of data.stations) {
+        if (st.lat==null||st.lon==null) continue;
+        const vs = st.variables?.[variable]; if (!vs) continue;
+        const v  = vs[metric]; if (v==null) continue;
+        const m  = L.circleMarker([st.lat,st.lon],{radius:5,fillColor:markerColor(v,metric,variable),color:'#333',weight:.5,opacity:.8,fillOpacity:.85});
+        m.bindTooltip(`<strong>${st.name} (${st.station_id})</strong><br>${mLabel}: ${v.toFixed(2)} ${unit}<br>n=${vs.count}`,{sticky:true});
+        m.on('click', () => openStation(st.station_id, st.name));
+        m.addTo(theMap); markers.push(m);
+    }
+}
+
+function updateColorScale() {
+    const variable = document.getElementById('selVariable').value;
+    const metric   = document.getElementById('selMetric').value;
+    const units = {temp:'°F',mslp:'mb',precip:'in',dewpoint:'°F'};
+    document.getElementById('colorUnits').textContent = units[variable]||'';
+    const mx = variable==='precip'?0.3:(variable==='temp'||variable==='dewpoint')?20:10;
+    if (metric==='bias') {
+        document.getElementById('colorMin').textContent = (-mx).toFixed(1);
+        document.getElementById('colorMax').textContent = mx.toFixed(1);
+        document.getElementById('colorScale').style.background =
+            (variable==='precip'||variable==='dewpoint')
+            ? 'linear-gradient(to right,#8b4513,#fff 50%,#22c55e)'
+            : 'linear-gradient(to right,#3b82f6,#fff 50%,#ef4444)';
+    } else {
+        document.getElementById('colorMin').textContent = '0.0';
+        document.getElementById('colorMax').textContent = mx.toFixed(1);
+        document.getElementById('colorScale').style.background = 'linear-gradient(to right,#22c55e,#eab308 50%,#ef4444)';
+    }
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+function navigate(dir) {
+    currentStepIdx = Math.max(0, Math.min(steps.length-1, currentStepIdx+dir));
+    fetchAndRender();
+}
+
+function onLeadTimeChange() { fetchAndRender(); }
+function onModelChange()    { fetchAndRender(); }
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft')  navigate(-1);
+    if (e.key === 'ArrowRight') navigate(1);
+});
+
+// ── Station detail ────────────────────────────────────────────────────────────
+async function openStation(stationId, stationName) {
+    currentStationId   = stationId;
+    currentStationName = stationName;
+    document.getElementById('stationName').textContent = stationName + ' (' + stationId + ')';
+    document.getElementById('stationDetail').style.display = 'block';
+    await buildAndRenderEvolution(stationId, currentVar);
+}
+
+function refreshStation() { if (currentStationId) openStation(currentStationId, currentStationName||''); }
+
+function setVar(varName) {
+    currentVar = varName;
+    document.querySelectorAll('[data-var]').forEach(b => b.classList.toggle('active', b.dataset.var===varName));
+    if (evoData) renderEvolutionChart(evoData, varName);
+}
+
+async function buildAndRenderEvolution(stationId, varName) {
+    if (!steps.length) return;
+    const {date, hour} = steps[currentStepIdx];
+    document.getElementById('evoLabel').textContent = 'Forecast Evolution — loading all lead times…';
+
+    // Fetch all lead times for this date/hour in parallel (for evolution chart)
+    const model = document.getElementById('selModel').value;
+    const fetches = [];
+    for (const lt of ALL_LEAD_TIMES)
+        for (const mdl of MODELS)
+            fetches.push(fetchStep(date, hour, lt, mdl));
+    await Promise.all(fetches);
+
+    // Build evolution data from mapIndex
+    const validTimeMs = Date.UTC(
+        parseInt(date.slice(0,4)), parseInt(date.slice(5,7))-1, parseInt(date.slice(8,10)), hour, 0, 0
+    );
+    const prefix = `${date}_${hour}_`;
+    const ltSet = new Set();
+    for (const key of Object.keys(mapIndex)) {
+        if (key.startsWith(prefix)) {
+            const lt = parseInt(key.split('_')[2]);
+            if (!isNaN(lt)) ltSet.add(lt);
+        }
+    }
+    const sortedLts = [...ltSet].sort((a,b) => b-a); // oldest init first (high lt = early init)
+    const entries = [];
+    for (const lt of sortedLts) {
+        const initDate = new Date(validTimeMs - lt*3600000);
+        const initLabel = initDate.toLocaleDateString('en-US',{month:'numeric',day:'numeric',timeZone:'UTC'})
+                        + ' ' + String(initDate.getUTCHours()).padStart(2,'0') + 'Z';
+        const entry = {lead_hours:lt, init_label:initLabel, models:{}};
+        let hasData = false;
+        for (const mdl of MODELS) {
+            const st = mapIndex[`${date}_${hour}_${lt}_${mdl}`]?.[stationId];
+            if (!st) continue;
+            const mdlData = {};
+            for (const vn of ['temp','mslp','precip','dewpoint']) {
+                const v = st.variables?.[vn];
+                if (v?.bias != null) {
+                    mdlData[vn] = {bias:v.bias, obs:v.obs??null};
+                    if (v.obs != null) mdlData[vn].fcst = Math.round((v.obs + v.bias)*100)/100;
+                }
+            }
+            if (Object.keys(mdlData).length) { entry.models[mdl] = mdlData; hasData = true; }
+        }
+        if (hasData) entries.push(entry);
+    }
+    evoData = {valid_time_ms: validTimeMs, entries};
+    renderEvolutionChart(evoData, varName);
+}
+
+function renderEvolutionChart(data, varName) {
+    const varLabels = {temp:'Temp (°F)',dewpoint:'Dew Point (°F)',mslp:'Pressure (mb)',precip:'Precip (in)'};
+    if (!data || !data.entries.length) {
+        document.getElementById('evoLabel').textContent = 'Forecast Evolution — no data';
+        return;
+    }
+    const {valid_time_ms, entries} = data;
+    const labels   = entries.map(e => e.init_label);
+    const datasets = [];
+    for (const mdl of MODELS) {
+        const pts = entries.map(e => e.models[mdl]?.[varName]?.fcst ?? null);
+        if (pts.every(v => v==null)) continue;
+        const s = MODEL_STYLES[mdl];
+        datasets.push({label:s.label,data:pts,borderColor:s.color,backgroundColor:'transparent',borderWidth:2,pointRadius:3,tension:.15,spanGaps:true});
+    }
+    let obs = null;
+    outer: for (const e of entries) for (const mdl of MODELS) { const v=e.models[mdl]?.[varName]?.obs; if(v!=null){obs=v;break outer;} }
+    if (obs != null) {
+        datasets.push({label:'Observed',data:Array(labels.length).fill(obs),borderColor:'#212529',backgroundColor:'transparent',borderWidth:1.5,borderDash:[6,4],pointRadius:0,order:-1});
+    }
+    const d = new Date(valid_time_ms);
+    const vtLabel = d.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'})+' '+String(d.getUTCHours()).padStart(2,'0')+'Z';
+    document.getElementById('evoLabel').textContent =
+        `Forecast Evolution — target: ${vtLabel}${obs!=null?' (obs: '+obs.toFixed(1)+')':''}`;
+    if (evoChart) { evoChart.destroy(); evoChart = null; }
+    evoChart = new Chart(document.getElementById('evoChart'), {
+        type: 'line',
+        data: {labels, datasets},
+        options: {
+            responsive:true, maintainAspectRatio:false,
+            plugins: {
+                legend:{position:'top',labels:{usePointStyle:true,padding:8,font:{size:11}}},
+                tooltip:{callbacks:{title(items){const e=entries[items[0]?.dataIndex];return e?`Init: ${e.init_label}  (${e.lead_hours}h lead)`:''}}},
+                annotation:{annotations:{vtLine:{type:'line',xMin:labels.length-1,xMax:labels.length-1,borderColor:'#adb5bd',borderWidth:1,borderDash:[4,3]}}}
+            },
+            scales:{
+                x:{ticks:{maxRotation:45,minRotation:30,font:{size:10}},grid:{display:false},title:{display:true,text:'Forecast Init Time (oldest → newest)',font:{size:10}}},
+                y:{title:{display:true,text:varLabels[varName]||''}}
+            }
+        }
+    });
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    initMap();
+    checkServer();
+});
+</script>
+</body>
+</html>
